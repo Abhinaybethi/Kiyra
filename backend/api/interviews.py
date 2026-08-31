@@ -77,7 +77,7 @@ async def start_session(session_id: int, db: Session = Depends(get_db)):
     session.started_at = datetime.utcnow()
     db.commit()
 
-    orchestrator = InterviewOrchestrator(db, get_provider())
+    orchestrator = InterviewOrchestrator(db, get_provider(db=db))
     question_text = await orchestrator.generate_next_question(session)
     if not question_text:
         raise HTTPException(status_code=500, detail="Failed to generate question")
@@ -110,11 +110,16 @@ async def submit_answer(
     if not session:
         raise HTTPException(status_code=404, detail="Session not found")
 
-    orchestrator = InterviewOrchestrator(db, get_provider())
+    orchestrator = InterviewOrchestrator(db, get_provider(db=db))
     response = await orchestrator.process_answer(session, question_id, data.content, data.method)
 
-    # Check if more questions needed
-    answered_count = db.query(InterviewQuestion).filter_by(session_id=session_id).count()
+    # Count actual answers (InterviewResponse) for this session
+    answered_count = (
+        db.query(IRModel)
+        .join(InterviewQuestion, IRModel.question_id == InterviewQuestion.id)
+        .filter(InterviewQuestion.session_id == session_id)
+        .count()
+    )
     is_complete = answered_count >= session.question_count
 
     next_question = None
@@ -124,10 +129,15 @@ async def submit_answer(
             next_question = db.query(InterviewQuestion).filter_by(session_id=session_id).order_by(
                 InterviewQuestion.order_index.desc()
             ).first()
+    else:
+        # Mark session complete and set ended_at
+        session.status = InterviewStatus.COMPLETED
+        session.ended_at = datetime.utcnow()
+        db.commit()
 
     return {
         "response_id": response.id,
-        "is_complete": is_complete or next_question is None,
+        "is_complete": is_complete,
         "next_question": QuestionResponse.model_validate(next_question) if next_question else None,
     }
 
@@ -140,7 +150,7 @@ async def complete_session(session_id: int, db: Session = Depends(get_db)):
     if not session:
         raise HTTPException(status_code=404, detail="Session not found")
 
-    orchestrator = InterviewOrchestrator(db, get_provider())
+    orchestrator = InterviewOrchestrator(db, get_provider(db=db))
     feedback = await orchestrator.complete_interview(session)
     return {"feedback": feedback, "session_id": session_id}
 
@@ -177,18 +187,20 @@ async def suggest_answer(data: AnswerSuggestionRequest, db: Session = Depends(ge
     if data.session_id:
         session = db.query(InterviewSession).filter_by(id=data.session_id, profile_id=profile.id).first()
 
-    orchestrator = InterviewOrchestrator(db, get_provider())
+    orchestrator = InterviewOrchestrator(db, get_provider(db=db))
     if session:
         answer_data = await orchestrator.generate_answer_suggestion(
             session, data.question, data.question_type
         )
-        model_used = get_provider().model_name
+        # model_used read from provider
+        provider = get_provider(db=db)
+        model_used = getattr(provider, "model_name", "default")
     else:
         # No session — still generate using profile context
         from knowledge.retrieval import retrieve_context
         from agents.answer_agent import AnswerAgent
         context = await retrieve_context(profile.id, data.question, top_k=3)
-        provider = get_provider()
+        provider = get_provider(db=db)
         agent = AnswerAgent(db, provider)
         result = await agent.run(
             data.question,
@@ -213,7 +225,7 @@ async def suggest_answer(data: AnswerSuggestionRequest, db: Session = Depends(ge
     )
 
 
-# ── WebSocket ──────────────────────────────────────────────────────────────
+# ── WebSocket ──────────────────────────────────────────────────────────
 
 @router.websocket("/{session_id}/ws")
 async def interview_websocket(session_id: int, websocket: WebSocket, db: Session = Depends(get_db)):
