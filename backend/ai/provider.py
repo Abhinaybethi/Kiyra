@@ -1,14 +1,24 @@
-"""AI Provider abstraction layer with retry, fallback, and capability metadata."""
+"""AI Provider abstraction layer with retry, fallback, and capability metadata.
+
+This module provides provider implementations (Ollama, OpenAI-compatible) and
+an authoritative factory `get_provider(...)` which accepts an optional SQLAlchemy
+Session. When a DB session is provided, an active ModelConfiguration row (if
+present) is preferred as the runtime configuration. Environment-based settings
+remain as fallbacks.
+"""
 from __future__ import annotations
 
 import asyncio
 import json
 import time
+import os
 from abc import ABC, abstractmethod
 from typing import AsyncIterator, Optional, Any, Dict
 import httpx
 
 from config import settings
+from sqlalchemy.orm import Session
+from db.models import ModelConfiguration
 
 
 # Model capability registry
@@ -102,7 +112,7 @@ class OllamaProvider(AIProvider):
         timeout: int = None,
         max_retries: int = 2,
     ):
-        self._base_url = (base_url or settings.ollama_base_url).rstrip("/")
+        self._base_url = (base_url or settings.ollama_base_url or "").rstrip("/")
         self._model = model or settings.model_name
         self._timeout = timeout or settings.ollama_timeout
         self._max_retries = max_retries
@@ -119,6 +129,9 @@ class OllamaProvider(AIProvider):
         max_tokens: Optional[int] = None,
         **kwargs,
     ) -> str | AsyncIterator[str]:
+        if not self._base_url:
+            raise RuntimeError("Ollama base URL is not configured")
+
         payload = {
             "model": self._model,
             "messages": messages,
@@ -171,6 +184,8 @@ class OllamaProvider(AIProvider):
             await client.aclose()
 
     async def embed(self, text: str) -> list[float]:
+        if not self._base_url:
+            raise RuntimeError("Ollama base URL is not configured")
         payload = {"model": settings.embedding_model, "input": text}
         async with httpx.AsyncClient(timeout=30) as client:
             resp = await client.post(f"{self._base_url}/api/embed", json=payload)
@@ -180,6 +195,8 @@ class OllamaProvider(AIProvider):
             return embeddings[0] if embeddings else []
 
     async def health_check(self) -> bool:
+        if not self._base_url:
+            return False
         try:
             async with httpx.AsyncClient(timeout=5) as client:
                 resp = await client.get(f"{self._base_url}/api/tags")
@@ -188,6 +205,8 @@ class OllamaProvider(AIProvider):
             return False
 
     async def list_models(self) -> list[str]:
+        if not self._base_url:
+            return []
         try:
             async with httpx.AsyncClient(timeout=10) as client:
                 resp = await client.get(f"{self._base_url}/api/tags")
@@ -208,8 +227,8 @@ class OpenAICompatibleProvider(AIProvider):
         timeout: int = 120,
         max_retries: int = 2,
     ):
-        self._base_url = (base_url or settings.openai_base_url).rstrip("/")
-        self._api_key = api_key or settings.openai_api_key or "no-key"
+        self._base_url = (base_url or settings.openai_base_url or "").rstrip("/")
+        self._api_key = api_key or settings.openai_api_key or ""
         self._model = model or settings.openai_model
         self._timeout = timeout
         self._max_retries = max_retries
@@ -232,6 +251,11 @@ class OpenAICompatibleProvider(AIProvider):
         max_tokens: Optional[int] = None,
         **kwargs,
     ) -> str | AsyncIterator[str]:
+        if not self._base_url:
+            raise RuntimeError("OpenAI-compatible base URL is not configured")
+        if not self._api_key:
+            raise RuntimeError("OpenAI-compatible API key is not configured in environment")
+
         payload: dict[str, Any] = {
             "model": self._model,
             "messages": messages,
@@ -289,6 +313,8 @@ class OpenAICompatibleProvider(AIProvider):
             await client.aclose()
 
     async def embed(self, text: str) -> list[float]:
+        if not self._base_url or not self._api_key:
+            raise RuntimeError("Embedding endpoint or API key not configured")
         payload = {"model": "text-embedding-ada-002", "input": text}
         async with httpx.AsyncClient(timeout=30) as client:
             resp = await client.post(
@@ -300,6 +326,8 @@ class OpenAICompatibleProvider(AIProvider):
             return resp.json()["data"][0]["embedding"]
 
     async def health_check(self) -> bool:
+        if not self._base_url:
+            return False
         try:
             async with httpx.AsyncClient(timeout=5) as client:
                 resp = await client.get(f"{self._base_url}/models", headers=self._headers())
@@ -308,13 +336,54 @@ class OpenAICompatibleProvider(AIProvider):
             return False
 
 
-def get_provider(override_model: str = None) -> AIProvider:
-    """Factory: returns the configured provider with configured model."""
-    provider_type = settings.model_provider.lower()
+def _provider_from_model_type(provider_type: str, model_name: str, base_url: Optional[str], api_key: Optional[str]) -> AIProvider:
+    provider_type = (provider_type or "ollama").lower()
     if provider_type == "ollama":
-        return OllamaProvider(model=override_model)
+        return OllamaProvider(base_url=base_url, model=model_name)
     elif provider_type in ("openai", "openai_compatible", "openrouter", "lmstudio"):
-        return OpenAICompatibleProvider(model=override_model)
+        return OpenAICompatibleProvider(base_url=base_url, api_key=api_key, model=model_name)
     else:
         # default to Ollama
-        return OllamaProvider(model=override_model)
+        return OllamaProvider(base_url=base_url, model=model_name)
+
+
+def get_provider(override_model: str = None, db: Optional[Session] = None) -> AIProvider:
+    """Factory: returns the configured provider with configured model.
+
+    Priority:
+      1. If a DB session is provided and an active ModelConfiguration exists, prefer its values.
+      2. Otherwise fall back to environment-based settings via config.settings.
+
+    Note: API keys are read from environment variables whose name may be stored in
+    the ModelConfiguration.api_key_env column. We never persist raw API keys in the DB.
+    """
+    provider_type = settings.model_provider.lower()
+    model_name = override_model or settings.model_name
+    base_url = None
+    api_key = None
+
+    if db is not None:
+        try:
+            cfg = db.query(ModelConfiguration).filter_by(is_active=True).first()
+            if cfg:
+                provider_type = (cfg.provider or provider_type).lower()
+                model_name = override_model or (cfg.model_name or model_name)
+                base_url = cfg.provider_url
+                if cfg.api_key_env:
+                    api_key = os.environ.get(cfg.api_key_env)
+        except Exception:
+            # If DB read fails for any reason, fall back to environment settings
+            cfg = None
+
+    # If no api_key supplied from DB, use env-level fallback
+    if not api_key:
+        api_key = os.environ.get("OPENAI_API_KEY") or settings.openai_api_key
+
+    # If base_url not provided by DB, use configured environment defaults per provider
+    if not base_url:
+        if provider_type == "ollama":
+            base_url = settings.ollama_base_url
+        else:
+            base_url = settings.openai_base_url
+
+    return _provider_from_model_type(provider_type, model_name, base_url, api_key)
