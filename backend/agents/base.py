@@ -33,7 +33,9 @@ class BaseAgent:
         session_id: Optional[int] = None,
     ):
         self.db = db
-        self.provider = provider or get_provider()
+        # Prefer a DB-backed provider when available so runtime ModelConfiguration
+        # changes take effect without relying solely on environment variables.
+        self.provider = provider or get_provider(db=self.db)
         self.session_id = session_id
 
     async def run(self, task: str, **kwargs) -> AgentResult:
