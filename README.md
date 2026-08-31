@@ -1,4 +1,5 @@
-# AI Interview Intelligence Platform
+# Kiyra 
+#AI Interview Intelligence Platform
 
 A production-grade, local-first, free-first AI interview assistance platform for candidates preparing for and navigating real-time interviews.
 
