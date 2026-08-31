@@ -1,0 +1,69 @@
+# Dependencies
+node_modules/
+venv/
+.venv/
+env/
+
+# Python generated files
+__pycache__/
+*.py[cod]
+
+# User uploads
+backend/uploads/
+# Build/output
+dist/
+build/
+.next/
+out/
+coverage/
+
+# Downloaded/generated data
+downloads/
+download/
+data/
+*.zip
+*.tar
+*.gz
+*.bin
+*.onnx
+*.pt
+*.pth
+*.safetensors
+*.gguf
+*.mp4
+*.webm
+*.wav
+*.mp3
+
+# AI / model cache
+models/
+model/
+.cache/
+huggingface/
+.huggingface/
+
+# Environment / secrets
+.env
+.env.*
+!.env.example
+
+# Logs
+*.log
+logs/
+
+# OS/editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# Temporary files
+tmp/
+temp/
+*.tmp
+# Python bytecode
+__pycache__/
+*.pyc
+
+# User uploaded documents
+backend/uploads/
