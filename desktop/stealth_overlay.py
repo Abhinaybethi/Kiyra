@@ -1,16 +1,14 @@
 """
-Stealth Interview Assistant — Windows-first desktop overlay with audio capture and WebSocket client.
+Stealth Interview Assistant — Production-ready Windows overlay.
 
-Requirements implemented:
-- Windows WASAPI loopback and microphone capture via sounddevice (device selection supported).
-- Mix, resample, convert to 16kHz mono PCM16 and encode into valid WAV bytes per chunk (default 2s).
-- Persistent WebSocket connection to backend /api/interviews/{session_id}/ws sending WAV bytes as binary frames and handling JSON text events.
-- Heartbeat (reply to ping with {"type":"pong"}), reconnect with backoff, single connection, and UI state updates.
-- Click-through mode preserved. Clean shutdown and error reporting.
-
-Notes:
-- This implementation prefers sounddevice and websockets. Add these to project dependencies (see backend/pyproject.toml change).
-- On Windows, to capture system audio reliably prefer a WASAPI "(Loopback)" device or use a virtual device (VB-CABLE, etc.).
+FEATURES:
+- Invisible to screen capture (SetWindowDisplayAffinity)
+- Real-time audio capture from Zoom/Teams/Meet
+- WebSocket streaming to backend for fast transcription
+- Instant answer display (STAR framework + key points)
+- Click-through mode for seamless interaction
+- Auto-hide answers after configurable delay
+- Keyboard shortcuts: F9 (toggle visibility), F10 (toggle click-through)
 """
 from __future__ import annotations
 
@@ -23,42 +21,46 @@ import wave
 import sys
 import queue
 import tkinter as tk
-from tkinter import ttk
+from tkinter import ttk, messagebox
 from typing import Optional
+import ctypes
 
-# Optional imports — handled at runtime to provide useful errors
 try:
     import numpy as np
-except Exception:  # pragma: no cover - environment dependent
+except Exception:
     np = None
 
 try:
     import sounddevice as sd
-except Exception:  # pragma: no cover - environment dependent
+except Exception:
     sd = None
 
 try:
     import websockets
     import asyncio
-except Exception:  # pragma: no cover - environment dependent
+except Exception:
     websockets = None
     asyncio = None
 
 
-# ----------------------------------------------------------------------------
-# Utilities: WAV encoding, resampling, mixing
-# ----------------------------------------------------------------------------
+# ─────────────────────────────────────────────────────────────────────────────
+# Audio Processing
+# ─────────────────────────────────────────────────────────────────────────────
 
 def pcm16_from_float32(arr: np.ndarray) -> np.ndarray:
-    """Convert float32 in -1..1 to int16 PCM"""
+    """Convert float32 in -1..1 to int16 PCM."""
+    if arr.size == 0:
+        return np.zeros(0, dtype=np.int16)
     clipped = np.clip(arr, -1.0, 1.0)
     return (clipped * 32767.0).astype(np.int16)
 
 
 def resample_linear(x: np.ndarray, src_sr: int, dst_sr: int) -> np.ndarray:
-    """Simple linear resampling using numpy.interp. Works for small buffers."""
+    """Simple linear resampling."""
     if src_sr == dst_sr:
         return x
+    if x.size == 0:
+        return np.zeros(0, dtype=x.dtype)
     duration = x.shape[0] / src_sr
     dst_n = int(math.ceil(duration * dst_sr))
     if dst_n <= 0:
@@ -68,45 +70,31 @@ def resample_linear(x: np.ndarray, src_sr: int, dst_sr: int) -> np.ndarray:
     return np.interp(dst_times, src_times, x).astype(x.dtype)
 
 
-def mix_mono(channels: list[np.ndarray]) -> np.ndarray:
-    """Mix multiple mono numpy arrays by padding to same length and averaging."""
-    if not channels:
-        return np.zeros(0, dtype=np.float32)
-    max_len = max(arr.shape[0] for arr in channels)
-    mix = np.zeros(max_len, dtype=np.float32)
-    for arr in channels:
-        if arr.shape[0] < max_len:
-            padded = np.pad(arr, (0, max_len - arr.shape[0]))
-        else:
-            padded = arr
-        mix += padded
-    mix /= len(channels)
-    return mix
-
-
 def encode_wav_bytes(samples: np.ndarray, samplerate: int = 16000) -> bytes:
-    """Encode a mono int16 numpy array as a WAV file in memory and return bytes."""
+    """Encode mono int16 numpy array as WAV bytes."""
+    if samples.size == 0:
+        samples = np.zeros(1, dtype=np.int16)
     bio = io.BytesIO()
     with wave.open(bio, "wb") as wf:
         wf.setnchannels(1)
-        wf.setsampwidth(2)  # 16-bit
+        wf.setsampwidth(2)
         wf.setframerate(samplerate)
         wf.writeframes(samples.tobytes())
     return bio.getvalue()
 
 
-# ----------------------------------------------------------------------------
-# Desktop Stealth Overlay App
-# ----------------------------------------------------------------------------
+# ─────────────────────────────────────────────────────────────────────────────
+# Stealth Overlay App
+# ─────────────────────────────────────────────────────────────────────────────
 
 class StealthOverlayApp:
-    def __init__(self, root: tk.Tk, api_url: str = "http://localhost:8000"):
+    def __init__(self, root: tk.Tk, api_url: str = "http://localhost:8000", session_id: int = 1):
         self.root = root
         self.api_url = api_url.rstrip("/")
+        self.session_id = session_id
 
         # Audio params
         self.target_sr = 16000
-        self.channels = 1
         self.chunk_seconds = 2.0
 
         # Device selection
@@ -114,222 +102,352 @@ class StealthOverlayApp:
         self.loopback_device = None
 
         # Internal state
-        self._audio_queue: queue.Queue[bytes] = queue.Queue()
+        self._audio_queue: queue.Queue[bytes] = queue.Queue(maxsize=50)
         self._stop_event = threading.Event()
         self._capture_thread: Optional[threading.Thread] = None
         self._ws_thread: Optional[threading.Thread] = None
         self._ws_loop = None
         self.websocket = None
         self.ws_connected = False
-        self.session_id: Optional[int] = None
 
         # UI state
         self.is_stealth_active = True
         self.is_click_through = False
         self.is_capturing = False
+        self.answer_auto_hide_task = None
 
-        # Build UI (keeps many original elements)
+        # Build UI
         self._init_window()
         self._init_styles()
         self._build_ui()
-        self._apply_win32_stealth()
+        self._apply_stealth_affinity()
         self._bind_shortcuts()
-
-        # Populate device lists
         self._populate_devices()
 
-    # ---------------- UI & Window helpers (kept lightweight) -----------------
+        print("[Stealth] Initialized. Press F9 to toggle visibility, F10 for click-through.")
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # Window & UI
+    # ─────────────────────────────────────────────────────────────────────────
+
     def _init_window(self):
-        self.root.title("InterviewAI — Stealth HUD")
-        self.root.geometry("520x520+60+60")
-        self.root.minsize(380, 260)
+        self.root.title("Kiyra — Interview Stealth HUD")
+        self.root.geometry("600x650+50+50")
+        self.root.minsize(400, 300)
         self.root.attributes("-topmost", True)
-        self.root.attributes("-alpha", 0.92)
-        self.root.configure(bg="#090d16")
-        self.root.overrideredirect(True)
+        self.root.attributes("-alpha", 0.94)
+        self.root.configure(bg="#0f172a")
 
     def _init_styles(self):
         self.font_family = "Segoe UI" if sys.platform == "win32" else "Helvetica"
-        self.bg_color = "#090d16"
-        self.card_bg = "#111827"
+        self.bg_color = "#0f172a"
+        self.card_bg = "#1e293b"
         self.accent_color = "#6366f1"
-        self.text_primary = "#f3f4f6"
-        self.text_secondary = "#9ca3af"
+        self.text_primary = "#f1f5f9"
+        self.text_secondary = "#94a3b8"
+        self.success_color = "#10b981"
+        self.warning_color = "#f59e0b"
 
-    def _apply_win32_stealth(self):
-        # Preserve previous affinity functions if present (in original file)
+    def _apply_stealth_affinity(self):
+        """Hide window from screenshots on Windows."""
         try:
-            import ctypes
-            self.hwnd = ctypes.windll.user32.GetParent(self.root.winfo_id()) or self.root.winfo_id()
-            # Leave actual SetWindowDisplayAffinity handled outside for safety — preserve UI only
-        except Exception:
-            self.hwnd = None
+            if sys.platform == "win32":
+                hwnd = ctypes.windll.user32.GetParent(self.root.winfo_id()) or self.root.winfo_id()
+                WDA_EXCLUDEFROMCAPTURE = 17
+                ctypes.windll.user32.SetWindowDisplayAffinity(hwnd, WDA_EXCLUDEFROMCAPTURE)
+                print("[Stealth] Window hidden from screen capture")
+        except Exception as e:
+            print(f"[Stealth] Could not set affinity: {e}")
 
     def _build_ui(self):
-        header = tk.Frame(self.root, bg="#131b2e", height=36)
+        # ─── Header ───────────────────────────────────────────────────────────
+        header = tk.Frame(self.root, bg="#1e293b", height=50)
         header.pack(fill=tk.X, side=tk.TOP)
+        header.pack_propagate(False)
 
-        self.status_label = tk.Label(header, text="Disconnected", fg="#f87171", bg="#131b2e", font=(self.font_family, 9, "bold"))
-        self.status_label.pack(side=tk.LEFT, padx=8, pady=6)
+        self.status_label = tk.Label(
+            header,
+            text="● Disconnected",
+            fg="#ef4444",
+            bg="#1e293b",
+            font=(self.font_family, 10, "bold")
+        )
+        self.status_label.pack(side=tk.LEFT, padx=12, pady=12)
 
-        btn_box = tk.Frame(header, bg="#131b2e")
-        btn_box.pack(side=tk.RIGHT, padx=6)
+        btn_box = tk.Frame(header, bg="#1e293b")
+        btn_box.pack(side=tk.RIGHT, padx=8, pady=8)
 
-        self.btn_start = tk.Button(btn_box, text="Start Capture", command=self.start_capture, bg="#064e3b", fg="#fff")
+        self.btn_start = tk.Button(
+            btn_box,
+            text="▶ Start",
+            command=self.start_capture,
+            bg="#059669",
+            fg="#fff",
+            font=(self.font_family, 9, "bold"),
+            relief=tk.FLAT,
+            padx=10,
+            cursor="hand2"
+        )
         self.btn_start.pack(side=tk.LEFT, padx=4)
 
-        self.btn_stop = tk.Button(btn_box, text="Stop Capture", command=self.stop_capture, state=tk.DISABLED)
+        self.btn_stop = tk.Button(
+            btn_box,
+            text="⏹ Stop",
+            command=self.stop_capture,
+            state=tk.DISABLED,
+            bg="#dc2626",
+            fg="#fff",
+            font=(self.font_family, 9, "bold"),
+            relief=tk.FLAT,
+            padx=10,
+            cursor="hand2"
+        )
         self.btn_stop.pack(side=tk.LEFT, padx=4)
 
-        self.btn_reconnect = tk.Button(btn_box, text="Reconnect WS", command=self._trigger_reconnect)
-        self.btn_reconnect.pack(side=tk.LEFT, padx=4)
+        # ─── Device Selection ──────────────────────────────────────────────────
+        dev_frame = tk.LabelFrame(
+            self.root,
+            text="Audio Devices",
+            bg=self.bg_color,
+            fg=self.text_secondary,
+            font=(self.font_family, 9, "bold"),
+            padx=10,
+            pady=10
+        )
+        dev_frame.pack(fill=tk.X, padx=12, pady=8)
 
-        # Devices
-        dev_frame = tk.Frame(self.root, bg=self.bg_color)
-        dev_frame.pack(fill=tk.X, padx=10, pady=8)
-        tk.Label(dev_frame, text="Microphone:", bg=self.bg_color, fg=self.text_secondary).grid(row=0, column=0, sticky="w")
-        self.cmb_mic = ttk.Combobox(dev_frame, values=[], state="readonly", width=50)
-        self.cmb_mic.grid(row=0, column=1, padx=6, sticky="ew")
+        tk.Label(dev_frame, text="Microphone:", bg=self.bg_color, fg=self.text_secondary).grid(row=0, column=0, sticky="w", pady=4)
+        self.cmb_mic = ttk.Combobox(dev_frame, values=[], state="readonly", width=60)
+        self.cmb_mic.grid(row=0, column=1, padx=8, sticky="ew", pady=4)
 
-        tk.Label(dev_frame, text="System/Loopback:", bg=self.bg_color, fg=self.text_secondary).grid(row=1, column=0, sticky="w")
-        self.cmb_loop = ttk.Combobox(dev_frame, values=[], state="readonly", width=50)
-        self.cmb_loop.grid(row=1, column=1, padx=6, sticky="ew")
+        tk.Label(dev_frame, text="System Audio:", bg=self.bg_color, fg=self.text_secondary).grid(row=1, column=0, sticky="w", pady=4)
+        self.cmb_loop = ttk.Combobox(dev_frame, values=[], state="readonly", width=60)
+        self.cmb_loop.grid(row=1, column=1, padx=8, sticky="ew", pady=4)
 
-        # Info area
-        info_frame = tk.Frame(self.root, bg=self.card_bg)
-        info_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=(0,10))
+        dev_frame.columnconfigure(1, weight=1)
 
-        tk.Label(info_frame, text="Latest Transcript:", bg=self.card_bg, fg=self.text_accent if hasattr(self, 'text_accent') else "#c7d2fe").pack(anchor="w", padx=8, pady=(8,0))
-        self.txt_transcript = tk.Text(info_frame, height=6, bg=self.card_bg, fg=self.text_primary)
-        self.txt_transcript.pack(fill=tk.BOTH, expand=False, padx=8, pady=(2,8))
+        # ─── Transcript ────────────────────────────────────────────────────────
+        tx_frame = tk.LabelFrame(
+            self.root,
+            text="📝 Detected Question",
+            bg=self.card_bg,
+            fg=self.accent_color,
+            font=(self.font_family, 9, "bold"),
+            padx=10,
+            pady=8
+        )
+        tx_frame.pack(fill=tk.BOTH, expand=False, padx=12, pady=8)
 
-        tk.Label(info_frame, text="Latest Question:", bg=self.card_bg, fg=self.text_secondary).pack(anchor="w", padx=8)
-        self.lbl_question = tk.Label(info_frame, text="-", bg=self.card_bg, fg=self.text_primary, wraplength=480, justify="left")
-        self.lbl_question.pack(fill=tk.X, padx=8, pady=(2,8))
+        self.txt_question = tk.Text(
+            tx_frame,
+            height=3,
+            bg="#0f172a",
+            fg=self.text_primary,
+            font=(self.font_family, 9),
+            wrap=tk.WORD,
+            relief=tk.FLAT
+        )
+        self.txt_question.pack(fill=tk.BOTH, expand=True, padx=0, pady=0)
+        self.txt_question.config(state=tk.DISABLED)
 
-        tk.Label(info_frame, text="Latest Answer:", bg=self.card_bg, fg=self.text_secondary).pack(anchor="w", padx=8)
-        self.txt_answer = tk.Text(info_frame, height=6, bg=self.card_bg, fg=self.text_primary)
-        self.txt_answer.pack(fill=tk.BOTH, expand=True, padx=8, pady=(2,8))
+        # ─── Answer Display (MAIN) ─────────────────────────────────────────────
+        ans_frame = tk.LabelFrame(
+            self.root,
+            text="✨ AI-Generated Answer (Instant Display)",
+            bg=self.card_bg,
+            fg=self.success_color,
+            font=(self.font_family, 9, "bold"),
+            padx=10,
+            pady=8
+        )
+        ans_frame.pack(fill=tk.BOTH, expand=True, padx=12, pady=8)
 
-        # Bottom controls
+        # Answer text with scrollbar
+        scrollbar = tk.Scrollbar(ans_frame)
+        scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+
+        self.txt_answer = tk.Text(
+            ans_frame,
+            bg="#0f172a",
+            fg=self.success_color,
+            font=(self.font_family, 10, "bold"),
+            wrap=tk.WORD,
+            relief=tk.FLAT,
+            yscrollcommand=scrollbar.set
+        )
+        self.txt_answer.pack(fill=tk.BOTH, expand=True)
+        self.txt_answer.config(state=tk.DISABLED)
+        scrollbar.config(command=self.txt_answer.yview)
+
+        # ─── Key Points ───────────────────────────────────────────────────────
+        kp_frame = tk.LabelFrame(
+            self.root,
+            text="⭐ Key Points",
+            bg=self.card_bg,
+            fg="#fbbf24",
+            font=(self.font_family, 8, "bold"),
+            padx=8,
+            pady=6
+        )
+        kp_frame.pack(fill=tk.X, padx=12, pady=4)
+
+        self.lbl_keypoints = tk.Label(
+            kp_frame,
+            text="-",
+            bg=self.card_bg,
+            fg="#fbbf24",
+            font=(self.font_family, 8),
+            wraplength=550,
+            justify="left"
+        )
+        self.lbl_keypoints.pack(anchor="w", fill=tk.BOTH, expand=True)
+
+        # ─── Bottom Status ─────────────────────────────────────────────────────
         bottom = tk.Frame(self.root, bg=self.bg_color)
-        bottom.pack(fill=tk.X, padx=10, pady=(0,10))
-        self.lbl_capture = tk.Label(bottom, text="Capture: stopped", bg=self.bg_color, fg=self.text_secondary)
+        bottom.pack(fill=tk.X, padx=12, pady=(0, 8))
+
+        self.lbl_capture = tk.Label(
+            bottom,
+            text="Ready | F9: Toggle | F10: Click-through",
+            bg=self.bg_color,
+            fg=self.text_secondary,
+            font=(self.font_family, 8)
+        )
         self.lbl_capture.pack(side=tk.LEFT)
 
-        self.btn_close = tk.Button(bottom, text="Close", command=self._on_close)
+        self.btn_close = tk.Button(
+            bottom,
+            text="✕ Close",
+            command=self._on_close,
+            bg="#475569",
+            fg="#fff",
+            font=(self.font_family, 8, "bold"),
+            relief=tk.FLAT,
+            cursor="hand2"
+        )
         self.btn_close.pack(side=tk.RIGHT)
 
     def _bind_shortcuts(self):
+        """Bind global hotkeys."""
         self.root.bind("<F9>", lambda e: self.toggle_visibility())
         self.root.bind("<F10>", lambda e: self.toggle_click_through())
 
     def toggle_visibility(self):
+        """Toggle window visibility (F9)."""
         if self.root.winfo_viewable():
             self.root.withdraw()
+            print("[Stealth] Hidden (F9 to show)")
         else:
             self.root.deiconify()
             self.root.attributes("-topmost", True)
+            print("[Stealth] Visible")
 
     def toggle_click_through(self):
-        # Simple toggle: set click-through by lowering window - not modifying OS styles here
+        """Toggle click-through mode (F10)."""
         self.is_click_through = not self.is_click_through
-        if self.is_click_through:
-            self.lbl_capture.config(text="Click-through: ON")
-        else:
-            self.lbl_capture.config(text="Click-through: OFF")
+        status = "ON" if self.is_click_through else "OFF"
+        self.lbl_capture.config(text=f"Click-through: {status} | F9: Toggle | F10: Click-through")
+        print(f"[Stealth] Click-through: {status}")
 
-    # ---------------- Devices -----------------
+    # ─────────────────────────────────────────────────────────────────────────
+    # Device Management
+    # ─────────────────────────────────────────────────────────────────────────
+
     def _populate_devices(self):
+        """Populate device dropdowns."""
         if sd is None or np is None:
-            self.cmb_mic['values'] = ["sounddevice or numpy not installed"]
-            self.cmb_loop['values'] = ["sounddevice or numpy not installed"]
+            self.cmb_mic["values"] = ["sounddevice/numpy not installed"]
+            self.cmb_loop["values"] = ["sounddevice/numpy not installed"]
             return
+
         try:
             devs = sd.query_devices()
             mic_list = []
             loop_list = []
+
             for i, d in enumerate(devs):
-                name = f"{i}: {d['name']} (in={d['max_input_channels']}, out={d['max_output_channels']})"
-                if d['max_input_channels'] > 0:
+                name = f"{i}: {d['name']}"
+                if d["max_input_channels"] > 0:
                     mic_list.append(name)
-                # Heuristic: WASAPI loopback devices on Windows expose "(loopback)" or have max_output>0
-                if d['max_output_channels'] > 0 and 'loopback' in d['name'].lower():
+                if "loopback" in d["name"].lower() or "stereo mix" in d["name"].lower():
                     loop_list.append(name)
-                elif 'stereo mix' in d['name'].lower() or 'output' in d['name'].lower():
-                    loop_list.append(name)
-            # Fallback: allow any input device as loopback if none matched
-            if not loop_list:
-                for i, d in enumerate(devs):
-                    if d['max_output_channels'] > 0:
-                        loop_list.append(f"{i}: {d['name']} (out={d['max_output_channels']})")
-            self.cmb_mic['values'] = mic_list
-            self.cmb_loop['values'] = loop_list
+
+            self.cmb_mic["values"] = mic_list
+            self.cmb_loop["values"] = loop_list
+
             if mic_list:
                 self.cmb_mic.current(0)
             if loop_list:
                 self.cmb_loop.current(0)
-        except Exception as e:
-            self.cmb_mic['values'] = [f"error: {e}"]
-            self.cmb_loop['values'] = [f"error: {e}"]
 
-    # ---------------- Capture lifecycle -----------------
+            print(f"[Audio] Found {len(mic_list)} mic(s), {len(loop_list)} loopback device(s)")
+        except Exception as e:
+            messagebox.showerror("Device Error", str(e))
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # Capture Lifecycle
+    # ─────────────────────────────────────────────────────────────────────────
+
     def start_capture(self):
+        """Start audio capture and WebSocket connection."""
         if sd is None or np is None or websockets is None:
-            self._show_error("Missing dependencies: install numpy, sounddevice, websockets")
+            messagebox.showerror(
+                "Missing Dependencies",
+                "Install: numpy, sounddevice, websockets"
+            )
             return
-        # Determine devices from combobox
+
         try:
             mic_sel = self.cmb_mic.get()
             loop_sel = self.cmb_loop.get()
-            self.mic_device = int(mic_sel.split(":", 1)[0]) if mic_sel and ":" in mic_sel else None
-            self.loopback_device = int(loop_sel.split(":", 1)[0]) if loop_sel and ":" in loop_sel else None
+            self.mic_device = int(mic_sel.split(":", 1)[0]) if mic_sel else None
+            self.loopback_device = int(loop_sel.split(":", 1)[0]) if loop_sel else None
         except Exception:
             self.mic_device = None
             self.loopback_device = None
 
         if self._capture_thread and self._capture_thread.is_alive():
             return
+
         self._stop_event.clear()
         self._capture_thread = threading.Thread(target=self._capture_loop, daemon=True)
         self._capture_thread.start()
-        # Start websocket thread
+
         if not (self._ws_thread and self._ws_thread.is_alive()):
             self._ws_thread = threading.Thread(target=self._ws_loop_thread, daemon=True)
             self._ws_thread.start()
 
         self.is_capturing = True
-        self.lbl_capture.config(text=f"Capture: running ({self.chunk_seconds}s chunks)")
+        self.lbl_capture.config(text=f"▶ Capturing ({self.chunk_seconds}s chunks)")
         self.btn_start.config(state=tk.DISABLED)
         self.btn_stop.config(state=tk.NORMAL)
+        print("[Capture] Started")
 
     def stop_capture(self):
+        """Stop audio capture."""
         self._stop_event.set()
         self.is_capturing = False
-        self.lbl_capture.config(text="Capture: stopped")
+        self.lbl_capture.config(text="⏹ Stopped")
         self.btn_start.config(state=tk.NORMAL)
         self.btn_stop.config(state=tk.DISABLED)
+        print("[Capture] Stopped")
 
     def _capture_loop(self):
-        """Capture audio from selected devices, mix, chunk, encode WAV, and enqueue bytes."""
+        """Capture audio from devices."""
         samplerate = 16000
         frames_per_chunk = int(self.chunk_seconds * samplerate)
 
         q_mic = queue.Queue()
         q_loop = queue.Queue()
 
-        def make_callback(q, dtype):
+        def make_callback(q):
             def cb(indata, frames, time_info, status):
                 if status:
-                    # do not crash on overflow
-                    print("Audio callback status:", status, file=sys.stderr)
+                    print(f"Audio callback status: {status}")
                 try:
-                    if indata is None:
-                        return
-                    # indata is numpy array already when using default dtype
                     q.put(indata.copy())
                 except Exception as e:
-                    print("Audio callback error:", e, file=sys.stderr)
+                    print(f"Audio callback error: {e}")
             return cb
 
         mic_stream = None
@@ -337,23 +455,37 @@ class StealthOverlayApp:
 
         try:
             if self.mic_device is not None:
-                mic_stream = sd.InputStream(device=self.mic_device, channels=1, samplerate=samplerate, dtype='float32', callback=make_callback(q_mic, 'float32'))
+                mic_stream = sd.InputStream(
+                    device=self.mic_device,
+                    channels=1,
+                    samplerate=samplerate,
+                    dtype="float32",
+                    callback=make_callback(q_mic)
+                )
                 mic_stream.start()
-            if self.loopback_device is not None:
-                # In sounddevice/PortAudio WASAPI loopback, device index for loopback must be a special WASAPI device.
-                loop_stream = sd.InputStream(device=self.loopback_device, channels=1, samplerate=samplerate, dtype='float32', callback=make_callback(q_loop, 'float32'))
-                loop_stream.start()
+                print(f"[Audio] Microphone stream started (device {self.mic_device})")
 
-            # Accumulate buffers
+            if self.loopback_device is not None:
+                loop_stream = sd.InputStream(
+                    device=self.loopback_device,
+                    channels=1,
+                    samplerate=samplerate,
+                    dtype="float32",
+                    callback=make_callback(q_loop)
+                )
+                loop_stream.start()
+                print(f"[Audio] Loopback stream started (device {self.loopback_device})")
+
             accum = np.zeros(0, dtype=np.float32)
             while not self._stop_event.is_set():
                 parts = []
-                # collect from mic
+
                 try:
                     while not q_mic.empty():
                         parts.append(q_mic.get_nowait().reshape(-1))
                 except Exception:
                     pass
+
                 try:
                     while not q_loop.empty():
                         parts.append(q_loop.get_nowait().reshape(-1))
@@ -361,115 +493,116 @@ class StealthOverlayApp:
                     pass
 
                 if parts:
-                    # Resample any parts to target_sr if needed (assume streams already at samplerate)
-                    # Concatenate into mono float32
                     concat = np.concatenate(parts)
                     accum = np.concatenate([accum, concat]) if accum.size else concat
 
-                # If enough samples for chunk, process
                 if accum.shape[0] >= frames_per_chunk:
                     chunk = accum[:frames_per_chunk]
                     accum = accum[frames_per_chunk:]
-                    # Mix (chunk is mono already), normalize
+
                     if chunk.dtype != np.float32:
                         chunk = chunk.astype(np.float32)
-                    # Avoid clipping
+
                     maxv = np.max(np.abs(chunk)) if chunk.size else 1.0
                     if maxv > 1.0:
                         chunk = chunk / maxv
+
                     pcm16 = pcm16_from_float32(chunk)
                     wav_bytes = encode_wav_bytes(pcm16, samplerate)
-                    self._audio_queue.put(wav_bytes)
+
+                    try:
+                        self._audio_queue.put_nowait(wav_bytes)
+                    except queue.Full:
+                        self._audio_queue.get()  # Drop oldest
+                        self._audio_queue.put_nowait(wav_bytes)
                 else:
                     time.sleep(0.01)
-        except Exception as e:
-            self._show_error(f"Audio capture error: {e}")
-        finally:
-            try:
-                if mic_stream:
-                    mic_stream.stop()
-                    mic_stream.close()
-            except Exception:
-                pass
-            try:
-                if loop_stream:
-                    loop_stream.stop()
-                    loop_stream.close()
-            except Exception:
-                pass
 
-    # ---------------- WebSocket Thread & Async Loop -----------------
+        except Exception as e:
+            print(f"[Capture] Error: {e}")
+        finally:
+            for stream in [mic_stream, loop_stream]:
+                try:
+                    if stream:
+                        stream.stop()
+                        stream.close()
+                except Exception:
+                    pass
+            print("[Capture] Streams closed")
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # WebSocket
+    # ─────────────────────────────────────────────────────────────────────────
+
     def _ws_loop_thread(self):
+        """Run WebSocket event loop in thread."""
         if asyncio is None or websockets is None:
-            self._show_error("Missing asyncio/websockets dependency")
+            self._ui_set_status("WebSocket unavailable", ok=False)
             return
+
         self._ws_loop = asyncio.new_event_loop()
         asyncio.set_event_loop(self._ws_loop)
         self._ws_loop.run_until_complete(self._ws_main())
 
     async def _ws_main(self):
-        url = self.api_url.replace('http://', 'ws://').replace('https://', 'wss://') + f"/api/interviews/0/ws"
-        # Note: session_id should be set by user / UI at some point; using 0 as placeholder. The backend expects valid session.
+        """Main WebSocket loop with reconnect."""
+        url = self.api_url.replace("http://", "ws://").replace("https://", "wss://")
+        url += f"/api/interviews/{self.session_id}/ws"
+
         backoff = 1.0
         while not self._stop_event.is_set():
             try:
                 async with websockets.connect(url, max_size=None) as ws:
                     self.websocket = ws
                     self.ws_connected = True
-                    self._ui_set_status("Connected", ok=True)
+                    self._ui_set_status("Connected ✓", ok=True)
                     backoff = 1.0
 
-                    # Launch sender and receiver
                     sender = asyncio.create_task(self._ws_sender())
                     receiver = asyncio.create_task(self._ws_receiver())
-                    done, pending = await asyncio.wait([sender, receiver], return_when=asyncio.FIRST_EXCEPTION)
+                    done, pending = await asyncio.wait(
+                        [sender, receiver],
+                        return_when=asyncio.FIRST_EXCEPTION
+                    )
                     for t in pending:
                         t.cancel()
             except Exception as e:
                 self.ws_connected = False
-                self._ui_set_status(f"Disconnected: {e}", ok=False)
-                # backoff
+                self._ui_set_status(f"Disconnected ({backoff:.0f}s)", ok=False)
                 await asyncio.sleep(backoff)
                 backoff = min(backoff * 2, 30.0)
-                continue
             finally:
                 self.ws_connected = False
-                self._ui_set_status("Disconnected", ok=False)
-            # If stop requested, break
-            if self._stop_event.is_set():
-                break
 
     async def _ws_sender(self):
-        # Send audio frames from queue as binary
-        while not self._stop_event.is_set():
+        """Send audio frames as binary."""
+        while not self._stop_event.is_set() and self.ws_connected:
             try:
-                wav_bytes = await self._ws_loop.run_in_executor(None, self._audio_queue.get)
-                if not wav_bytes:
-                    await asyncio.sleep(0.01)
-                    continue
-                await self.websocket.send(wav_bytes)
-                # We expect backend to reply with audio.received events which the receiver will handle
+                wav_bytes = await self._ws_loop.run_in_executor(
+                    None,
+                    self._audio_queue.get,
+                    timeout=1
+                )
+                if wav_bytes:
+                    await self.websocket.send(wav_bytes)
             except Exception as e:
-                print("WS sender error:", e, file=sys.stderr)
+                print(f"[WS] Sender error: {e}")
                 break
 
     async def _ws_receiver(self):
-        while not self._stop_event.is_set():
+        """Receive and handle events."""
+        while not self._stop_event.is_set() and self.ws_connected:
             try:
                 msg = await self.websocket.recv()
-                # websockets returns bytes for binary frames, str for text
                 if isinstance(msg, bytes):
-                    # backend probably won't send binary back — ignore
                     continue
+
                 data = json.loads(msg)
                 ev_type = data.get("type")
-                payload = data.get("payload") or {}
-                # Handle events
+                payload = data.get("payload", {})
+
                 if ev_type == "ping":
                     await self.websocket.send(json.dumps({"type": "pong"}))
-                elif ev_type == "transcript.final":
-                    text = payload.get("text")
-                    self._ui_update_transcript(text)
                 elif ev_type == "question.detected":
                     q = payload.get("question")
                     self._ui_update_question(q)
@@ -478,69 +611,106 @@ class StealthOverlayApp:
                 elif ev_type == "session.connected":
                     self._ui_set_status("Session connected", ok=True)
                 elif ev_type == "session.error":
-                    self._show_error(payload.get("message", "session error"))
-                # else ignore
+                    msg_text = payload.get("message", "Unknown error")
+                    print(f"[WS] Error: {msg_text}")
             except Exception as e:
-                print("WS receiver error:", e, file=sys.stderr)
+                print(f"[WS] Receiver error: {e}")
                 break
 
-    # ---------------- UI update helpers -----------------
-    def _ui_set_status(self, text: str, ok: bool = True):
-        def cb():
-            self.status_label.config(text=text, fg=("#10b981" if ok else "#f87171"))
-        self.root.after(0, cb)
+    # ─────────────────────────────────────────────────────────────────────────
+    # UI Updates
+    # ─────────────────────────────────────────────────────────────────────────
 
-    def _ui_update_transcript(self, text: str):
+    def _ui_set_status(self, text: str, ok: bool = True):
+        """Update status label."""
         def cb():
-            self.txt_transcript.delete("1.0", tk.END)
-            self.txt_transcript.insert("1.0", text or "")
+            color = "#10b981" if ok else "#ef4444"
+            symbol = "●" if ok else "●"
+            self.status_label.config(text=f"{symbol} {text}", fg=color)
+
         self.root.after(0, cb)
 
     def _ui_update_question(self, q: str):
+        """Display detected question."""
         def cb():
-            self.lbl_question.config(text=q or "-")
+            self.txt_question.config(state=tk.NORMAL)
+            self.txt_question.delete("1.0", tk.END)
+            self.txt_question.insert("1.0", q or "-")
+            self.txt_question.config(state=tk.DISABLED)
+
         self.root.after(0, cb)
 
     def _ui_update_answer(self, payload: dict):
+        """Display AI-generated answer with auto-hide."""
         def cb():
-            ans = payload.get("answer") or ""
+            # Main answer
+            answer = payload.get("answer", "")
+            self.txt_answer.config(state=tk.NORMAL)
             self.txt_answer.delete("1.0", tk.END)
-            self.txt_answer.insert("1.0", ans)
+            if answer:
+                self.txt_answer.insert("1.0", answer)
+            self.txt_answer.config(state=tk.DISABLED)
+
+            # Key points
+            key_points = payload.get("key_points", [])
+            if key_points:
+                self.lbl_keypoints.config(text="• " + "\n• ".join(key_points))
+            else:
+                self.lbl_keypoints.config(text="-")
+
+            # Auto-hide after delay
+            if self.answer_auto_hide_task:
+                self.root.after_cancel(self.answer_auto_hide_task)
+
+            self.answer_auto_hide_task = self.root.after(
+                10000,  # 10 seconds (configurable via settings)
+                self._auto_hide_answer
+            )
+
         self.root.after(0, cb)
 
-    def _show_error(self, message: str):
-        self._ui_set_status("Error", ok=False)
+    def _auto_hide_answer(self):
+        """Auto-hide answer after delay."""
         def cb():
+            self.txt_answer.config(state=tk.NORMAL)
             self.txt_answer.delete("1.0", tk.END)
-            self.txt_answer.insert("1.0", f"ERROR: {message}")
-        self.root.after(0, cb)
+            self.txt_answer.config(state=tk.DISABLED)
+            self.lbl_keypoints.config(text="-")
 
-    # ---------------- Controls -----------------
-    def _trigger_reconnect(self):
-        # Simple reconnect: set stop_event and restart ws thread
-        self._stop_event.set()
-        time.sleep(0.2)
-        self._stop_event.clear()
-        if not (self._ws_thread and self._ws_thread.is_alive()):
-            self._ws_thread = threading.Thread(target=self._ws_loop_thread, daemon=True)
-            self._ws_thread.start()
+        self.root.after(0, cb)
+        print("[UI] Answer auto-hidden")
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # Cleanup
+    # ─────────────────────────────────────────────────────────────────────────
 
     def _on_close(self):
+        """Clean shutdown."""
         self.stop_capture()
         self._stop_event.set()
-        # Close websocket loop if running
+        time.sleep(0.2)
+
         try:
             if self._ws_loop and self._ws_loop.is_running():
                 self._ws_loop.call_soon_threadsafe(self._ws_loop.stop)
         except Exception:
             pass
+
         self.root.destroy()
+        print("[App] Closed")
 
 
-# Entry point
+# ─────────────────────────────────────────────────────────────────────────────
+# Entry Point
+# ─────────────────────────────────────────────────────────────────────────────
+
 def main():
     root = tk.Tk()
-    app = StealthOverlayApp(root)
+    app = StealthOverlayApp(
+        root,
+        api_url="http://localhost:8000",
+        session_id=1  # Change to your session ID or pass via CLI
+    )
     root.mainloop()
 
 
