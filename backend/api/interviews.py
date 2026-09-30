@@ -15,7 +15,7 @@ from api.schemas import (
 )
 from api.profile import get_profile
 from agents.orchestrator import InterviewOrchestrator
-from ai.provider import get_provider
+from ai.provider import get_provider, ensure_provider_ready
 from realtime.session import LiveSession
 
 router = APIRouter(prefix="/api/interviews", tags=["interviews"])
@@ -77,7 +77,9 @@ async def start_session(session_id: int, db: Session = Depends(get_db)):
     session.started_at = datetime.utcnow()
     db.commit()
 
-    orchestrator = InterviewOrchestrator(db, get_provider(db=db))
+    provider = get_provider(db=db)
+    await ensure_provider_ready(provider)  # fail fast with a clear 503 if llama-server is down
+    orchestrator = InterviewOrchestrator(db, provider)
     question_text = await orchestrator.generate_next_question(session)
     if not question_text:
         raise HTTPException(status_code=500, detail="Failed to generate question")

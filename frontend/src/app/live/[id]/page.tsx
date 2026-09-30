@@ -34,6 +34,7 @@ interface TranscriptItem {
   text: string;
   timestamp: string;
   isQuestion?: boolean;
+  partial?: boolean;
 }
 
 interface AnswerData {
@@ -69,71 +70,119 @@ export default function LiveWorkspacePage({ params }: { params: Promise<{ id: st
   const [manualQuery, setManualQuery] = useState('');
   const [wsConnected, setWsConnected] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [streamingText, setStreamingText] = useState('');
 
   const wsRef = useRef<WebSocket | null>(null);
   const transcriptEndRef = useRef<HTMLDivElement | null>(null);
   const recognitionRef = useRef<any>(null);
   const displayStreamRef = useRef<MediaStream | null>(null);
+  const fileInputRef = useRef<HTMLInputElement | null>(null);
 
   useEffect(() => {
     // 1. Fetch Session & Profile
     api.getSession(sessionId).then(setSession).catch(() => {});
     api.getProfile().then(setProfile).catch(() => {});
 
-    // 2. Connect WebSocket
-    const wsUrl = `${WS_BASE}/api/interviews/${sessionId}/ws`;
-    const ws = new WebSocket(wsUrl);
-    wsRef.current = ws;
+    // 2. Connect WebSocket with automatic reconnection (exponential backoff, cap 15s)
+    let socket: WebSocket | null = null;
+    let disposed = false;
+    let retryDelay = 1000;
+    let retryTimer: ReturnType<typeof setTimeout> | null = null;
 
-    ws.onopen = () => {
-      setWsConnected(true);
-    };
+    const connect = () => {
+      if (disposed) return;
+      const wsUrl = `${WS_BASE}/api/interviews/${sessionId}/ws`;
+      socket = new WebSocket(wsUrl);
+      wsRef.current = socket;
 
-    ws.onmessage = (event) => {
-      try {
-        const msg = JSON.parse(event.data);
-        const { type, payload } = msg;
+      socket.onopen = () => {
+        retryDelay = 1000;
+        setWsConnected(true);
+        setError(null);
+      };
 
-        if (type === 'transcript.final' || type === 'transcript.partial') {
-          if (payload.text) {
-            setTranscripts((prev) => [
-              ...prev,
-              {
-                id: Math.random().toString(),
-                speaker: payload.speaker || 'interviewer',
-                text: payload.text,
-                timestamp: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' }),
-              },
-            ]);
+      socket.onmessage = (event) => {
+        try {
+          const msg = JSON.parse(event.data);
+          const { type, payload } = msg;
+
+          if (type === 'transcript.partial') {
+            if (payload.text) {
+              const now = new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' });
+              setTranscripts((prev) => {
+                const next = [...prev];
+                const last = next[next.length - 1];
+                if (last && last.partial) {
+                  next[next.length - 1] = { ...last, text: payload.text, timestamp: now, speaker: payload.speaker || last.speaker };
+                  return next;
+                }
+                return [...next, { id: Math.random().toString(), speaker: payload.speaker || 'interviewer', text: payload.text, timestamp: now, partial: true }];
+              });
+            }
+          } else if (type === 'transcript.final') {
+            if (payload.text) {
+              const now = new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' });
+              setTranscripts((prev) => {
+                const next = [...prev];
+                const last = next[next.length - 1];
+                if (last && last.partial) {
+                  next[next.length - 1] = { ...last, text: payload.text, timestamp: now, partial: false };
+                  return next;
+                }
+                return [...next, { id: Math.random().toString(), speaker: payload.speaker || 'interviewer', text: payload.text, timestamp: now }];
+              });
+            }
+          } else if (type === 'question.detected') {
+            setDetectedQuestion(payload.question);
+          } else if (type === 'answer.generating') {
+            setIsGenerating(true);
+            setStreamingText('');
+            setCurrentAnswer(null);
+            setError(null);
+          } else if (type === 'answer.streamed') {
+            setStreamingText((prev) => prev + (payload.delta || ''));
+          } else if (type === 'answer.generated') {
+            setIsGenerating(false);
+            setStreamingText('');
+            setCurrentAnswer(payload);
+          } else if (type === 'answer.cancelled') {
+            setIsGenerating(false);
+            setStreamingText('');
+            setError(null);
+          } else if (type === 'session.error') {
+            console.warn('WS Session warning:', payload.message);
           }
-        } else if (type === 'question.detected') {
-          setDetectedQuestion(payload.question);
-          if (autoAnswer && payload.question) {
-            handleManualTrigger(undefined, payload.question);
-          }
-        } else if (type === 'answer.generating') {
-          setIsGenerating(true);
-        } else if (type === 'answer.generated') {
-          setIsGenerating(false);
-          setCurrentAnswer(payload);
-        } else if (type === 'session.error') {
-          console.warn('WS Session warning:', payload.message);
+        } catch (err) {
+          console.error('WS Parse Error:', err);
         }
-      } catch (err) {
-        console.error('WS Parse Error:', err);
-      }
+      };
+
+      socket.onclose = () => {
+        setWsConnected(false);
+        if (!disposed) {
+          retryTimer = setTimeout(connect, retryDelay);
+          retryDelay = Math.min(retryDelay * 2, 15000);
+        }
+      };
+
+      socket.onerror = () => {
+        socket?.close();
+      };
     };
 
-    ws.onclose = () => setWsConnected(false);
+    connect();
 
     return () => {
-      if (ws.readyState === WebSocket.OPEN) ws.close();
+      disposed = true;
+      if (retryTimer) clearTimeout(retryTimer);
+      if (socket && socket.readyState === WebSocket.OPEN) socket.close();
+      wsRef.current = null;
       if (recognitionRef.current) recognitionRef.current.stop();
       if (displayStreamRef.current) {
         displayStreamRef.current.getTracks().forEach((t) => t.stop());
       }
     };
-  }, [sessionId, autoAnswer]);
+  }, [sessionId]);
 
   useEffect(() => {
     transcriptEndRef.current?.scrollIntoView({ behavior: 'smooth' });
@@ -247,6 +296,8 @@ export default function LiveWorkspacePage({ params }: { params: Promise<{ id: st
 
     setIsGenerating(true);
     setDetectedQuestion(query);
+    setStreamingText('');
+    setCurrentAnswer(null);
 
     try {
       const result = await api.suggestAnswer(query, 'unknown', sessionId);
@@ -256,6 +307,30 @@ export default function LiveWorkspacePage({ params }: { params: Promise<{ id: st
       setError(err.message || 'Failed to generate answer');
     } finally {
       setIsGenerating(false);
+      setStreamingText('');
+    }
+  };
+
+  // Visual Input: image/screenshot upload
+  const handleImageUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    setIsGenerating(true);
+    setError(null);
+    setStreamingText('');
+    setCurrentAnswer(null);
+    try {
+      const analysis = await api.analyzeImage(file, sessionId);
+      setDetectedQuestion(analysis.question);
+      setCurrentAnswer({
+        answer: analysis.answer,
+        key_points: analysis.key_points || [],
+      });
+    } catch (err: any) {
+      setError(err.message || 'Image analysis failed');
+    } finally {
+      setIsGenerating(false);
+      if (fileInputRef.current) fileInputRef.current.value = '';
     }
   };
 
@@ -281,6 +356,23 @@ export default function LiveWorkspacePage({ params }: { params: Promise<{ id: st
         </div>
 
         <div className="flex flex-wrap items-center gap-2.5">
+          <input
+            ref={fileInputRef}
+            type="file"
+            accept="image/png,image/jpeg,image/webp,image/bmp"
+            onChange={handleImageUpload}
+            className="hidden"
+          />
+          <button
+            onClick={() => fileInputRef.current?.click()}
+            disabled={isGenerating}
+            className="flex items-center gap-1.5 px-3 py-1.5 rounded-xl text-xs font-semibold bg-violet-950/60 border border-violet-500/30 text-violet-300 hover:bg-violet-900/60 transition-all disabled:opacity-50"
+            title="Upload a screenshot or image for visual question analysis"
+          >
+            <Layers className="w-3.5 h-3.5 text-violet-400" />
+            <span>Upload Image</span>
+          </button>
+
           {/* Desktop Stealth Overlay Guide Button */}
           <button
             onClick={() => setShowStealthModal(true)}
@@ -437,6 +529,17 @@ export default function LiveWorkspacePage({ params }: { params: Promise<{ id: st
                     )}
                   </div>
                 )}
+              </div>
+            ) : streamingText ? (
+              <div className="p-5 rounded-2xl bg-emerald-950/30 border border-emerald-500/40 shadow-lg space-y-2">
+                <p className="text-xs font-bold text-emerald-400 uppercase tracking-wider flex items-center gap-1.5">
+                  <Sparkles className="w-3.5 h-3.5 animate-pulse" />
+                  <span>Generating Answer (streaming)</span>
+                </p>
+                <p className="text-sm text-slate-100 font-medium leading-relaxed">
+                  {streamingText}
+                  <span className="inline-block w-1.5 h-3.5 bg-emerald-400 animate-pulse ml-0.5 align-text-bottom" />
+                </p>
               </div>
             ) : (
               <div className="h-48 flex flex-col items-center justify-center text-center text-slate-500 space-y-2">
@@ -613,6 +716,19 @@ export default function LiveWorkspacePage({ params }: { params: Promise<{ id: st
                       ))}
                     </div>
                   )}
+                </div>
+              ) : streamingText ? (
+                <div className="space-y-4">
+                  <div className="p-4 rounded-xl bg-emerald-500/10 border border-emerald-500/30 space-y-1.5">
+                    <p className="text-[11px] font-bold text-emerald-400 uppercase tracking-wider flex items-center gap-1">
+                      <Sparkles className="w-3 h-3 animate-pulse" />
+                      <span>Direct 30-Sec Soundbite (streaming)</span>
+                    </p>
+                    <p className="text-xs text-slate-100 font-medium leading-relaxed">
+                      {streamingText}
+                      <span className="inline-block w-1.5 h-3.5 bg-emerald-400 animate-pulse ml-0.5 align-text-bottom" />
+                    </p>
+                  </div>
                 </div>
               ) : (
                 <div className="h-full flex flex-col items-center justify-center text-center p-6 text-slate-500 space-y-2">

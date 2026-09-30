@@ -213,9 +213,9 @@ Requirements:
         # 6. Model Config & Settings
         if not db.query(ModelConfiguration).filter_by(is_active=True).first():
             db.add(ModelConfiguration(
-                provider="ollama",
-                model_name="llama3.2:3b",
-                embedding_model="nomic-embed-text",
+                provider="bonsai",
+                model_name="bonsai-8b",
+                embedding_model="all-MiniLM-L6-v2",
                 transcription_model="base",
                 is_active=True,
             ))

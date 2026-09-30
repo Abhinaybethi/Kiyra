@@ -196,3 +196,37 @@ class AnswerSuggestionResponse(BaseModel):
     confidence: Optional[float] = None
     missing_context: Optional[str] = None
     model_used: str = ""
+
+
+# ── Visual Input Pipeline ────────────────────────────────────────────────
+
+class VisualAnalysisResponse(BaseModel):
+    extracted_text: str
+    line_count: int = 0
+    question: str
+    is_question: bool = False
+    likely_code: bool = False
+    answer: str = ""
+    key_points: Optional[list[str]] = None
+    rag_used: bool = False
+    rag_ms: float = 0.0
+    latency_ms: int = 0
+    model_used: str = ""
+    ocr_ms: Optional[float] = None
+
+
+class VisualExtractResponse(BaseModel):
+    """OCR-only result: image → text + extracted question, no answering.
+
+    The overlay uses this to feed the extracted question into the SAME
+    streaming real-time pipeline as voice/manual questions (never a separate
+    screenshot answer engine).
+    """
+    extracted_text: str
+    line_count: int = 0
+    question: str
+    is_question: bool = False
+    likely_code: bool = False
+    avg_confidence: Optional[float] = None
+    ocr_ms: Optional[float] = None
+    source: str = "screenshot"

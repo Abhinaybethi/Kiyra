@@ -71,7 +71,9 @@ def test_full_candidate_interview_lifecycle(client):
     assert session_data["status"] == "pending"
 
     # Step 5: Start Interview (AI generates Question 1)
-    with patch("ai.provider.OllamaProvider.complete", new_callable=AsyncMock) as mock_complete:
+    with patch("ai.provider.BonsaiProvider.health_check", new_callable=AsyncMock) as mock_health, \
+         patch("ai.provider.BonsaiProvider.complete", new_callable=AsyncMock) as mock_complete:
+        mock_health.return_value = True
         mock_complete.return_value = "Can you explain how the Raft consensus algorithm handles network partitions?"
         start_res = client.post(f"/api/interviews/{session_id}/start")
         assert start_res.status_code == 200
@@ -88,7 +90,7 @@ def test_full_candidate_interview_lifecycle(client):
         ),
         "method": "text",
     }
-    with patch("ai.provider.OllamaProvider.complete", new_callable=AsyncMock) as mock_complete:
+    with patch("ai.provider.BonsaiProvider.complete", new_callable=AsyncMock) as mock_complete:
         # AI asks Question 2 as follow up
         mock_complete.return_value = "How would you handle split-brain scenarios when the partition heals?"
         ans1_res = client.post(

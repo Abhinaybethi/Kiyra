@@ -75,13 +75,10 @@ def _clean_text(text: str) -> str:
 
 async def save_upload(filename: str, content: bytes) -> str:
     """Save file to uploads dir and return path."""
-    import aiofiles
+    import asyncio
     upload_dir = Path(settings.upload_dir)
     upload_dir.mkdir(parents=True, exist_ok=True)
     safe_name = validate_file(filename, content)
     file_path = upload_dir / safe_name
-
-    async with aiofiles.open(file_path, "wb") as f:
-        await f.write(content)
-
+    await asyncio.to_thread(file_path.write_bytes, content)
     return str(file_path)

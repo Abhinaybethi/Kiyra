@@ -7,7 +7,7 @@ from sqlalchemy.orm import Session
 from db.database import get_db
 from db.models import ModelConfiguration, ApplicationSettings
 from api.schemas import ModelConfigUpdate, ModelConfigResponse, SettingUpdate, OKResponse
-from ai.provider import get_provider, OllamaProvider
+from ai.provider import get_provider, BonsaiProvider
 
 router = APIRouter(prefix="/api/settings", tags=["settings"])
 
@@ -40,13 +40,21 @@ def update_model_config(data: ModelConfigUpdate, db: Session = Depends(get_db)):
 
 @router.get("/models/available")
 async def list_available_models(db: Session = Depends(get_db)):
-    """List models available in Ollama."""
-    provider = OllamaProvider()
+    """List models available on the Bonsai (llama.cpp) server."""
+    provider = BonsaiProvider()
     healthy = await provider.health_check()
     if not healthy:
-        return {"ollama_available": False, "models": [], "error": "Ollama is not running. Start with: ollama serve"}
+        return {
+            "available": False,
+            "models": [],
+            "provider": "bonsai",
+            "error": (
+                "Bonsai inference server is unavailable. "
+                "Start llama-server and verify BONSAI_BASE_URL."
+            ),
+        }
     models = await provider.list_models()
-    return {"ollama_available": True, "models": models}
+    return {"available": True, "models": models, "provider": "bonsai", "error": None}
 
 
 @router.get("/models/health")

@@ -1,0 +1,17 @@
+fastapi
+uvicorn[standard]
+pydantic
+pydantic-settings
+sqlalchemy
+alembic
+python-multipart
+httpx
+pdfminer.six
+python-docx
+numpy
+sentence-transformers
+chromadb
+faster-whisper
+rapidocr-onnxruntime
+pytest
+pytest-asyncio

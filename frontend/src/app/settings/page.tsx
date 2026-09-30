@@ -17,10 +17,10 @@ export default function SettingsPage() {
   const [modelConfig, setModelConfig] = useState<ModelConfig | null>(null);
   const [profile, setProfile] = useState<Profile | null>(null);
   const [availableModels, setAvailableModels] = useState<string[]>([]);
-  const [ollamaAvailable, setOllamaAvailable] = useState<boolean>(true);
-  const [provider, setProvider] = useState('ollama');
-  const [modelName, setModelName] = useState('llama3.2:3b');
-  const [embeddingModel, setEmbeddingModel] = useState('nomic-embed-text');
+  const [bonsaiAvailable, setBonsaiAvailable] = useState<boolean>(true);
+  const [provider, setProvider] = useState('bonsai');
+  const [modelName, setModelName] = useState('bonsai-8b');
+  const [embeddingModel, setEmbeddingModel] = useState('all-MiniLM-L6-v2');
   const [transcriptionModel, setTranscriptionModel] = useState('base');
   const [candidateName, setCandidateName] = useState('');
   const [targetRole, setTargetRole] = useState('');
@@ -46,9 +46,9 @@ export default function SettingsPage() {
     }).catch(() => {});
 
     api.getAvailableModels().then((res) => {
-      setOllamaAvailable(res.ollama_available);
+      setBonsaiAvailable(res.available);
       setAvailableModels(res.models);
-    }).catch(() => setOllamaAvailable(false));
+    }).catch(() => setBonsaiAvailable(false));
   };
 
   useEffect(() => {
@@ -124,11 +124,11 @@ export default function SettingsPage() {
             <div className="flex items-center gap-2">
               <span
                 className={`w-2.5 h-2.5 rounded-full ${
-                  ollamaAvailable ? 'bg-emerald-400 animate-pulse' : 'bg-amber-400'
+                  bonsaiAvailable ? 'bg-emerald-400 animate-pulse' : 'bg-amber-400'
                 }`}
               />
               <span className="text-xs text-slate-400">
-                {ollamaAvailable ? 'Ollama Online' : 'Ollama Unreachable'}
+                {bonsaiAvailable ? 'Bonsai Server Online' : 'Bonsai Server Unreachable'}
               </span>
             </div>
           </div>
@@ -141,8 +141,9 @@ export default function SettingsPage() {
                 onChange={(e) => setProvider(e.target.value)}
                 className="w-full px-4 py-2.5 rounded-xl bg-slate-900 border border-slate-800 text-xs text-white focus:outline-none focus:border-indigo-500 transition-colors"
               >
-                <option value="ollama">Ollama (Local / Free / Private)</option>
-                <option value="openai_compatible">OpenAI-Compatible / LMStudio / OpenRouter</option>
+                <option value="bonsai">Bonsai (Local llama.cpp / Free / Private) - Default</option>
+                <option value="openai_compatible">Local OpenAI-Compatible Server (LMStudio / vLLM)</option>
+                <option value="ollama">Ollama (Legacy / Optional)</option>
               </select>
             </div>
 
@@ -165,7 +166,7 @@ export default function SettingsPage() {
                   type="text"
                   value={modelName}
                   onChange={(e) => setModelName(e.target.value)}
-                  placeholder="e.g. llama3.2:3b, mistral, qwen2.5-coder"
+                  placeholder="e.g. bonsai-8b, llama3.2:3b, mistral, qwen2.5-coder"
                   className="w-full px-4 py-2.5 rounded-xl bg-slate-900 border border-slate-800 text-xs text-white placeholder-slate-500 focus:outline-none focus:border-indigo-500 transition-colors"
                 />
               )}

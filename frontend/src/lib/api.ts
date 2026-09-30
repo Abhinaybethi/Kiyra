@@ -178,6 +178,21 @@ export interface SearchKnowledgeResult {
   }>;
 }
 
+export interface VisualAnalysis {
+  extracted_text: string;
+  line_count: number;
+  question: string;
+  is_question: boolean;
+  likely_code: boolean;
+  answer: string;
+  key_points?: string[];
+  rag_used: boolean;
+  rag_ms: number;
+  latency_ms: number;
+  model_used: string;
+  ocr_ms?: number;
+}
+
 async function request<T>(path: string, options: RequestInit = {}): Promise<T> {
   const url = `${API_BASE}${path}`;
   const res = await fetch(url, {
@@ -281,15 +296,33 @@ export const api = {
       body: JSON.stringify({ question, question_type, session_id: sessionId }),
     }),
 
-  // Analytics
-  getDashboard: () => request<DashboardData>('/api/analytics/dashboard'),
-  getSessionAnalytics: (id: number) => request<any>(`/api/analytics/session/${id}`),
+// Analytics
+    getDashboard: () => request<DashboardData>('/api/analytics/dashboard'),
+    getSessionAnalytics: (id: number) => request<any>(`/api/analytics/session/${id}`),
+
+    // Visual Input
+    analyzeImage: async (file: File, sessionId?: number) => {
+      const formData = new FormData();
+      formData.append('file', file);
+      if (sessionId) formData.append('session_id', String(sessionId));
+      const res = await fetch(`${API_BASE}/api/vision/analyze`, {
+        method: 'POST',
+        body: formData,
+      });
+      let errDetail: string | undefined;
+      try {
+        const err = await res.json();
+        errDetail = err.detail;
+      } catch { /* fallback */ }
+      if (!res.ok) throw new Error(errDetail || 'Image analysis failed');
+      return res.json() as Promise<VisualAnalysis>;
+    },
 
   // Settings & Models
   getModelConfig: () => request<ModelConfig>('/api/settings/models'),
   updateModelConfig: (data: Partial<ModelConfig>) =>
     request<ModelConfig>('/api/settings/models', { method: 'PATCH', body: JSON.stringify(data) }),
-  getAvailableModels: () => request<{ ollama_available: boolean; models: string[]; error?: string }>('/api/settings/models/available'),
+  getAvailableModels: () => request<{ available: boolean; models: string[]; error?: string | null; provider?: string }>('/api/settings/models/available'),
   getModelHealth: () => request<{ healthy: boolean; provider: string; model: string }>('/api/settings/models/health'),
   getSettings: () => request<Record<string, string>>('/api/settings'),
   updateSetting: (key: string, value: string) =>

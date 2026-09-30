@@ -3,7 +3,7 @@ import pytest
 from unittest.mock import AsyncMock, patch, MagicMock
 
 from db.models import CandidateProfile, KnowledgeDocument, InterviewSession, QuestionType
-from ai.provider import OllamaProvider, OpenAICompatibleProvider, get_provider
+from ai.provider import BonsaiProvider, get_provider
 
 
 def test_knowledge_base_crud_and_search(client):

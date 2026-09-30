@@ -10,6 +10,7 @@ from fastapi.responses import JSONResponse
 
 from config import settings
 from db.database import Base, engine
+from ai.provider import ProviderUnavailableError
 
 
 @asynccontextmanager
@@ -33,6 +34,22 @@ async def lifespan(app: FastAPI):
         db.commit()
     finally:
         db.close()
+
+    # Warm up the Whisper + embedding models off the critical path so the first
+    # utterance in a live session doesn't eat the STT/RAG time budgets with
+    # one-time model loading or downloads.
+    import threading as _threading
+    from realtime.transcription import _get_model as _warm_whisper
+
+    def _warm_embeddings():
+        try:
+            from knowledge.embeddings import embed_text
+            embed_text("warmup")
+        except Exception as e:
+            print(f"[Warmup] embeddings failed: {e}")
+
+    _threading.Thread(target=_warm_whisper, name="whisper-warmup", daemon=True).start()
+    _threading.Thread(target=_warm_embeddings, name="embeddings-warmup", daemon=True).start()
 
     yield
     # Shutdown: nothing to clean up
@@ -66,6 +83,12 @@ async def global_exception_handler(request: Request, exc: Exception):
     return JSONResponse(status_code=500, content={"detail": detail})
 
 
+@app.exception_handler(ProviderUnavailableError)
+async def provider_unavailable_handler(request: Request, exc: ProviderUnavailableError):
+    """Surface clear domain-level errors instead of deep connection failures."""
+    return JSONResponse(status_code=503, content={"detail": str(exc)})
+
+
 # ── Routes ─────────────────────────────────────────────────────────────────
 
 from api.profile import router as profile_router
@@ -75,6 +98,7 @@ from api.knowledge import router as knowledge_router
 from api.interviews import router as interviews_router
 from api.analytics import router as analytics_router
 from api.settings import router as settings_router
+from api.vision import router as vision_router
 
 app.include_router(profile_router)
 app.include_router(resume_router)
@@ -83,6 +107,7 @@ app.include_router(knowledge_router)
 app.include_router(interviews_router)
 app.include_router(analytics_router)
 app.include_router(settings_router)
+app.include_router(vision_router)
 
 
 @app.get("/health")

@@ -2,7 +2,7 @@
 import pytest
 from knowledge.chunker import chunk_text, chunk_document
 from services.document_parser import validate_file, extract_text, _clean_text
-from realtime.transcription import detect_question
+from realtime.question_detector import detect as detect_question
 
 
 def test_chunk_text_basic():

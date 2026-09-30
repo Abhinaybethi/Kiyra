@@ -58,6 +58,7 @@ class AgentStatus(str, enum.Enum):
 
 
 class AIProviderType(str, enum.Enum):
+    BONSAI = "bonsai"
     OLLAMA = "ollama"
     OPENAI_COMPATIBLE = "openai_compatible"
 
@@ -239,6 +240,7 @@ class InterviewSession(Base):
     transcript_segments: Mapped[list["TranscriptSegment"]] = relationship(back_populates="session", cascade="all, delete-orphan")
     feedback: Mapped[Optional["InterviewFeedback"]] = relationship(back_populates="session", uselist=False, cascade="all, delete-orphan")
     agent_runs: Mapped[list["AgentRun"]] = relationship(back_populates="session", cascade="all, delete-orphan")
+    turns: Mapped[list["SessionTurn"]] = relationship(back_populates="session", cascade="all, delete-orphan")
 
     __table_args__ = (
         Index("ix_sessions_profile", "profile_id"),
@@ -347,9 +349,9 @@ class ModelConfiguration(Base):
     __tablename__ = "model_configurations"
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
-    provider: Mapped[str] = mapped_column(String(50), default="ollama")
-    model_name: Mapped[str] = mapped_column(String(100), default="llama3.2:3b")
-    embedding_model: Mapped[str] = mapped_column(String(100), default="nomic-embed-text")
+    provider: Mapped[str] = mapped_column(String(50), default="bonsai")
+    model_name: Mapped[str] = mapped_column(String(100), default="bonsai-8b")
+    embedding_model: Mapped[str] = mapped_column(String(100), default="all-MiniLM-L6-v2")
     transcription_model: Mapped[str] = mapped_column(String(50), default="base")
     provider_url: Mapped[Optional[str]] = mapped_column(String(500))
     api_key_env: Mapped[Optional[str]] = mapped_column(String(100))  # env var name, not the key itself
@@ -367,3 +369,57 @@ class ApplicationSettings(Base):
     category: Mapped[str] = mapped_column(String(50), default="general")
     description: Mapped[Optional[str]] = mapped_column(String(500))
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+
+# ── Session Memory (Phase 3) ───────────────────────────────────────────────
+
+class SessionTurn(Base):
+    """One answered exchange of a live session (original question kept for
+    display; resolved_question stores the follow-up-resolved form)."""
+    __tablename__ = "session_turns"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    session_id: Mapped[int] = mapped_column(ForeignKey("interview_sessions.id"))
+    turn_index: Mapped[int] = mapped_column(Integer, default=0)
+    question: Mapped[str] = mapped_column(Text)
+    answer: Mapped[str] = mapped_column(Text)
+    resolved_question: Mapped[Optional[str]] = mapped_column(Text)
+    topic: Mapped[Optional[str]] = mapped_column(String(200))
+    entities: Mapped[Optional[list]] = mapped_column(JSON, default=list)
+    follow_up: Mapped[bool] = mapped_column(Boolean, default=False)
+    answered_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+
+    session: Mapped["InterviewSession"] = relationship(back_populates="turns")
+
+    __table_args__ = (Index("ix_session_turns_session", "session_id"),)
+
+
+class SessionMemoryState(Base):
+    """Compact persisted memory for a session (resume across reconnects)."""
+    __tablename__ = "session_memories"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    session_id: Mapped[int] = mapped_column(ForeignKey("interview_sessions.id"), unique=True)
+    active_topic: Mapped[str] = mapped_column(String(200), default="")
+    compact_summary: Mapped[str] = mapped_column(Text, default="")
+    important_entities: Mapped[Optional[list]] = mapped_column(JSON, default=list)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+    __table_args__ = (Index("ix_session_memories_session", "session_id"),)
+
+
+class SessionRetrieval(Base):
+    """Audit row for a non-empty RAG retrieval (observability + warm cache)."""
+    __tablename__ = "session_retrievals"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    session_id: Mapped[int] = mapped_column(ForeignKey("interview_sessions.id"))
+    topic: Mapped[Optional[str]] = mapped_column(String(200))
+    query: Mapped[str] = mapped_column(Text)
+    context: Mapped[str] = mapped_column(Text)
+    metrics: Mapped[Optional[dict]] = mapped_column(JSON, default=dict)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+
+    __table_args__ = (Index("ix_session_retrievals_session", "session_id"),)
