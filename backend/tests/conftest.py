@@ -87,3 +87,24 @@ def db_session(client):
             next(_db_gen)
         except StopIteration:
             pass
+
+
+@pytest.fixture(scope="session")
+def tk_root():
+    """The single Tk root shared by every Tkinter-driven test module.
+
+    Creating a second Tk interpreter in the same process after a previous one
+    has been destroyed intermittently fails on CPython 3.14 / Windows with
+    ``_tkinter.TclError: invalid command name "tcl_findLibrary"``. Each module
+    that needs a window therefore reuses this one root and destroys only its
+    own child widgets, never the root itself.
+    """
+    tk = pytest.importorskip("tkinter")
+    root = tk.Tk()
+    root.withdraw()
+    yield root
+    try:
+        root.destroy()
+    except Exception:
+        pass
+    tk._default_root = None

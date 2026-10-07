@@ -1,4 +1,4 @@
-.PHONY: dev backend frontend test seed migrate clean
+.PHONY: dev backend frontend test live-check seed migrate clean
 
 # Start both backend and frontend concurrently
 dev:
@@ -18,6 +18,11 @@ frontend:
 # Run backend pytest suite
 test:
 	cd backend && uv run pytest tests/ -v
+
+# Live end-to-end check: real backend + Bonsai + Whisper + Windows SAPI TTS.
+# Requires a running backend on :8000. Not part of `make test` (needs a GPU model).
+live-check:
+	cd backend && uv run python tests/integration/live_continuous.py
 
 # Seed development/demo data
 seed:
