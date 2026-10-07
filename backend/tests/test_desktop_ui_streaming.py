@@ -58,7 +58,7 @@ def _answer_texts(app):
 
 
 @pytest.fixture(scope="module")
-def overlay():
+def overlay(tk_root):
     import stealth_overlay as so
 
     class _UIOnlyApp(so.StealthOverlayApp):
@@ -68,7 +68,7 @@ def overlay():
         def _realize_window(self):
             self.root.deiconify()  # map the window; skip affinity/region
 
-    root = tk.Tk()
+    root = tk_root
     app = _UIOnlyApp(root, api_url="http://127.0.0.1:9", session_id=0)
     _pump(root)
     yield app
@@ -76,10 +76,11 @@ def overlay():
         app._cancel_answer_auto_hide()
     except Exception:
         pass
-    try:
-        root.destroy()
-    except Exception:
-        pass
+    for child in list(root.winfo_children()):
+        try:
+            child.destroy()
+        except Exception:
+            pass
 
 
 def _begin(app):

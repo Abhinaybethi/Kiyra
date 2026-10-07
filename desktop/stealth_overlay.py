@@ -31,6 +31,33 @@ import ctypes
 import ctypes.wintypes
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Win32 window-shell constants (named — no magic numbers)
+# ─────────────────────────────────────────────────────────────────────────────
+# The taskbar button and the Alt+Tab entry are driven by the TOP-LEVEL window's
+# extended styles, not Tk's. A Tk toplevel is created as an ordinary app window,
+# so Windows gives it a taskbar button unless we make it a TOOL window.
+GWL_EXSTYLE = -20                  # Get/SetWindowLongPtr: extended style index
+WS_EX_TOPMINDOW = 0x00000008
+WS_EX_TRANSPARENT = 0x00000020    # click-through (left to the existing toggle)
+WS_EX_TOOLWINDOW = 0x00000080     # tool window: no taskbar button, no Alt+Tab
+WS_EX_LAYERED = 0x00080000        # set by Tk for -alpha; must be preserved
+WS_EX_APPWINDOW = 0x00040000      # force a taskbar button — must be CLEARED
+
+SWP_NOSIZE = 0x0001
+SWP_NOMOVE = 0x0002
+SWP_NOACTIVATE = 0x0010
+SWP_FRAMECHANGED = 0x0020
+
+HWND_TOPMOST = -1                 # (HWND)-1
+GA_ROOT = 2                       # GetAncestor: top-level (shell) window
+
+# LONG_PTR must be POINTER-SIZED: ctypes.wintypes.LONG_PTR does not exist in
+# CPython's wintypes, and c_long is only 4 bytes on Win64 — using either would
+# be the unsafe 32-bit assumption. c_ssize_t is 8 bytes here, 4 on Win32.
+LONG_PTR = ctypes.c_ssize_t
+
+
 def _declare_dpi_awareness():
     """Declare DPI awareness BEFORE any Tk window exists.
 
@@ -58,6 +85,101 @@ def _declare_dpi_awareness():
 
 
 _declare_dpi_awareness()
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 64-bit-safe extended-style access
+# ─────────────────────────────────────────────────────────────────────────────
+_STYLE_API = None
+
+
+def _window_style_api():
+    """Bind Get/SetWindowLongPtrW once, with explicit argtypes/restype.
+
+    ctypes defaults restype to c_int (32-bit); on Win64 the LongPtr variants
+    return a 64-bit LONG_PTR, so the signatures are declared explicitly rather
+    than inherited. Falls back to the non-Ptr (32-bit) entry points if the
+    LongPtr pair is unavailable.
+    """
+    global _STYLE_API
+    if _STYLE_API is None:
+        user32 = ctypes.windll.user32
+        get_fn = getattr(user32, "GetWindowLongPtrW", None)
+        set_fn = getattr(user32, "SetWindowLongPtrW", None)
+        if get_fn is None or set_fn is None:
+            get_fn, set_fn = user32.GetWindowLongW, user32.SetWindowLongW
+        get_fn.restype = LONG_PTR
+        get_fn.argtypes = [ctypes.wintypes.HWND, ctypes.c_int]
+        set_fn.restype = LONG_PTR
+        set_fn.argtypes = [ctypes.wintypes.HWND, ctypes.c_int, LONG_PTR]
+        _STYLE_API = (get_fn, set_fn)
+    return _STYLE_API
+
+
+def get_window_exstyle(hwnd):
+    """Read GWL_EXSTYLE as a pointer-sized integer."""
+    if not hwnd:
+        return 0
+    get_fn, _ = _window_style_api()
+    return int(get_fn(ctypes.wintypes.HWND(hwnd), GWL_EXSTYLE))
+
+
+def set_window_exstyle(hwnd, exstyle):
+    """Write GWL_EXSTYLE (pointer-sized) and return the previous value."""
+    if not hwnd:
+        return 0
+    _, set_fn = _window_style_api()
+    return int(set_fn(ctypes.wintypes.HWND(hwnd), GWL_EXSTYLE,
+                      LONG_PTR(int(exstyle))))
+
+
+def stealth_exstyle(current):
+    """TOOLWINDOW on, APPWINDOW off — every other bit preserved.
+
+    Pure bit math (unit-testable): WS_EX_LAYERED (Tk's -alpha),
+    WS_EX_TRANSPARENT (click-through) and WS_EX_TOPMOST survive untouched, so
+    this can never break alpha, topmost or the F10 toggle.
+    """
+    return (int(current) | WS_EX_TOOLWINDOW) & ~WS_EX_APPWINDOW
+
+
+def toplevel_hwnd(client_hwnd):
+    """The shell (top-level) window for a Tk client hwnd.
+
+    Tk's ``winfo_id()`` is the CLIENT window; the taskbar and Alt+Tab are
+    driven by its top-level ancestor. GA_ROOT is the real shell window, so it
+    is preferred; GetParent is the Tk wrapper fallback.
+    """
+    if not client_hwnd:
+        return 0
+    user32 = ctypes.windll.user32
+    root = int(user32.GetAncestor(client_hwnd, GA_ROOT) or 0)
+    if root:
+        return root
+    return int(user32.GetParent(client_hwnd) or 0) or int(client_hwnd)
+
+
+def read_window_shell_flags(hwnd):
+    """Programmatic taskbar/Alt+Tab verdict for a window handle."""
+    if not hwnd:
+        return {"hwnd": 0, "valid": False, "exstyle": 0, "toolwindow": False,
+                "appwindow": False, "topmost": False, "layered": False,
+                "transparent": False, "taskbar_button": False,
+                "alt_tab_entry": False}
+    valid = bool(ctypes.windll.user32.IsWindow(ctypes.wintypes.HWND(hwnd)))
+    ex = get_window_exstyle(hwnd) if valid else 0
+    tool = bool(ex & WS_EX_TOOLWINDOW)
+    app = bool(ex & WS_EX_APPWINDOW)
+    # Windows shows a taskbar button / Alt+Tab entry for an APPWINDOW, and for a
+    # plain top-level window that is NOT a tool window.
+    return {
+        "hwnd": int(hwnd), "valid": valid, "exstyle": ex,
+        "toolwindow": tool, "appwindow": app,
+        "topmost": bool(ex & WS_EX_TOPMINDOW),
+        "layered": bool(ex & WS_EX_LAYERED),
+        "transparent": bool(ex & WS_EX_TRANSPARENT),
+        "taskbar_button": app or not tool,
+        "alt_tab_entry": app or not tool,
+    }
 
 try:
     import numpy as np
@@ -91,6 +213,9 @@ from screenshot_capture import (
     ScreenshotInput,
     QuestionInput,
 )
+
+from backend_server import BackendLauncher
+from llama_server import ModelServerLauncher
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -138,10 +263,23 @@ def encode_wav_bytes(samples: np.ndarray, samplerate: int = 16000) -> bytes:
 # ─────────────────────────────────────────────────────────────────────────────
 
 class StealthOverlayApp:
-    def __init__(self, root: tk.Tk, api_url: str = "http://localhost:8000", session_id: int = 1):
+    def __init__(self, root: tk.Tk, api_url: str = "http://localhost:8000",
+                 session_id: int = 1,
+                 backend_launcher: "BackendLauncher | None" = None,
+                 model_launcher: "ModelServerLauncher | None" = None,
+                 listening_mode: bool = True,
+                 auto_start_listening: bool = True):
         self.root = root
         self.api_url = api_url.rstrip("/")
         self.session_id = session_id
+        # Interview Listening Mode switches (Phase 5.4).
+        self._want_listening_mode = bool(listening_mode)
+        self._want_auto_start = bool(auto_start_listening)
+        # Only ever a backend THIS process started (see main()); None when the
+        # backend was already running, so shutdown never kills a foreign one.
+        self.backend_launcher = backend_launcher
+        # Same contract for the model server this process started.
+        self.model_launcher = model_launcher
 
         # Audio params
         self.target_sr = 16000
@@ -203,6 +341,9 @@ class StealthOverlayApp:
         self._region_after = None
         self._region_applied_once = False
         self._affinity_reported = False
+        # Window-shell (taskbar / Alt+Tab) styling state.
+        self._shell_styles_reported = False
+        self._shell_flags = None
         self._ui_scale = 1.0
         # Screenshot input mode: true while capture/OCR is in flight so
         # repeated clicks are ignored and the overlay stays responsive.
@@ -244,6 +385,10 @@ class StealthOverlayApp:
         self.root.minsize(int(480 * self._ui_scale), int(540 * self._ui_scale))
         self.root.attributes("-topmost", True)
         self.root.configure(bg="#121315")
+        # Tool-window style FIRST, before the window is ever deiconified: this
+        # is the earliest point the shell hwnd exists, so Windows never gets the
+        # chance to show a Kiyra taskbar button (even briefly).
+        self._apply_stealth_window_styles(reason="init")
 
     def _realize_window(self):
         """Show + paint the dark UI, then layer alpha, rounded region and
@@ -259,8 +404,10 @@ class StealthOverlayApp:
             except Exception:
                 pass
             self.root.update_idletasks()
-            # Region FIRST, capture-exclusion LAST: nothing may touch the
-            # window after SetWindowDisplayAffinity or it can be invalidated.
+            # Styles FIRST, then region, then capture-exclusion: nothing may
+            # touch the window after SetWindowDisplayAffinity or it can be
+            # invalidated.
+            self._apply_stealth_window_styles(reason="realize")
             self._apply_rounded_corners()
             self._apply_stealth_affinity()
 
@@ -280,6 +427,9 @@ class StealthOverlayApp:
 
     def _refresh_window_shape(self):
         self._region_after = None
+        # Re-assert the tool-window style: a SetWindowPos/resize can hand the
+        # shell its default app-window styles back.
+        self._apply_stealth_window_styles(reason="configure")
         self._apply_rounded_corners()
         self._apply_stealth_affinity()
 
@@ -307,6 +457,82 @@ class StealthOverlayApp:
         self._latest_detected = ""
         self._manual_mode = False
         self._is_pinned = True
+        # ── Interview Listening Mode (Phase 5.4) ──────────────────────────
+        # The user owns the question boundary: VAD segments speech, the user
+        # presses SEND. The live panel is built lazily on `mode.changed` so the
+        # default (auto-detect) layout is untouched.
+        self._listening_mode = False
+        self._listening_active = False
+        self._server_state = "IDLE"
+        self._can_send = False
+        self._live_transcript = ""
+        self._live_partial = ""
+        self._memory_points: list[str] = []
+        self._previous_questions: list[dict] = []
+        self._active_topic = ""
+        self._turn_submitted = False
+        self._listening_panel = None
+        # Phase 5.4.1: the previous answer survives SEND and is swapped in
+        # place when the first chunk of the new one arrives.
+        self._answer_replace_pending = False
+        self._question_history: list[dict] = []
+        self._history_index = -1
+
+    def _apply_stealth_window_styles(self, reason: str = ""):
+        """Make the window a TOOL window: no taskbar button, no Alt+Tab entry.
+
+        Runs against the REAL top-level (shell) hwnd — Tk's ``winfo_id()`` is
+        the client window, and it is the shell's extended styles that the taskbar
+        and the Alt+Tab switcher read.
+
+        Idempotent and non-destructive: WS_EX_TOOLWINDOW is set,
+        WS_EX_APPWINDOW is cleared, and every other bit (WS_EX_LAYERED from
+        ``-alpha``, WS_EX_TRANSPARENT from click-through, WS_EX_TOPMOST) is left
+        alone. Nothing moves or resizes — SWP_NOMOVE|SWP_NOSIZE keep the fixed
+        560x640 geometry, SWP_NOACTIVATE avoids stealing focus, and
+        SWP_FRAMECHANGED makes the shell recompute the frame for the new styles.
+        HWND_TOPMOST re-asserts always-on-top so this cannot silently drop it.
+        """
+        try:
+            if sys.platform != "win32":
+                return None
+            hwnd = toplevel_hwnd(self.root.winfo_id())
+            if not hwnd or not ctypes.windll.user32.IsWindow(
+                    ctypes.wintypes.HWND(hwnd)):
+                return None    # window not realized yet — nothing to style
+
+            before = get_window_exstyle(hwnd)
+            desired = stealth_exstyle(before)
+            if desired != before:
+                set_window_exstyle(hwnd, desired)
+                # Refresh the non-client frame WITHOUT moving/resizing, and keep
+                # the window topmost (SWP_FRAMECHANGED alone can re-apply the
+                # shell's default styles).
+                ctypes.windll.user32.SetWindowPos(
+                    ctypes.wintypes.HWND(hwnd),
+                    ctypes.wintypes.HWND(HWND_TOPMOST),
+                    0, 0, 0, 0,
+                    SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_FRAMECHANGED)
+
+            flags = read_window_shell_flags(hwnd)
+            if not flags["toolwindow"] or flags["appwindow"]:
+                print(f"[Stealth] WARNING: shell styles did not stick "
+                      f"(toolwindow={flags['toolwindow']}, "
+                      f"appwindow={flags['appwindow']}) — a taskbar button "
+                      f"may still appear.")
+            elif not self._shell_styles_reported:
+                self._shell_styles_reported = True
+                why = f" ({reason})" if reason else ""
+                print(f"[Stealth] Shell styles ACTIVE{why}: hwnd={hwnd:#x} "
+                      f"exstyle={flags['exstyle']:#x} TOOLWINDOW=on "
+                      f"APPWINDOW=off topmost={flags['topmost']} "
+                      f"layered={flags['layered']} "
+                      f"-> no taskbar button, no Alt+Tab")
+            self._shell_flags = flags
+            return flags
+        except Exception as e:
+            print(f"[Stealth] Could not apply shell styles: {e}")
+            return None
 
     def _apply_stealth_affinity(self):
         """Hide window from screenshots on Windows.
@@ -616,6 +842,10 @@ class StealthOverlayApp:
             try:
                 self.root.deiconify()
                 self.root.attributes("-topmost", True)
+                # Screenshot flow: temp-hide deiconifies the window, so the
+                # tool-window style is re-asserted here — the taskbar must stay
+                # free of Kiyra after a capture.
+                self._apply_stealth_window_styles(reason="capture-restore")
             except Exception:
                 pass
         self._safe_after(cb)
@@ -1006,6 +1236,8 @@ class StealthOverlayApp:
         else:
             self.root.deiconify()
             self.root.attributes("-topmost", True)
+            # Re-assert after remapping so the taskbar button cannot reappear.
+            self._apply_stealth_window_styles(reason="f9-show")
             print("[Stealth] Visible")
 
     def toggle_click_through(self):
@@ -1324,9 +1556,27 @@ class StealthOverlayApp:
                     self._ui_cancel_answer(payload)
                 elif ev_type == "session.connected":
                     self._ui_set_status("Session connected", ok=True)
+                    self._negotiate_listening_mode()
+                elif ev_type == "mode.changed":
+                    self._ui_mode_changed(payload)
+                elif ev_type == "listening.started":
+                    self._ui_listening_started(payload)
+                elif ev_type == "listening.stopped":
+                    self._ui_listening_stopped(payload)
+                elif ev_type == "transcript.segment":
+                    self._ui_transcript_segment(payload)
+                elif ev_type == "transcript.partial":
+                    self._ui_transcript_partial(payload)
+                elif ev_type == "turn.submitted":
+                    self._ui_turn_submitted(payload)
+                elif ev_type == "memory.updated":
+                    self._ui_memory_updated(payload)
+                elif ev_type == "perf":
+                    print(f"[PERF] {payload}")
                 elif ev_type == "session.error":
                     msg_text = payload.get("message", "Unknown error")
                     print(f"[WS] Error: {msg_text}")
+                    self._ui_turn_error(payload)
             except Exception as e:
                 print(f"[WS] Receiver error: {e}")
                 break
@@ -1354,6 +1604,318 @@ class StealthOverlayApp:
         """A stream/cancel/complete of an old request must never touch the
         answer currently streaming for a newer request."""
         return bool(rid and self._active_request_id and rid != self._active_request_id)
+
+    # ── Interview Listening Mode ───────────────────────────────────────────
+    def _negotiate_listening_mode(self):
+        """Ask the backend to switch to Interview Listening Mode.
+
+        Sent once the session is connected. `--auto-detect` (or the env
+        override) keeps the legacy behaviour, in which case nothing is sent and
+        the panel is never built.
+        """
+        if not self._want_listening_mode:
+            return
+        if self._send_ws_message({"type": "mode.set",
+                                  "payload": {"mode": "interview_listening"}}):
+            print("[UI] Requested Interview Listening Mode")
+
+    def _ui_mode_changed(self, payload: dict):
+        mode = payload.get("mode")
+        self._listening_mode = mode == "interview_listening"
+        if not self._listening_mode:
+            return
+        self._safe_after(self._build_listening_panel)
+        if self._want_auto_start:
+            self._send_ws_message({"type": "listening.start", "payload": {}})
+
+    def _build_listening_panel(self):
+        """Live transcript + START/STOP/SEND + memory/previous/topic panel.
+
+        Built only once the backend confirms listening mode, so the default
+        auto-detect layout (and its geometry tests) are unaffected.
+        """
+        if self._listening_panel is not None:
+            return
+        try:
+            frame = tk.Frame(self._body, bg=self.panel_bg)
+            frame.pack(side=tk.BOTTOM, fill=tk.X, padx=12, pady=(4, 10))
+
+            head = tk.Frame(frame, bg=self.panel_bg)
+            head.pack(fill=tk.X)
+            self.lbl_listen_state = tk.Label(
+                head, text="NOT LISTENING", bg=self.panel_bg,
+                fg=self.text_secondary, font=(self.font_family, 8, "bold"))
+            self.lbl_listen_state.pack(side=tk.LEFT)
+            self.lbl_topic = tk.Label(
+                head, text="", bg=self.panel_bg, fg=self.accent_color,
+                font=(self.font_family, 8))
+            self.lbl_topic.pack(side=tk.RIGHT)
+
+            self.txt_live = tk.Text(
+                frame, height=3, bg=self.card_bg, fg=self.text_primary,
+                font=(self.font_family, 9), relief=tk.FLAT, wrap=tk.WORD,
+                padx=6, pady=4, highlightthickness=1,
+                highlightbackground=self.border_color)
+            self.txt_live.pack(fill=tk.X, pady=(4, 4))
+
+            row = tk.Frame(frame, bg=self.panel_bg)
+            row.pack(fill=tk.X)
+            self.btn_listen_toggle = self._btn(
+                row, "Start", self._toggle_listening, font_size=9, padx=6, pady=2)
+            self.btn_listen_toggle.pack(side=tk.LEFT)
+            self.btn_send = self._btn(
+                row, "SEND", self._send_turn, bg=self.accent_color,
+                fg="#0b1020", font_size=9, padx=10, pady=2, state=tk.DISABLED)
+            self.btn_send.pack(side=tk.LEFT, padx=(6, 0))
+            self.lbl_prev = tk.Label(
+                row, text="", bg=self.panel_bg, fg=self.text_secondary,
+                font=(self.font_family, 7))
+            self.lbl_prev.pack(side=tk.RIGHT)
+
+            # ── Question history (Phase 5.4.1 §9) ─────────────────────────
+            # UP/DOWN navigate previously answered questions. Purely local
+            # UI: no WS command, no generation, no state change.
+            hrow = tk.Frame(frame, bg=self.panel_bg)
+            hrow.pack(fill=tk.X, pady=(4, 0))
+            self.btn_hist_up = self._btn(
+                hrow, "▲", self._history_prev, font_size=7, padx=5, pady=1,
+                state=tk.DISABLED)
+            self.btn_hist_up.pack(side=tk.LEFT)
+            self.btn_hist_down = self._btn(
+                hrow, "▼", self._history_next, font_size=7, padx=5, pady=1,
+                state=tk.DISABLED)
+            self.btn_hist_down.pack(side=tk.LEFT, padx=(3, 0))
+            self.lbl_hist = tk.Label(
+                hrow, text="", bg=self.panel_bg, fg=self.text_secondary,
+                font=(self.font_family, 7))
+            self.lbl_hist.pack(side=tk.LEFT, padx=(6, 0))
+
+            self.lbl_history_view = tk.Label(
+                frame, text="", bg=self.panel_bg, fg=self.text_secondary,
+                font=(self.font_family, 7), anchor="w", justify=tk.LEFT,
+                wraplength=int(500 * getattr(self, "_ui_scale", 1)))
+            self.lbl_history_view.pack(fill=tk.X, pady=(3, 0))
+
+            self.lbl_memory = tk.Label(
+                frame, text="", bg=self.panel_bg, fg=self.text_secondary,
+                font=(self.font_family, 7), anchor="w", justify=tk.LEFT,
+                wraplength=int(500 * getattr(self, "_ui_scale", 1)))
+            self.lbl_memory.pack(fill=tk.X, pady=(3, 0))
+
+            self._listening_panel = frame
+        except Exception as e:
+            print(f"[UI] listening panel build failed: {e}")
+
+    def _toggle_listening(self):
+        if not self._listening_mode:
+            return
+        self._send_ws_message(
+            {"type": "listening.stop" if self._listening_active
+             else "listening.start", "payload": {}})
+
+    def _send_turn(self):
+        """SEND is the only thing that submits a question in this mode."""
+        if not self._listening_mode:
+            return
+        if self._assistant_state == "generating" or not self._can_send:
+            # Defence in depth: the button is disabled too, but a second
+            # submission must be impossible even if a click slips through.
+            return
+        if self._send_ws_message({"type": "turn.send", "payload": {}}):
+            self._set_send_enabled(False)
+
+    def _set_send_enabled(self, enabled: bool):
+        self._can_send = bool(enabled)
+        self._safe_after(self._apply_send_state)
+
+    def _apply_send_state(self):
+        if self._listening_panel is None or not hasattr(self, "btn_send"):
+            return
+        busy = self._assistant_state == "generating"
+        self.btn_send.config(
+            state=tk.NORMAL if (self._can_send and not busy) else tk.DISABLED)
+
+    def _ui_listening_started(self, payload: dict):
+        self._listening_active = bool(payload.get("listening", True))
+        self._server_state = payload.get("state") or "LISTENING"
+        # Auto re-arm (§5) and a fresh START both reset only the live
+        # transcript — the answer, history and memory stay on screen.
+        self._live_transcript = ""
+        self._live_partial = ""
+        self._turn_submitted = False
+        self._set_send_enabled(False)
+        self._safe_after(self._render_live)
+
+    def _ui_listening_stopped(self, payload: dict):
+        self._listening_active = False
+        self._server_state = payload.get("state") or "IDLE"
+        current = payload.get("current") or ""
+        if current:
+            self._live_transcript = current
+        self._set_send_enabled(bool(payload.get("can_send")))
+        self._safe_after(self._render_live)
+
+    def _ui_transcript_partial(self, payload: dict):
+        self._live_partial = payload.get("text") or payload.get("partial") or ""
+        self._safe_after(self._render_live)
+
+    def _ui_transcript_segment(self, payload: dict):
+        """Append one finalized VAD segment — this never submits anything."""
+        text = payload.get("current")
+        if text is None:
+            seg = payload.get("text") or ""
+            base = (self._live_transcript + " " + seg).strip()
+            text = re.sub(r"\s+", " ", base) or seg
+        self._live_transcript = text or ""
+        self._live_partial = ""
+        self._set_send_enabled(bool(payload.get("can_send")))
+        self._safe_after(self._render_live)
+
+    def _ui_turn_submitted(self, payload: dict):
+        self._turn_submitted = True
+        self._live_transcript = payload.get("question") or self._live_transcript
+        self._set_send_enabled(False)
+        # A new SEND returns the selector to the latest question (§9).
+        self._history_index = len(self._question_history)
+        self._clamp_history_index()
+        self._safe_after(self._render_live)
+
+    def _ui_turn_error(self, payload: dict):
+        code = payload.get("code") or ""
+        if code == "already_generating":
+            self._set_send_enabled(False)
+        elif code in ("empty_turn", "too_short"):
+            # Turn kept and unfrozen: the user can keep speaking or retry.
+            self._safe_after(self._render_live)
+
+    def _ui_memory_updated(self, payload: dict):
+        self._memory_points = list(payload.get("memory_points") or [])[:6]
+        self._previous_questions = list(payload.get("previous") or [])[-8:]
+        # Topic is preserved, never blanked by a memory push (§16).
+        topic = payload.get("topic") or ""
+        if topic:
+            self._active_topic = topic
+        self._question_history = list(self._previous_questions)
+        idx = payload.get("history_index")
+        self._history_index = (int(idx) if isinstance(idx, int)
+                               else len(self._question_history) - 1)
+        self._clamp_history_index()
+        self._safe_after(self._render_live)
+
+    def _clamp_history_index(self) -> None:
+        """Boundaries do not wrap (§9)."""
+        count = len(self._question_history)
+        if count == 0:
+            self._history_index = -1
+        elif self._history_index < 0:
+            self._history_index = 0
+        elif self._history_index >= count:
+            self._history_index = count - 1
+
+    def _history_prev(self):
+        """UP: show an earlier question. Local UI only — no WS command."""
+        if not self._question_history:
+            return
+        if self._history_index <= 0:
+            print("[UI] history up ignored at first entry")
+            return
+        self._history_index -= 1
+        print(f"[UI] history index={self._history_index}")
+        self._safe_after(self._render_live)
+
+    def _history_next(self):
+        """DOWN: show a later question. Local UI only — no WS command."""
+        if not self._question_history:
+            return
+        if self._history_index >= len(self._question_history) - 1:
+            print("[UI] history down ignored at last entry")
+            return
+        self._history_index += 1
+        print(f"[UI] history index={self._history_index}")
+        self._safe_after(self._render_live)
+
+    def _render_history(self):
+        """Paint the history selector + selected Q/A (§9)."""
+        hist = self._question_history
+        try:
+            has_prev = len(hist) > 0 and self._history_index > 0
+            has_next = (len(hist) > 0
+                        and self._history_index < len(hist) - 1)
+            if hasattr(self, "btn_hist_up"):
+                self.btn_hist_up.config(
+                    state=tk.NORMAL if has_prev else tk.DISABLED)
+                self.btn_hist_down.config(
+                    state=tk.NORMAL if has_next else tk.DISABLED)
+            if not hist:
+                self.lbl_hist.config(text="")
+                self.lbl_history_view.config(text="")
+                return
+            entry = hist[self._history_index]
+            self.lbl_hist.config(
+                text=f"{self._history_index + 1}/{len(hist)}")
+            if self._history_index == len(hist) - 1:
+                # Latest question: the live answer panel is already showing it.
+                self.lbl_history_view.config(text="")
+                return
+            question = (entry.get("question") or "") if isinstance(entry, dict) \
+                else str(entry)
+            answer = (entry.get("answer") or "") if isinstance(entry, dict) else ""
+            lines = [f"Earlier Q{self._history_index + 1}: "
+                     f"{' '.join(question.split())[:150]}"]
+            if answer:
+                lines.append("   A: " + " ".join(answer.split())[:220])
+            self.lbl_history_view.config(text="\n".join(lines))
+        except Exception as e:
+            print(f"[UI] render history failed: {e}")
+
+    def _render_live(self):
+        """Tk thread: paint transcript, SEND state, memory and topic."""
+        panel = self._listening_panel
+        if panel is None or not hasattr(self, "txt_live"):
+            return
+        try:
+            if self._listening_active:
+                state, color = "LISTENING", self.success_color
+            elif self._assistant_state == "generating":
+                state, color = "GENERATING", self.accent_color
+            elif self._server_state == "IDLE":
+                # STOP is terminal until START (§20).
+                state, color = "IDLE", self.text_secondary
+            elif self._turn_submitted or self._can_send:
+                state, color = "READY TO SEND", self.accent_color
+            else:
+                state, color = "STOPPED", self.text_secondary
+            self.lbl_listen_state.config(text=state, fg=color)
+            self.lbl_topic.config(text=(self._active_topic or "")[:60])
+
+            body = self._live_transcript or self._live_partial or ""
+            self.txt_live.config(state=tk.NORMAL)
+            self.txt_live.delete("1.0", tk.END)
+            if self._live_partial and self._listening_active:
+                body = (body + " " + self._live_partial).strip()
+                self.txt_live.insert("1.0", body)
+                self.txt_live.config(fg=self.text_secondary)
+            else:
+                self.txt_live.insert("1.0", body or "Press Start, then speak.")
+                self.txt_live.config(fg=self.text_primary)
+            self.txt_live.config(state=tk.DISABLED)
+
+            prev = self._previous_questions
+            if prev:
+                last = prev[-1].get("question", "") if isinstance(prev[-1], dict) \
+                    else str(prev[-1])
+                n = len(prev)
+                self.lbl_prev.config(text=f"{n} earlier - {last[:40]}")
+            else:
+                self.lbl_prev.config(text="")
+            self.lbl_memory.config(
+                text=("Memory: " + " | ".join(self._memory_points)) if
+                self._memory_points else "")
+            if hasattr(self, "lbl_history_view"):
+                self._render_history()
+            self._apply_send_state()
+        except Exception as e:
+            print(f"[UI] render live failed: {e}")
 
     def _ui_set_status(self, text: str, ok: bool = True):
         """Update status label."""
@@ -1424,10 +1986,12 @@ class StealthOverlayApp:
                     try:
                         if txt.winfo_exists():
                             if first:
-                                # Replace the "Generating…" placeholder IN
-                                # PLACE — no parent/container recreation.
+                                # First non-empty chunk of the new answer:
+                                # swap out the previous answer IN PLACE (no
+                                # container rebuild, no blank panel).
                                 txt.config(state=tk.NORMAL)
                                 txt.delete("1.0", "end")
+                                self._answer_replace_pending = False
                                 self._perf_first_chunk_rendered = time.monotonic()
                                 print("[UI] First chunk rendered")
                             txt.insert("end", delta)
@@ -1444,9 +2008,13 @@ class StealthOverlayApp:
 
         The Answer section (frame + Text) is created ONCE and reused across
         the whole generation; only the previous answer's extra sections
-        (Approach/Code/Key Points/…) are destroyed here. The placeholder
-        "Generating…" is set in place — the container itself is never
-        rebuilt, so the panel geometry stays stable."""
+        (Approach/Code/Key Points/…) are destroyed here. The container itself
+        is never rebuilt, so the panel geometry stays stable.
+
+        Interview Listening Mode (§12): the PREVIOUS answer stays on screen
+        through SEND and retrieval — it is replaced in place when the first
+        non-empty chunk of the new answer arrives, so the user never sees a
+        blank panel while the model is thinking."""
         self._cancel_answer_auto_hide()
         for frame in list(self._answer_widgets):
             if frame is self._stable_answer_frame:
@@ -1467,6 +2035,18 @@ class StealthOverlayApp:
                 alive = txt.winfo_exists()
             except Exception:
                 alive = False
+
+        # Keep the old answer visible; defer the swap to the first chunk.
+        self._answer_replace_pending = False
+        if alive and self._listening_mode:
+            try:
+                if txt.get("1.0", "end-1c").strip():
+                    self._answer_replace_pending = True
+                    self._answer_scroll_pinned = True
+                    return
+            except Exception:
+                pass
+
         if alive:
             txt.config(state=tk.NORMAL)
             txt.delete("1.0", "end")
@@ -1552,6 +2132,15 @@ class StealthOverlayApp:
         def cb():
             self._assistant_state = "ready"
             self._active_gen_question = None
+            if self._listening_mode:
+                # Interview mode never blanks the Answer panel (§19): if no
+                # chunk arrived the previous answer is still showing, and if
+                # one did it is the best answer we have.
+                self._stream_buffer = ""
+                self._cancel_answer_auto_hide()
+                self._answer_replace_pending = False
+                self._paint_dot(False)
+                return
             self._clear_answer_area()
             self._stream_buffer = ""
             self._cancel_answer_auto_hide()
@@ -1568,6 +2157,14 @@ class StealthOverlayApp:
             self._render_answer(payload)
             print(f"[UI] Answer generation completed chars={len(self._stream_buffer)}")
             self._cancel_answer_auto_hide()
+            self._answer_replace_pending = False
+            if self._listening_mode:
+                # Interview mode: the answer must stay readable for the next
+                # question — no auto-hide (§12). Legacy behaviour unchanged.
+                self.answer_auto_hide_task = None
+                print("[UI] Answer auto-hide suppressed (interview mode)")
+                self._print_ui_perf()
+                return
             delay_ms = self.answer_hide_delay_ms
             self.answer_auto_hide_task = self.root.after(
                 delay_ms, self._auto_hide_answer)
@@ -1792,6 +2389,22 @@ class StealthOverlayApp:
         self.root.destroy()
         print("[App] Closed")
 
+        # Only a backend we launched ourselves is stopped, and only when asked
+        # (default keeps it warm so the next `python stealth_overlay.py` is
+        # instant).
+        if self.backend_launcher is not None and _stop_backend_on_exit():
+            try:
+                self.backend_launcher.stop()
+            except Exception:
+                pass
+
+        # Same rule for the model server we launched (releases GPU VRAM).
+        if self.model_launcher is not None and _stop_backend_on_exit():
+            try:
+                self.model_launcher.stop()
+            except Exception:
+                pass
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Entry Point
@@ -1817,19 +2430,206 @@ def _create_live_session(api_url: str) -> int:
     return data["id"]
 
 
-def main():
-    api_url = "http://localhost:8000"
-    try:
-        session_id = _create_live_session(api_url)
-        print(f"[Session] Created session {session_id}")
-    except Exception as e:
-        print(f"[Session] Could not auto-create session: {e} — defaulting to id=1")
+def _stop_backend_on_exit() -> bool:
+    """Whether to shut the auto-started backend down when the overlay closes.
+
+    Default is False (keep it warm so the next launch connects instantly).
+    """
+    return os.environ.get("KIYRA_STOP_BACKEND_ON_EXIT", "").strip().lower() in (
+        "1", "true", "yes", "on")
+
+
+def _env_flag(name: str, default: bool) -> bool:
+    """Truthy env var with an explicit default."""
+    raw = os.environ.get(name)
+    if raw is None or not raw.strip():
+        return default
+    return raw.strip().lower() in ("1", "true", "yes", "on")
+
+
+def _ensure_backend(api_url: str, autostart: bool = True,
+                    startup_timeout: float | None = None):
+    """Make sure the backend is serving before the overlay opens.
+
+    Reuses an already-running backend; otherwise launches it as a hidden child
+    and waits for GET /health. Returns (launcher_or_None, ready, message).
+    The launcher is returned ONLY when this process started the backend, so
+    shutdown can never kill a backend the user started themselves.
+    """
+    launcher = BackendLauncher(
+        api_url=api_url,
+        **({"startup_timeout": startup_timeout} if startup_timeout else {}),
+    )
+
+    if not autostart:
+        ok = launcher.is_running()
+        return None, ok, (
+            "backend already running" if ok
+            else "--no-backend given and nothing answers on /health")
+
+    ready, message = launcher.ensure()
+    if not ready or not launcher.started_here:
+        return None, ready, message
+    return launcher, True, message
+
+
+def _ensure_model_server(autostart: bool = True,
+                         startup_timeout: float | None = None):
+    """Make sure Bonsai's llama-server is serving before the session starts.
+
+    Reuses an already-running model server; otherwise starts it (GPU-first with
+    the proven CPU fallback) and waits for /v1/models. Returns
+    (launcher_or_None, ready, message). The launcher is returned ONLY when this
+    process started the server, so shutdown can never kill one the user started.
+    """
+    launcher = ModelServerLauncher(
+        **({"startup_timeout": startup_timeout} if startup_timeout else {}))
+
+    if not autostart:
+        ok = launcher.is_running()
+        return None, ok, (
+            "model server already running" if ok
+            else "--no-model given and nothing answers on /v1/models")
+
+    ready, message = launcher.ensure()
+    if not ready or not launcher.started_here:
+        return None, ready, message
+    return launcher, True, message
+
+
+def _parse_args(argv):
+    """Tiny flag parser — stdlib argparse is overkill for four switches."""
+    opts = {
+        "api_url": os.environ.get("KIYRA_API_URL", "http://localhost:8000"),
+        "autostart": True,
+        "model_autostart": True,
+        "startup_timeout": None,
+        "stop_on_exit": _stop_backend_on_exit(),
+        # Interview Listening Mode (Phase 5.4): the user, not the VAD, decides
+        # when a question ends. Opt-in so the legacy auto-detect overlay and the
+        # web client keep their current behaviour.
+        "listening_mode": _env_flag("KIYRA_INTERVIEW_LISTENING", True),
+        "auto_start_listening": _env_flag("KIYRA_AUTO_START_LISTENING", True),
+    }
+    # Drop the script path when argv came from sys.argv (argv[0] always ends
+    # in .py; no real flag does).
+    args = [a for a in argv if not a.lower().endswith(".py")]
+    i = 0
+    while i < len(args):
+        flag = args[i].lower()
+        nxt = args[i + 1] if i + 1 < len(args) else ""
+        if flag in ("--api-url", "-a") and nxt:
+            opts["api_url"] = nxt
+            i += 2
+        elif flag == "--no-backend":
+            opts["autostart"] = False
+            i += 1
+        elif flag in ("--no-model", "--no-bonsai"):
+            opts["model_autostart"] = False
+            i += 1
+        elif flag in ("--startup-timeout", "-t") and nxt:
+            opts["startup_timeout"] = float(nxt)
+            i += 2
+        elif flag == "--stop-backend-on-exit":
+            opts["stop_on_exit"] = True
+            i += 1
+        elif flag in ("--keep-backend", "-k"):
+            opts["stop_on_exit"] = False
+            i += 1
+        elif flag == "--auto-detect":
+            opts["listening_mode"] = False
+            opts["auto_start_listening"] = False
+            i += 1
+        elif flag == "--no-auto-start-listening":
+            opts["auto_start_listening"] = False
+            i += 1
+        elif flag in ("-h", "--help"):
+            print("usage: python stealth_overlay.py [--api-url URL] "
+                  "[--no-backend] [--no-model] "
+                  "[--startup-timeout SECONDS] "
+                  "[--stop-backend-on-exit | --keep-backend] "
+                  "[--auto-detect] [--no-auto-start-listening]")
+            sys.exit(0)
+        else:
+            print(f"[Args] ignoring unknown argument: {args[i]}")
+            i += 1
+    return opts
+
+
+def main(argv=None):
+    opts = _parse_args(list(sys.argv if argv is None else argv))
+    api_url = opts["api_url"].rstrip("/")
+
+    # 0. Model server: Bonsai's llama-server. Started first because session
+    #    start fails fast with a 503 when it is down, which used to surface as
+    #    "listening never starts". Best-effort: a missing model must not stop
+    #    the overlay from opening (someone may run a different provider).
+    if not opts["model_autostart"]:
+        model_launcher = ModelServerLauncher()
+        model_ready = model_launcher.is_running()
+        print(f"[Model] autostart disabled; "
+              f"{'running' if model_ready else 'NOT reachable'}")
+    else:
+        print("[Model] checking llama-server …")
+        model_launcher, model_ready, model_message = _ensure_model_server(
+            autostart=True, startup_timeout=opts["startup_timeout"])
+        print(f"[Model] {model_message}")
+        if not model_ready:
+            print("[Model] WARNING: inference will fail until llama-server is "
+                  "up. Start it manually with:\n"
+                  "            python llama_server.py\n"
+                  "          (or pass --no-model to silence this)")
+
+    # 1. Backend: reuse if healthy, otherwise start it and wait for /health.
+    if not opts["autostart"]:
+        launcher = BackendLauncher(api_url=api_url)
+        ready = launcher.is_running()
+        print(f"[Backend] autostart disabled; "
+              f"{'running' if ready else 'NOT reachable'} at {api_url}")
+    else:
+        print(f"[Backend] checking {api_url} …")
+        launcher, ready, message = _ensure_backend(
+            api_url, autostart=True,
+            startup_timeout=opts["startup_timeout"])
+        print(f"[Backend] {message}")
+
+    if not ready:
+        print(f"[Backend] startup failed — the overlay needs a live backend.\n"
+              f"          Fix the cause above, or run it yourself:\n"
+              f"            cd backend && .\\.venv\\Scripts\\python.exe "
+              f"-m uvicorn main:app --port {launcher.port if launcher else 8000}\n"
+              f"          Log: {launcher.log_path if launcher else ''}")
+        return 1
+
+    # 2. Live session (retry briefly: /health can go green a moment before the
+    #    database accepts writes).
+    session_id = 0
+    last_err = None
+    for attempt in range(5):
+        try:
+            session_id = _create_live_session(api_url)
+            print(f"[Session] Created session {session_id}")
+            break
+        except Exception as e:
+            last_err = e
+            if attempt < 4:
+                time.sleep(1.0)
+    if not session_id:
+        print(f"[Session] Could not auto-create session: {last_err} "
+              f"— defaulting to id=1")
         session_id = 1
 
+    # 3. Overlay (its WebSocket loop auto-reconnects if the link blips).
     root = tk.Tk()
-    app = StealthOverlayApp(root, api_url=api_url, session_id=session_id)
+    app = StealthOverlayApp(
+        root, api_url=api_url, session_id=session_id,
+        backend_launcher=launcher if opts["stop_on_exit"] else None,
+        model_launcher=model_launcher if opts["stop_on_exit"] else None,
+        listening_mode=opts["listening_mode"],
+        auto_start_listening=opts["auto_start_listening"])
     root.mainloop()
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())
