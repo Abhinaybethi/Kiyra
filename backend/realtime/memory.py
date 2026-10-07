@@ -75,6 +75,41 @@ _DEMONSTRATIVE = re.compile(
 )
 # The exact cue span each rule matched (used for referent substitution).
 _LEAD_RE = re.compile(r"^\s*(it|that|this|they|them|those|these|he|she)\b", re.IGNORECASE)
+# Expletive/dummy "it": "how does it work", "is it fast", "does it matter".
+# Here "it" is a grammatical placeholder, not a reference back to an earlier
+# turn. Treating it as an anaphor dragged the previous topic into unrelated
+# questions and rewrote them — e.g. "What is RAG and how does it work in
+# general?" became "…how does project and work in general?", which the model
+# then answered as a project question.
+_DUMMY_IT = re.compile(
+    r"\b(?:do|does|did|is|are|was|were|can|could|will|would|shall|should|"
+    r"may|might|has|have|had)\s+(?:it|its)\b",
+    re.IGNORECASE,
+)
+
+
+def _anaphora_cue(text: str):
+    """First anaphoric cue in ``text`` that is not an expletive "it"."""
+    dummies = [m.span() for m in _DUMMY_IT.finditer(text)]
+    for m in _ANAPHORA.finditer(text):
+        if any(start <= m.start() and m.end() <= end for start, end in dummies):
+            continue
+        return m
+    return None
+
+
+# Which of the detected cues is a bare pronoun (as opposed to repeated-a-word
+# cues like "again"/"same": those always reach back regardless of the rest).
+_CUE_IS_PRONOUN = re.compile(r"\b(?:it|its|they|them|their)\b", re.IGNORECASE)
+# A non-demonstrative determiner phrase naming the question's own subject
+# ("the access token", "your project"). "that approach" / "this design" are
+# deliberately excluded: they are themselves the anaphor, not an independently
+# named subject freshly introduced by this question.
+_HAS_OWN_NP = re.compile(
+    r"\b(?:the|your|my|our|an?)\s+"
+    r"[A-Za-z0-9][A-Za-z0-9+\-_.]*(?:\s+[A-Za-z0-9][A-Za-z0-9+\-_.]*){0,3}\b",
+    re.IGNORECASE,
+)
 
 
 @dataclass
@@ -125,7 +160,7 @@ class ContextResolver:
             return True
         if _DEMONSTRATIVE.search(norm):
             return True
-        return bool(_ANAPHORA.search(norm))
+        return _anaphora_cue(norm) is not None
 
     # ── Resolution ───────────────────────────────────────────────────────
 
@@ -152,13 +187,32 @@ class ContextResolver:
         if referenced:
             referent = referenced[0]
         elif followup:
-            referent = self.memory.active_topic
+            # A bare pronoun only reaches back to the previous topic when the
+            # question does NOT already name its own subject. "…and how do you
+            # refresh it?" right after "the access token" refers to the token,
+            # not to whatever the last topic was — overwriting it with the old
+            # topic dragged the answer onto the wrong subject entirely.
+            cue = (_anaphora_cue(original)
+                   or _LEAD_RE.match(original.strip()))
+            has_own_np = bool(cue and _CUE_IS_PRONOUN.match(cue.group(0))
+                              and _HAS_OWN_NP.search(original))
+            if not has_own_np:
+                referent = self.memory.active_topic
 
         resolved = original
         if followup and referent:
             resolved = self._substitute(original, referent)
 
-        topic = referenced[0] if referenced else self.memory.active_topic
+        # A self-contained question names its own topic. Only a genuine
+        # follow-up ("it", "that", "there") inherits the previous active
+        # topic; otherwise "What is RAG…?" would be tagged with the last
+        # project topic and the answer would be pulled back to it.
+        if referenced:
+            topic = referenced[0]
+        elif followup:
+            topic = self.memory.active_topic
+        else:
+            topic = ""
 
         return Resolution(
             original_question=original,
@@ -172,7 +226,7 @@ class ContextResolver:
     @staticmethod
     def _substitute(question: str, referent: str) -> str:
         """Replace the first anaphoric cue with the referent."""
-        m = _DEMONSTRATIVE.search(question) or _ANAPHORA.search(question) \
+        m = _DEMONSTRATIVE.search(question) or _anaphora_cue(question) \
             or _LEAD_RE.match(question.strip())
         if not m:
             return question
@@ -266,13 +320,20 @@ class SessionMemory:
         self.rebuild_summary()
 
     def rebuild_summary(self) -> str:
-        """Deterministic compact summary of the conversation so far."""
+        """Deterministic compact summary of the conversation so far.
+
+        Deliberately questions-and-topics only. Earlier answers used to be
+        inlined here *and* again in ``conversation_block()``, which put the
+        same verbatim answer in the prompt twice — an 8B model anchored on it
+        and restated/continued the previous answer instead of answering the
+        new question. Prior answer text now lives in exactly one place
+        (``RECENT CONVERSATION``) and is clearly labelled as reference.
+        """
         lines: list[str] = []
         if self.active_topic:
             lines.append("Active topic: %s" % _one_line(self.active_topic))
         for i, t in enumerate(self.turns, 1):
             lines.append("%d. Q: %s" % (i, _clip(t.question, 160)))
-            lines.append("   A: %s" % _clip(t.answer, 200))
         if self.important_entities:
             lines.append("Entities: " + ", ".join(
                 _clip(e, 40) for e in self.important_entities[:12]))
@@ -291,10 +352,11 @@ class SessionMemory:
         recent = self.turns[-self.recent_turns:]
         if not recent:
             return "(none)"
-        lines: list[str] = []
+        lines: list[str] = ["(reference only — do not restate these)"]
         for t in recent:
             lines.append("- Q: %s" % _clip(t.question, 160))
-            lines.append("  A: %s" % _clip(t.answer, 240))
+            lines.append("  A (earlier, for reference only): %s"
+                         % _clip(t.answer, 160))
         return "\n".join(lines)
 
 
@@ -376,11 +438,17 @@ _ANSWER_REQUIREMENTS = """\
   "according to the resume", "the candidate", or "based on the documents".
 - Ground every personal claim in RELEVANT KNOWLEDGE or PREVIOUS CONTEXT;
   never invent projects, technologies, metrics, or experience.
-- If CURRENT QUESTION reaches back to an earlier turn, answer the referent
-  using ACTIVE TOPIC and RECENT CONVERSATION, and stay consistent with the
-  answers already given this session.
+- If CURRENT QUESTION reaches back to an earlier turn, use ACTIVE TOPIC and
+  RECENT CONVERSATION to work out WHAT it refers to, then answer that
+  referent from scratch. Stay factually consistent with the session, but a
+  consistent answer is usually worded differently.
 - Plain speakable text only: no headings, citations, or meta commentary.
-  Follow the length rules from the system prompt."""
+  Follow the length rules from the system prompt.
+- Answer ONLY the CURRENT QUESTION, and start from the beginning. Earlier
+  answers in RECENT CONVERSATION are background for references and
+  consistency only — never reuse, quote, paraphrase, or continue them, and
+  never answer an earlier question again. If an earlier answer would be a
+  valid answer to CURRENT QUESTION, write a fresh answer to it instead."""
 
 
 class ContextBuilder:
@@ -398,8 +466,14 @@ class ContextBuilder:
         try:
             memory = memory or SessionMemory()
             resolution = resolution or Resolution.identity("")
+            # Inherit the previous active topic only when this question
+            # actually reaches back to it. A self-contained question must
+            # not be anchored to the last project topic — that is what made
+            # a generic "What is RAG…?" question answered as a project
+            # answer instead of a generic one.
+            inherited = memory.active_topic if resolution.followup else ""
             topic = (resolution.referent or resolution.topic
-                     or memory.active_topic or "(none yet)")
+                     or inherited or "(none yet)")
             return {
                 "ACTIVE TOPIC": topic,
                 "PREVIOUS CONTEXT": memory.summary_block(),
@@ -422,6 +496,7 @@ class ContextBuilder:
         resolution: Optional[Resolution] = None,
         sections: Optional[dict[str, str]] = None,
         analysis: Optional[QuestionAnalysis] = None,
+        project_evidence: Optional[str] = None,
     ) -> str:
         try:
             memory = memory or SessionMemory()
@@ -439,15 +514,25 @@ class ContextBuilder:
                 current_block = current
             ordered = [
                 ("CANDIDATE", candidate_name or "the candidate"),
-                ("CURRENT QUESTION", current_block or "(none)"),
                 ("ACTIVE TOPIC", sections.get("ACTIVE TOPIC", "(none yet)")),
                 ("PREVIOUS CONTEXT", sections.get("PREVIOUS CONTEXT", "(none)")),
                 ("RELEVANT KNOWLEDGE",
                  (context or "").strip() or "(no retrieved context)"),
-                ("RECENT CONVERSATION",
-                 sections.get("RECENT CONVERSATION", "(none)")),
-                ("ANSWER REQUIREMENTS", _ANSWER_REQUIREMENTS),
             ]
+            # Project (GitHub) evidence: only when the question is
+            # project-related; the block carries its own grounding rules and
+            # PROJECT CODE MODE directive, so no separate injection is needed.
+            if project_evidence and project_evidence.strip():
+                ordered.append(("PROJECT EVIDENCE", project_evidence.strip()))
+            ordered.append(
+                ("RECENT CONVERSATION",
+                 sections.get("RECENT CONVERSATION", "(none)")))
+            # CURRENT QUESTION goes LAST (just before the requirements): a small
+            # local model is strongly recency-biased, so with the question up
+            # top and RECENT CONVERSATION at the bottom it copied the *previous*
+            # answer verbatim instead of answering the question in hand.
+            ordered.append(("CURRENT QUESTION", current_block or "(none)"))
+            ordered.append(("ANSWER REQUIREMENTS", _ANSWER_REQUIREMENTS))
             # Strict coding mode: appended ONLY when requires_code is True, so
             # behavioral/project/technical questions keep the humanized format
             # and the prompt is never overloaded with coding instructions.
@@ -472,6 +557,7 @@ class ContextBuilder:
         memory: Optional["SessionMemory"],
         resolution: Optional[Resolution] = None,
         analysis: Optional[QuestionAnalysis] = None,
+        project_evidence: Optional[str] = None,
     ) -> str:
         """One-shot: memory sections + full sectioned prompt."""
         sections = ContextBuilder.memory_sections(memory, resolution)
@@ -483,4 +569,5 @@ class ContextBuilder:
             resolution=resolution,
             sections=sections,
             analysis=analysis,
+            project_evidence=project_evidence,
         )

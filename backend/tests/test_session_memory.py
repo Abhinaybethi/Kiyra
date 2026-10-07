@@ -75,12 +75,16 @@ class FakeProvider:
         return "".join(self.stream_tokens)
 
 
-def make_session(provider, db=None, session_row=None):
-    session = session_row or SimpleNamespace(
+def _make_session_row():
+    return SimpleNamespace(
         id=7,
         mode="realtime",
         profile=SimpleNamespace(id=3, name="Test Candidate"),
     )
+
+
+def make_session(provider, db=None, session_row=None):
+    session = session_row or _make_session_row()
     if db is None:
         db = SimpleNamespace(
             add=lambda *a, **k: None,
@@ -106,6 +110,8 @@ def make_session(provider, db=None, session_row=None):
     sess._prefetch_task = None
     sess._prefetch_question = None
     sess._prefetch_context = None
+    sess._last_analysis = None
+    sess._active_project_id = None
     sess._partial_task = None
     sess._last_partial_speech = 0.0
     sess._partial_count = 0
@@ -190,6 +196,75 @@ def test_independent_question_is_not_followup():
     assert res.followup is False
     assert res.resolved_question == res.original_question
     assert res.referent == ""
+
+
+def test_expletive_it_is_not_a_followup_and_is_never_rewritten():
+    """Regression: "What is RAG and how does **it** work in general?" uses
+    "it" as a dummy subject, not as a reference back to the previous turn.
+    The old rule flagged it as a follow-up and rewrote it with the active
+    topic — "…how does project and work in general?" — so the model answered
+    a generic question with the previous project answer."""
+    mem = SessionMemory(entities=["Friday"])
+    mem.record_turn(Turn(
+        question="Can you explain my project?",
+        answer="I used FastAPI for the backend.",
+        topic="FastAPI",
+    ))
+
+    res = mem.resolve("What is RAG and how does it work in general?")
+    assert res.followup is False
+    assert res.referent == ""
+    assert res.resolved_question == res.original_question
+    assert "FastAPI" not in res.resolved_question
+    # A self-contained question must not inherit the previous topic either.
+    assert res.topic == ""
+
+    # …but a genuine referential follow-up still resolves.
+    real = mem.resolve("Why did you choose it?")
+    assert real.followup is True
+    assert real.referent == "FastAPI"
+    assert "FastAPI" in real.resolved_question
+
+
+def test_pronoun_reaches_its_own_in_question_subject_not_the_old_topic():
+    """Regression: "…and how do you refresh **it**?" after "the access token"
+    refers to the token, but the resolver overwrote "it" with the previous
+    session topic ("node.js"), so the whole question and answer veered onto
+    the wrong subject."""
+    mem = SessionMemory(entities=["node.js"])
+    mem.record_turn(Turn(
+        question="write a node.js function that reads a JSON file",
+        answer="I built a Node.js function.",
+        topic="node.js",
+    ))
+
+    res = mem.resolve("How long should the access token expiry be "
+                      "and how do you refresh it?")
+    assert res.followup is True
+    assert res.referent == "", (
+        "'it' must resolve inside the question, not steal the old topic")
+    assert res.resolved_question == res.original_question
+    assert "node.js" not in res.resolved_question
+
+    # A bare pronoun with no in-question subject still reaches back.
+    bare = mem.resolve("Why did you choose it?")
+    assert bare.referent == "node.js"
+    assert "node.js" in bare.resolved_question
+
+
+def test_topic_fallback_never_ends_on_a_connector():
+    """Regression: the fallback label kept connectors mid-question and
+    produced "project and" / "rag and", which read as a broken referent."""
+    fallback = session_mod._topic_fallback
+    assert fallback(
+        "Can you explain my project? and tell me what architecture you used. "
+        "and why you selected Fast API for the backend?"
+    ) == "project"
+    assert fallback("What is rag and how does it work in general?") == "rag"
+    # The documented example in the docstring must keep working.
+    assert fallback("Can you explain how the retry path works?") == \
+        "retry path works"
+    assert fallback("Tell me about the retry path") == "retry path"
 
 
 # ── TEST 4: profile entities from DB + tech tokens as candidates ───────────
@@ -355,6 +430,54 @@ def test_retrieval_cache_ttl_expiry():
 
 # ── TEST 10: context builder sections + knowledge cap + resolution shown ───
 
+def test_previous_answer_appears_at_most_once_in_the_prompt():
+    """Regression: an earlier answer used to be inlined TWICE (PREVIOUS
+    CONTEXT via the compact summary *and* RECENT CONVERSATION). An 8B model
+    anchored on the repeated text and restated or continued the previous
+    answer instead of answering the new question."""
+    marker = "ZZUNIQUEANSWERTOKENZZ built the ingestion pipeline with Kafka"
+    mem = SessionMemory(entities=["Friday"])
+    mem.record_turn(Turn(question="Explain your ingestion pipeline",
+                         answer=marker, topic="ingestion"))
+    prompt = ContextBuilder.build(
+        question="What are the advantages of that choice?",
+        candidate_name="Jane Doe",
+        context="",
+        memory=mem,
+        resolution=Resolution.identity("What are the advantages of that choice?"),
+    )
+    assert prompt.count(marker) == 1, (
+        "an earlier answer must be present exactly once, as reference")
+
+    # PREVIOUS CONTEXT carries the question trail, not the answer body.
+    previous = prompt.split("PREVIOUS CONTEXT:\n", 1)[1].split("\n\n", 1)[0]
+    assert marker not in previous
+    assert "Explain your ingestion pipeline" in previous
+
+    # RECENT CONVERSATION keeps it, labelled as reference only.
+    recent = prompt.split("RECENT CONVERSATION:\n", 1)[1].split("\n\n", 1)[0]
+    assert marker in recent
+    assert "reference only" in recent
+
+    # The rules must forbid reuse without inviting consistency-by-copying.
+    assert "never reuse" in prompt
+    assert "start from the beginning" in prompt
+
+
+def test_prompt_rules_do_not_encourage_restating_earlier_answers():
+    """The old wording ("stay consistent with the answers already given")
+    actively invited the model to copy its previous answer."""
+    from realtime.memory import _ANSWER_REQUIREMENTS
+    rules = _ANSWER_REQUIREMENTS
+    assert "stay consistent with the answers already given" not in rules
+    assert "Stay factually consistent" in rules
+    assert "never reuse, quote, paraphrase, or continue them" in rules
+
+    system = realtime_system("short")
+    assert "stay consistent with the answers you already gave" not in system
+    assert "never restate or continue an earlier answer" in system
+
+
 def test_context_builder_sections_and_knowledge_cap():
     mem = SessionMemory(entities=["Friday"])
     mem.record_turn(Turn(question="Tell me about Friday",
@@ -403,9 +526,22 @@ def test_system_prompt_followup_voice_grounding_rules():
         resolution=None,
     )
     assert "first person" in prompt
-    assert "stay consistent" in prompt
+    # Still asks for continuity, but no longer phrases it as "stay consistent
+    # with the answers you already gave", which invited the model to restate
+    # a previous answer instead of writing a fresh one.
+    assert "factually consistent" in prompt
+    assert "stay consistent" not in prompt
     assert "never contradict" in system
     assert "according to the resume" in prompt  # …as a prohibition
+
+
+def test_system_prompt_coding_override_only_when_requires_code():
+    plain = realtime_system("short")
+    coding = realtime_system("short", requires_code=True)
+    assert "CODING QUESTION OVERRIDE" not in plain
+    assert "CODING QUESTION OVERRIDE" in coding
+    assert "MUST contain a fenced code block" in coding
+    assert "plain text only" in coding
 
 
 # ── TEST 12: answer survives retrieval + persistence failures ──────────────

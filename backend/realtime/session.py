@@ -39,6 +39,8 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
+import re
 import time
 import traceback
 from datetime import datetime
@@ -71,7 +73,78 @@ from realtime.question_analyzer import analyze_question
 from realtime.perf import PerformanceTracker
 from realtime.prompts import realtime_system
 from realtime.transcription import transcribe_with_lock
-from realtime.transcript import TranscriptBuffer
+from realtime.transcript import (
+    InterviewTranscriptBuffer,
+    TranscriptBuffer,
+    normalize as normalize_whitespace,
+)
+
+
+_QUESTION_LEAD = frozenset({
+    "what", "why", "how", "when", "where", "who", "whom", "which",
+    "explain", "describe", "tell", "briefly", "walk", "give", "show",
+    "can", "could", "would", "should", "do", "does", "did", "is", "are",
+    "was", "were", "have", "has", "had", "you", "me", "us", "your", "my",
+    "our", "their", "the", "a", "an", "about", "please",
+})
+
+# Words that only ever connect content words inside a topic label. They are
+# skipped anywhere in the question so a label never ends on a dangling
+# conjunction ("project and", "rag and").
+_TOPIC_CONNECTORS = frozenset({
+    "and", "or", "but", "of", "to", "for", "with", "in", "on", "at",
+    "from", "as", "by", "into", "via", "than", "then",
+})
+
+
+def _topic_fallback(question: str, limit: int = 6) -> str:
+    """Last-resort topic label so the panel is never blank (Phase 5.4.1 §16).
+
+    Strips the whole interrogative lead-in and keeps the first content words,
+    e.g. "Can you explain how the retry path works?" -> "retry path works".
+    Only leading words are dropped, so "the" inside the topic survives.
+    Connectors are skipped wherever they appear: the old behaviour kept them
+    and produced labels like "project and" / "rag and", which then read as a
+    broken referent when reused as an active topic.
+    """
+    words = re.findall(r"[A-Za-z0-9_+#.\-]+", question or "")
+    kept: list[str] = []
+    for word in words:
+        low = word.lower()
+        if low in _TOPIC_CONNECTORS:
+            continue
+        if low in _QUESTION_LEAD:
+            if kept:
+                break  # only a leading run of filler is removed
+            continue
+        kept.append(word)
+        if len(kept) >= limit:
+            break
+    return " ".join(kept)
+
+
+def _memory_points(memory, limit: int = 6) -> list[str]:
+    """Concise, non-sensitive memory lines for the overlay Memory panel.
+
+    Deliberately shallow: never dumps raw memory blobs (spec §9).
+    """
+    if memory is None:
+        return []
+    points: list[str] = []
+
+    established = getattr(memory, "established_facts", None) or []
+    for fact in established[-limit:]:
+        text = getattr(fact, "text", None) or str(fact)
+        if text:
+            points.append(" ".join(str(text).split())[:160])
+
+    if not points:
+        for turn in list(getattr(memory, "turns", []) or [])[-3:]:
+            q = getattr(turn, "question", "") or ""
+            if q:
+                points.append(" ".join(str(q).split())[:160])
+
+    return points[:limit]
 from realtime.question_detector import (
     QuestionDetector,
     similarity,
@@ -79,7 +152,16 @@ from realtime.question_detector import (
     partial_validation_score,
     partial_spec_eligible,
 )
-
+from github_repo import (
+    GitHubConfigError,
+    GitHubRetriever,
+    configured_projects,
+    create_if_configured,
+    evidence_block,
+    evidence_note,
+    project_display_names,
+    resolve_project,
+)
 
 class RealtimeState(str, Enum):
     IDLE = "IDLE"
@@ -90,6 +172,13 @@ class RealtimeState(str, Enum):
     RETRIEVING_CONTEXT = "RETRIEVING_CONTEXT"
     GENERATING = "GENERATING"
     STREAMING_ANSWER = "STREAMING_ANSWER"
+    # ── Interview Listening Mode (Phase 5.4) ──────────────────────────────
+    # The user owns the question boundary: speech accumulates into a turn and
+    # ONLY an explicit SEND leaves READY_TO_SEND.
+    READY_TO_SEND = "READY_TO_SEND"
+    ANSWER_READY = "ANSWER_READY"
+    CANCELLED = "CANCELLED"
+    ERROR = "ERROR"
     # Error states
     STT_ERROR = "STT_ERROR"
     PROVIDER_UNAVAILABLE = "PROVIDER_UNAVAILABLE"
@@ -99,6 +188,7 @@ class RealtimeState(str, Enum):
 
 class EventType(str, Enum):
     """WebSocket event types (kept backward-compatible where possible)."""
+
     SESSION_CONNECTED = "session.connected"
     SESSION_ERROR = "session.error"
     SESSION_END = "session.end"
@@ -116,11 +206,55 @@ class EventType(str, Enum):
     ANSWER_STREAMED = "answer.streamed"
     ANSWER_CANCELLED = "answer.cancelled"
 
+    # ── Interview Listening Mode (Phase 5.4) ──────────────────────────────
+    MODE_CHANGED = "mode.changed"
+    LISTENING_STARTED = "listening.started"
+    LISTENING_STOPPED = "listening.stopped"
+    TRANSCRIPT_SEGMENT = "transcript.segment"  # one finalized STT segment
+    TURN_SUBMITTED = "turn.submitted"          # the frozen, authoritative text
+    MEMORY_UPDATED = "memory.updated"          # topic / previous / memory for UI
+    PERF = "kiyra.perf"                         # [KIYRA-PERF] metrics
+
     PING = "ping"
     PONG = "pong"
 
 
 _SPEC_END = object()  # sentinel marking the end of a speculative provider stream
+
+
+# ── GitHub-aware project retrieval (Phase 5.2) ─────────────────────────────
+# The retriever is the ONLY GitHub-touching object the session uses; all
+# repo logic lives in github_repo/. Bonsai never calls GitHub directly.
+
+_github_retriever: Optional[GitHubRetriever] = None
+_github_error_logged = False
+
+
+def _get_retriever() -> Optional[GitHubRetriever]:
+    """Lazily-built GitHub retriever; None when disabled / unconfigured.
+
+    Never raises: a missing token, bad config, or any construction failure
+    simply disables project retrieval instead of failing the answer.
+    """
+    global _github_retriever, _github_error_logged
+    if _github_retriever is not None:
+        return _github_retriever
+    if not settings.kiyra_github_enabled:
+        return None
+    try:
+        provider = create_if_configured()
+    except GitHubConfigError as e:
+        if not _github_error_logged:
+            print(f"[GITHUB] project retrieval unavailable: {e}")
+            _github_error_logged = True
+        return None
+    except Exception as e:
+        print(f"[GITHUB] retriever init failed (project retrieval off): {e}")
+        return None
+    if provider is None:
+        return None
+    _github_retriever = GitHubRetriever(provider)
+    return _github_retriever
 
 
 def _event(event_type: str, payload: dict) -> str:
@@ -151,6 +285,43 @@ class LiveSession:
     _spec_perf: Optional[PerformanceTracker] = None
     _vad_end_mono: Optional[float] = None
 
+    # ── Interview Listening Mode class defaults (same __new__ reason) ─────
+    # The turn buffer and question history are lazily built per instance so a
+    # test double created with __new__ never shares mutable state.
+    _listening_mode = False
+    _listening_active = False
+    _turn = None
+    _turn_seq = 0
+    _turn_submitting = False
+    _turn_submitted_text: Optional[str] = None
+    _turn_start_ts: Optional[float] = None
+    _turn_listen_ms = 0.0
+    _turn_id: Optional[str] = None
+    _turn_no = 0
+    _submitted_turn_id: Optional[str] = None
+    _last_resolved_topic: Optional[str] = None
+    _question_history: Optional[list] = None
+    _recent_questions: Optional[list] = None
+
+    @property
+    def turn(self) -> InterviewTranscriptBuffer:
+        """The open turn's transcript buffer (lazily created per instance)."""
+        buf = self.__dict__.get("_turn")
+        if buf is None:
+            buf = InterviewTranscriptBuffer(
+                min_useful_chars=settings.turn_min_useful_chars)
+            self.__dict__["_turn"] = buf
+        return buf
+
+    @property
+    def recent_questions(self) -> list:
+        """Submitted questions for the Previous Questions panel."""
+        history = self.__dict__.get("_recent_questions")
+        if history is None:
+            history = []
+            self.__dict__["_recent_questions"] = history
+        return history
+
     def __init__(self, websocket: WebSocket, session: InterviewSession, db: Session):
         self.ws = websocket
         self.session = session
@@ -179,6 +350,29 @@ class LiveSession:
             dedup_window=settings.question_dedup_window,
         )
 
+        # ── Interview Listening Mode (Phase 5.4) ────────────────────────────
+        # Opt-in per connection. When on, VAD only SEGMENTS audio; every
+        # finalized STT segment is appended to the turn buffer and nothing is
+        # submitted until the client sends `turn.send`. Legacy auto-detect
+        # behaviour is untouched when the mode is off (the web client).
+        self._listening_mode = False
+        self._listening_active = False
+        # `turn` / `recent_questions` are lazy properties (see the class body)
+        # so test doubles built with __new__ never share mutable state.
+        self._turn = None
+        self._turn_seq = 0
+        self._seg_seq = 0
+        self._turn_submitting = False   # single-flight guard: one SEND = one gen
+        self._turn_submitted_text: Optional[str] = None
+        self._turn_start_ts: Optional[float] = None
+        self._turn_listen_ms = 0.0
+        self._turn_id: Optional[str] = None
+        self._turn_no = 0
+        self._submitted_turn_id: Optional[str] = None
+        self._last_resolved_topic: Optional[str] = None
+        self._question_history: Optional[list] = None
+        self._recent_questions = None
+
         # Answer generation management
         self._request_seq = 0
         self._current_request_id: Optional[str] = None
@@ -190,6 +384,10 @@ class LiveSession:
         # Deterministic question analysis carried between turns so follow-ups
         # ("now add authentication") inherit coding intent / language.
         self._last_analysis = None
+
+        # Project (GitHub) grounding: the project resolved from the last
+        # project question so follow-ups keep targeting the same repository.
+        self._active_project_id: Optional[str] = None
 
         # Partial / speculative pipeline
         self._partial_task: Optional[asyncio.Task] = None
@@ -216,6 +414,32 @@ class LiveSession:
         self._last_queue_log = 0.0
         self._last_queue_delay_ms = 0.0
         self._budget_warns: dict[str, float] = {}
+
+    def _trace_prompt_boundary(self, question, source, analysis, system,
+                               user_prompt):
+        """[CODE-TRACE] final generation boundary: does the exact prompt about
+        to reach the provider still carry the coding instruction? Logs ONLY
+        marker booleans + the analysis fields — never resume/context/prompt."""
+        q_safe = " ".join(str(question or "").split())[:100]
+        had = analysis is not None
+        req = bool(had and analysis.requires_code)
+        low = user_prompt.lower()
+        inst_exe = "must provide actual executable code" in low
+        inst_fence = "must contain a fenced code block" in low
+        sys_override = "CODING QUESTION OVERRIDE" in (system or "")
+        lang = analysis.language or "" if had else ""
+        fw = analysis.framework or "" if had else ""
+        print(
+            "[CODE-TRACE] question=%s source=%s intent=%s requires_code=%s "
+            "language=%s framework=%s"
+            % (q_safe, source or "-", (analysis.intent if had else "-")
+               or "-", req, lang or "-", fw or "-")
+        )
+        print(
+            "[CODE-TRACE] coding_instruction_present=%s code_block_required=%s "
+            "requested_language=%s requested_framework=%s system_override=%s"
+            % (inst_exe, inst_fence, lang or "-", fw or "-", sys_override)
+        )
 
     # ────────────────────────────────────────────────────────────────────────
     # WebSocket plumbing
@@ -394,7 +618,14 @@ class LiveSession:
             print(f"[VAD] SPEECH_END duration={dur_ms:.0f}ms rms={rms:.4f}")
 
         if utterance is not None:
-            await self._handle_utterance(utterance, recv_ts)
+            # Turn ownership: stamp the utterance with the turn that was OPEN
+            # when the VAD finalized it. STT happens inline below and can be
+            # slower than a WS `listening.start`, so the turn may rotate while
+            # this utterance is in flight. The stamp is what stops a late turn-N
+            # transcript from being appended into turn N+1.
+            utterance_turn_id = self._turn_id
+            await self._handle_utterance(utterance, recv_ts,
+                                         turn_id=utterance_turn_id)
 
         # Partial / speculative trigger — fire-and-forget (drain loop never blocks)
         if self._receiver.is_voiced:
@@ -410,6 +641,54 @@ class LiveSession:
         perf.set_duration("vad_ms", vad_ms)
         self._perf = perf
         return perf
+
+    def _emit_turn_perf(self, tracker: Optional[PerformanceTracker],
+                        request_id: str = "", prompt_tokens=None,
+                        completion_tokens=None, chunks: Optional[int] = None):
+        """Structured per-turn latency line ([KIYRA-PERF], Phase 5.4 §10).
+
+        Contains timings and counts only — never transcript or answer content.
+        Emitted to the log and, in listening mode, to the client as a `perf`
+        event so the overlay can measure UI render latency.
+        """
+        if tracker is None:
+            return
+        d = tracker.durations
+
+        def _ms(key):
+            val = d.get(key)
+            return -1 if val is None else int(round(val))
+
+        listen_ms = int(round(getattr(self, "_turn_listen_ms", 0.0) or 0.0))
+        record = {
+            "turn_id": getattr(self, "_turn_id", None) or request_id or "",
+            "request_id": request_id or (tracker.request_id or ""),
+            "mode": "interview_listening" if self._listening_mode else "auto_detect",
+            "listen_ms": listen_ms,
+            "vad_ms": _ms("vad_ms"),
+            "stt_ms": _ms("stt_ms"),
+            "detection_ms": _ms("question_detection_ms"),
+            "retrieval_ms": _ms("rag_ms"),
+            "context_ms": _ms("context_ms"),
+            "prompt_ms": _ms("prompt_ms"),
+            "llm_ttft_ms": _ms("llm_ttft_ms"),
+            "llm_total_ms": _ms("generation_ms"),
+            "first_token_ms": _ms("first_token_ms"),
+            "total_ms": _ms("total_ms"),
+            "segments": int(getattr(self, "_turn_seq", 0) or 0),
+            "chunks": int(chunks) if chunks is not None else -1,
+            "prompt_tokens": int(prompt_tokens) if prompt_tokens else -1,
+            "completion_tokens": (int(completion_tokens)
+                                  if completion_tokens else -1),
+        }
+        print("[KIYRA-PERF] " + " ".join(
+            f"{k}={v}" for k, v in record.items()))
+        if self._listening_mode:
+            try:
+                asyncio.get_running_loop().create_task(
+                    self.send(EventType.PERF, record))
+            except Exception:
+                pass
 
     # ────────────────────────────────────────────────────────────────────────
     # Session memory (Phase 3): lazy state, profile entities, persistence
@@ -526,13 +805,22 @@ class LiveSession:
                 pass
 
     def _record_turn(self, question: str, answer: str,
-                     resolution: Optional[Resolution]) -> None:
-        """Append the answered turn to memory + DB (never raises)."""
+                     resolution: Optional[Resolution]) -> str:
+        """Append the answered turn to memory + DB (never raises).
+
+        Returns the resolved topic (never blank when a question exists) so the
+        history entry can reuse it instead of re-resolving.
+        """
         try:
             memory = self._get_memory()
             resolution = resolution or Resolution.identity(question)
+            # Inherit the previous active topic only for real follow-ups.
+            # Otherwise a self-contained question ("What is RAG…?") would be
+            # labelled with the previous project topic.
+            inherited = memory.active_topic if resolution.followup else ""
             topic = (resolution.referent or resolution.topic
-                     or memory.active_topic)
+                     or inherited
+                     or _topic_fallback(question))
             turn = Turn(
                 question=question,
                 answer=answer,
@@ -545,7 +833,7 @@ class LiveSession:
             memory.record_turn(turn)
         except Exception as e:
             print(f"[MEMORY] record failed: {e}")
-            return
+            return _topic_fallback(question)
         print(
             "[MEMORY] turn=%d topic=%r followup=%s entities=%d"
             % (len(memory.turns), topic, resolution.followup, len(turn.entities))
@@ -553,10 +841,10 @@ class LiveSession:
         try:
             probe = self.db.query(SessionTurn)
             if not hasattr(probe, "filter_by"):
-                return  # lightweight test double
+                return topic  # lightweight test double
             sid = getattr(self.session, "id", None)
             if sid is None:
-                return
+                return topic
             self.db.add(SessionTurn(
                 session_id=sid,
                 turn_index=len(memory.turns),
@@ -584,6 +872,7 @@ class LiveSession:
                 self.db.rollback()
             except Exception:
                 pass
+        return topic
 
     def _report_perf(self, tracker: Optional[PerformanceTracker]) -> None:
         """Print a speculative [PERF] once, inheriting utterance timing."""
@@ -595,12 +884,18 @@ class LiveSession:
         tracker.log()
 
 
-    async def _handle_utterance(self, utterance, recv_ts: float, *, finalize_only: bool = False):
+    async def _handle_utterance(self, utterance, recv_ts: float, *,
+                            finalize_only: bool = False,
+                            turn_id: str | None = None):
         """Full utterance ready → transcribe → aggregate → detect → answer.
 
         finalize_only=True is used on disconnect: transcribe and persist the
         trailing speech, but skip detection/answer generation (no client is
         listening and the answer task would outlive the DB session).
+
+        turn_id is the turn that owned this utterance at the VAD boundary. If
+        the turn has since rotated, the STT result is stale and is dropped
+        instead of corrupting the new question (Phase 5.4.1 §7-§8).
         """
         # Utterance boundary: TranscriptBuffer.current_utterance is a
         # fragment roll-up for ONE utterance, and finalize_utterance() is
@@ -610,11 +905,21 @@ class LiveSession:
         # add_fragment; only the scratch roll-up is cleared.
         self._transcripts.current_utterance = ""
 
+        # Allocate the segment identity BEFORE the async STT hop. A stale
+        # result can then be logged with the exact segment it belonged to,
+        # and a late/failed transcript never has to invent an identity
+        # (Phase 5.4.1 §8).
+        seg_seq = getattr(self, "_seg_seq", 0) + 1
+        self._seg_seq = seg_seq
+        segment_id = f"u{seg_seq}"
+
         # Aggressive first answer: speech just ended and a speculative answer is
         # already buffered (generated from a *complete-looking* partial). Release
         # it NOW — don't wait ~1.7s for the full final STT. The authoritative
         # transcript that lands later confirms it or supersedes it.
-        if (self._spec_task and not self._spec_task.done()
+        # Interview Listening Mode never speculates: the user owns the boundary.
+        if (not self._listening_mode
+                and self._spec_task and not self._spec_task.done()
                 and self._spec_question and not self._spec_released):
             self._spec_released = True
             self._spec_validated = True
@@ -633,11 +938,23 @@ class LiveSession:
 
         stt_start = time.monotonic()
         perf.mark("stt_start")
-        try:
-            result = await asyncio.wait_for(
+
+        async def _stt_once(timeout_s: float):
+            return await asyncio.wait_for(
                 asyncio.to_thread(transcribe_with_lock, audio_wav, "wav"),
-                timeout=settings.stt_timeout,
+                timeout=timeout_s,
             )
+
+        try:
+            try:
+                result = await _stt_once(settings.stt_timeout)
+            except asyncio.TimeoutError:
+                # Dropping the audio here loses the candidate's words forever,
+                # and the retry is what absorbs a cold Whisper load. One
+                # bounded retry, then surface it (never silently discard).
+                print(f"[STT] timed out at {settings.stt_timeout}s; retrying "
+                      f"within {settings.stt_retry_timeout}s")
+                result = await _stt_once(settings.stt_retry_timeout)
         except asyncio.TimeoutError:
             self._set_state(RealtimeState.STT_ERROR)
             await self.send(EventType.SESSION_ERROR, {
@@ -669,14 +986,76 @@ class LiveSession:
         if result.text and result.text.strip():
             print(f'[STT] transcript="{result.text}"')
 
+        # ── Turn ownership gate (Phase 5.4.1 §8) ───────────────────────────
+        # The turn rotated while STT was running (a faster `listening.start`, a
+        # STOP, or a SEND that finalised this utterance). Appending now would
+        # splice turn N's words into turn N+1's question. Drop it.
+        if (turn_id is not None and turn_id != self._turn_id
+                and self._listening_mode):
+            print("[TURN] stale_stt_ignored session=%s turn=%s active_turn=%s "
+                  "segment=%s chars=%d"
+                  % (self.session.id, turn_id, self._turn_id, segment_id,
+                     len(result.text or "")))
+            return
+
         if not result.text or len(result.text.strip()) < 3:
             self._cancel_spec()
+            return
+
+        # ── Interview Listening Mode ──────────────────────────────────────
+        # Speech ended, but that is NOT "the interviewer finished". Append the
+        # finalized segment to the open turn and go back to waiting for more
+        # speech. Only an explicit SEND submits.
+        if self._listening_mode:
+            await self._append_turn_segment(result, segment_id=segment_id)
             return
 
         self._on_partial_transcript(result)
         if finalize_only:
             return
         await self._analyze_transcript(result)
+
+    async def _append_turn_segment(self, result, *, segment_id: str):
+        """Append one finalized STT segment to the open turn (listening mode)."""
+        self._turn_seq += 1
+        stored = self.turn.append(result.text, segment_id=segment_id)
+
+        entry = self._transcripts.add_fragment(
+            result.text, speaker="interviewer")
+        db_segment_id = None
+        if entry is not None:
+            seg = TranscriptSegment(
+                session_id=self.session.id,
+                speaker=entry.speaker,
+                content=entry.text,
+                timestamp_ms=int(time.time() * 1000),
+            )
+            self.db.add(seg)
+            self.db.commit()
+            db_segment_id = seg.id
+            self._last_transcript_segment_id = seg.id
+
+        current = self.turn.get_current()
+        # `duplicate` keeps the UI honest: nothing was added to the turn.
+        await self.send(EventType.TRANSCRIPT_SEGMENT, {
+            "segment_id": segment_id,
+            "turn_id": self._turn_id or "",
+            "text": result.text,
+            "current": current,
+            "duplicate": stored is None,
+            "char_count": len(current),
+            "can_send": self.turn.can_send,
+            "segment_count": self.turn.segment_count,
+        })
+        print(
+            '[TURN] segment appended turn=%s segment=%s segments=%d chars=%d'
+            % (self._turn_id, segment_id, self.turn.segment_count, len(current))
+        )
+
+        if self.turn.can_send:
+            self._set_state(RealtimeState.READY_TO_SEND)
+        else:
+            self._set_state(RealtimeState.LISTENING)
 
     # ────────────────────────────────────────────────────────────────────────
     # Partial STT + question-prefix detection + speculative preparation (Phases 3–5)
@@ -733,6 +1112,14 @@ class LiveSession:
 
             det = detect_partial(result.text)
             if not det["is_question"] or not det["stable_prefix"]:
+                if det["confidence"] >= settings.realtime_prefetch_confidence:
+                    self._maybe_prefetch(result.text)
+                return
+
+            # ── Interview Listening Mode ──────────────────────────────────
+            # Partial text updates the live transcript and warms the RAG cache,
+            # but never starts a generation: the SEND button owns submission.
+            if self._listening_mode:
                 if det["confidence"] >= settings.realtime_prefetch_confidence:
                     self._maybe_prefetch(result.text)
                 return
@@ -1029,6 +1416,123 @@ class LiveSession:
             return "", "no-rag-error"
 
     # ────────────────────────────────────────────────────────────────────────
+    # GitHub-aware project retrieval (Phase 5.2)
+    # ────────────────────────────────────────────────────────────────────────
+
+    def _project_scope(self) -> tuple[list[str], bool, Optional[GitHubRetriever]]:
+        """(project_names, project_active, retriever) for the question analyzer.
+
+        Never raises. ``project_active`` is true when a project is firmly in
+        scope (active-project memory OR exactly one configured project) so
+        project-area questions become Mode B without guessing between repos.
+        """
+        gh = _get_retriever()
+        if gh is None:
+            return [], False, None
+        try:
+            projects = configured_projects()
+        except Exception:
+            return [], False, gh
+        if not projects:
+            return [], False, gh
+        try:
+            names = project_display_names()
+        except Exception:
+            names = []
+        active = bool(getattr(self, "_active_project_id", None)) or len(projects) == 1
+        if not active:
+            try:
+                memory = self._get_memory()
+                cands = set(memory.entity_candidates())
+                if any(n in cands for n in names):
+                    active = True
+            except Exception:
+                pass
+        return names, active, gh
+
+    def _resolve_project_match(self, question: str, resolution: Resolution,
+                               include_entities: bool = False):
+        """Select the target project (no network). None = ambiguous/generic."""
+        try:
+            memory = self._get_memory()
+        except Exception:
+            memory = None
+        entities = []
+        if include_entities and memory is not None:
+            entities = memory.entity_candidates()
+        try:
+            return resolve_project(
+                question,
+                active_project_id=getattr(self, "_active_project_id", None),
+                active_topic=(resolution.topic if resolution else "") or
+                             (memory.active_topic if memory is not None else ""),
+                conversation_entities=entities,
+            )
+        except Exception:
+            return None
+
+    async def _github_evidence(
+        self, question: str, analysis, resolution: Resolution,
+        match=None,
+    ) -> tuple[str, str, dict]:
+        """PROJECT EVIDENCE for a project-related question + rag_note tail.
+
+        Returns (evidence_text, evidence_note, project_info). Hard-bounded by
+        ``kiyra_github_real_timeout`` and NEVER raises — an unavailable or
+        ambiguous project degrades to (empty, note, None).
+        """
+        gh = _get_retriever()
+        if gh is None or not analysis.project_related:
+            return "", "", None
+        if match is None:
+            match = self._resolve_project_match(
+                question, resolution, include_entities=True)
+        if match is None:
+            return "", "github-ambiguous", None
+        with_repo = {
+            "id": match.project.project_id,
+            "name": match.project.project_name,
+            "repo": match.project.full_name,
+        }
+        # Remember the resolved project for follow-ups ("now add rate limiting").
+        self._active_project_id = match.project.project_id
+        try:
+            memory = self._get_memory()
+        except Exception:
+            memory = None
+        if memory is not None:
+            memory.add_entities([
+                match.project.project_name, match.project.full_name])
+        try:
+            hits = await asyncio.wait_for(
+                asyncio.to_thread(
+                    self._retrieve_project_chunks,
+                    gh, match.project, question, analysis),
+                timeout=settings.kiyra_github_real_timeout,
+            )
+        except asyncio.TimeoutError:
+            return "", "github-timeout", with_repo
+        except Exception as e:
+            print(f"[GITHUB] retrieval failed (safe note only): {e}")
+            return "", "github-error", with_repo
+        if not hits:
+            return "", "github-noevidence", with_repo
+        try:
+            text = evidence_block(
+                match.project.project_name, hits, analysis.project_intent or "")
+        except Exception:
+            text = ""
+        if not text:
+            return "", "github-noevidence", with_repo
+        return text, evidence_note(hits), with_repo
+
+    def _retrieve_project_chunks(self, gh: GitHubRetriever, project,
+                                 question: str, analysis):
+        """Sync retrieval (runs in a worker thread, bounded by the caller)."""
+        gh.ensure_indexed(project)
+        return gh.retrieve(project, question, intent=analysis.project_intent or "")
+
+    # ────────────────────────────────────────────────────────────────────────
     # Answer generation (streaming + cancellation)
     # ────────────────────────────────────────────────────────────────────────
 
@@ -1090,10 +1594,14 @@ class LiveSession:
             resolution = Resolution.identity(question)
         # Deterministic intent analysis (resolved question: follow-ups resolve
         # against previous context so "now add authentication" keeps coding).
+        project_names, project_active, _gh = self._project_scope()
         analysis = analyze_question(
             resolution.resolved_question or question,
             source=source,
-            previous=self._last_analysis,
+            previous=getattr(self, "_last_analysis", None),
+            followup=bool(resolution.followup),
+            project_names=project_names,
+            project_active=project_active,
         )
         self._last_analysis = analysis
         latency = {
@@ -1108,18 +1616,32 @@ class LiveSession:
             )
             print(
                 '[ANALYSIS] intent=%s requires_code=%s language=%s framework=%s'
-                ' source=%s'
+                ' source=%s project_related=%s project_intent=%s'
                 % (analysis.intent, analysis.requires_code,
-                   analysis.language or "-", analysis.framework or "-", source or "-")
+                   analysis.language or "-", analysis.framework or "-",
+                   source or "-", analysis.project_related,
+                   analysis.project_intent or "-")
             )
 
             # Signal "generating" immediately so the client never stares at a
             # silent spinner while retrieval (bounded below) runs.
+            project_info = None
+            project_match = None
+            if analysis.project_related:
+                project_match = self._resolve_project_match(
+                    resolution.resolved_question or question, resolution)
+                if project_match is not None:
+                    project_info = {
+                        "id": project_match.project.project_id,
+                        "name": project_match.project.project_name,
+                        "repo": project_match.project.full_name,
+                    }
             await self.send(EventType.ANSWER_GENERATING, {
                 "agent": "realtime_answer",
                 "question": question,
                 "request_id": request_id,
                 "analysis": analysis.to_dict(),
+                "project": project_info,
             })
             self._set_state(RealtimeState.RETRIEVING_CONTEXT)
 
@@ -1128,6 +1650,16 @@ class LiveSession:
             latency["rag_ms"] = perf.durations.get("rag_ms") or 0.0
             self._prefetch_context = None
             self._prefetch_question = None
+
+            # Project evidence (GitHub) — bounded, only when project-related.
+            project_evidence = ""
+            if analysis.project_related:
+                ev, gh_note, project_info = await self._github_evidence(
+                    resolution.resolved_question or question, analysis,
+                    resolution, match=project_match)
+                project_evidence = ev
+                if gh_note:
+                    rag_note = f"{rag_note}|{gh_note}"
 
             self._set_state(RealtimeState.GENERATING)
 
@@ -1138,7 +1670,8 @@ class LiveSession:
             perf.span("context_ms", ctx_start)
 
             prompt_start = time.monotonic()
-            system = realtime_system(settings.answer_mode)
+            system = realtime_system(
+                settings.answer_mode, requires_code=bool(analysis.requires_code))
             user_prompt = ContextBuilder.assemble(
                 question=question,
                 candidate_name=self.session.profile.name or "the candidate",
@@ -1147,11 +1680,15 @@ class LiveSession:
                 resolution=resolution,
                 sections=sections,
                 analysis=analysis,
+                project_evidence=project_evidence or None,
             )
             if note:
                 user_prompt = f"{user_prompt}\n\n{note}"
             perf.mark("prompt_construction")
             perf.span("prompt_ms", prompt_start)
+
+            self._trace_prompt_boundary(question, source, analysis, system,
+                                        user_prompt)
 
             perf.mark("llm_request")
             llm_call_t = time.monotonic()
@@ -1174,6 +1711,8 @@ class LiveSession:
             q: asyncio.Queue = asyncio.Queue()
             drain = asyncio.create_task(self._drain(stream, q, _ANSWER_END))
             token_deadline: Optional[float] = None
+            _trace = {"first_chunk": None, "fenced_so_far": False,
+                      "chunk_count": 0}
 
             while True:
                 if self._current_request_id != request_id:
@@ -1208,6 +1747,10 @@ class LiveSession:
                     )
                 tokens.append(tok)
                 partial += tok
+                if _trace is not None and _trace.get("first_chunk") is None:
+                    _trace["first_chunk"] = tok.strip()[:80]
+                if _trace is not None and ("```" in tok or "~~~" in tok):
+                    _trace["fenced_so_far"] = True
                 if len(partial) >= 40 or (time.monotonic() - last_flush) > 0.1:
                     await self.send(EventType.ANSWER_STREAMED, {
                         "delta": partial,
@@ -1224,10 +1767,26 @@ class LiveSession:
                 })
                 perf.first_visible(llm_call_t)
 
+            if _trace is not None:
+                _trace["chunk_count"] = len(tokens)
+
             if self._current_request_id != request_id:
                 return
 
             answer = "".join(tokens).strip()
+            if _trace is not None:
+                print(
+                    "[CODE-TRACE] first_chunk=%r fenced_so_far=%s chunk_count=%s "
+                    "final_contains_fence=%s"
+                    % (str(_trace.get("first_chunk") or "")[:80],
+                       _trace.get("fenced_so_far", False),
+                       _trace.get("chunk_count", 0),
+                       "```" in answer or "~~~" in answer))
+            if _trace is not None:
+                print(
+                    "[CODE-TRACE] generated_chars=%d generated_contains_code_fence=%s"
+                    % (len(answer), "```" in answer or "~~~" in answer)
+                )
             if not tokens:
                 print(
                     "[LLM] empty stream request_id=%s question=%r "
@@ -1241,13 +1800,20 @@ class LiveSession:
             latency["stt_ms"] = perf.durations.get("stt_ms") or 0.0
             latency["detect_ms"] = perf.durations.get("question_detection_ms") or 0.0
             perf.finish()
+            # Structured per-turn latency line (Phase 5.4 §10).
+            self._emit_turn_perf(
+                perf, request_id,
+                chunks=len(tokens),
+                prompt_tokens=_trace.get("prompt_tokens") if _trace else None,
+                completion_tokens=_trace.get("completion_tokens") if _trace else None,
+            )
             print(
                 "[REALTIME_LATENCY] stt=%.0fms detect=%.0fms rag=%.0fms "
                 "llm_ttft=%.0fms total=%.0fms"
                 % (latency["stt_ms"], latency["detect_ms"], latency["rag_ms"],
                    latency["llm_ttft_ms"], latency["total_ms"])
             )
-            self._record_turn(question, answer, resolution)
+            self._last_resolved_topic = self._record_turn(question, answer, resolution)
             perf.log()
 
             await self.send(EventType.ANSWER_GENERATED, {
@@ -1263,6 +1829,41 @@ class LiveSession:
                 "rag": rag_note,
             })
 
+            # ── Continuous interview loop (Phase 5.4.1, spec 1/5/24) ──────
+            # ANSWER_READY is NOT terminal: the answer is already on screen and
+            # persisted, so the turn rotates and the mic goes live again for
+            # the next question without another START click. Only per-turn
+            # state is reset — Whisper/VAD/audio device are never reloaded.
+            if self._listening_mode:
+                self._set_state(RealtimeState.ANSWER_READY)
+                # _record_turn already resolved and persisted the topic; reuse
+                # it so history and the panel can never disagree (spec 16).
+                resolved_topic = (getattr(self, "_last_resolved_topic", "")
+                                  or _topic_fallback(question))
+                self._record_question_history(
+                    question=question, answer=answer,
+                    turn_id=getattr(self, "_submitted_turn_id", None) or
+                            self._turn_id or "",
+                    topic=resolved_topic or "",
+                )
+                try:
+                    await self._send_memory_snapshot()
+                except Exception:
+                    pass
+                next_turn = self._rearm_turn(listening=True)
+                self._set_state(RealtimeState.LISTENING)
+                await self.send(EventType.LISTENING_STARTED, {
+                    "listening": True,
+                    "state": RealtimeState.LISTENING.value,
+                    "turn_id": next_turn,
+                    "can_send": False,
+                    "segment_count": 0,
+                    "auto_rearm": True,
+                    "previous_answer": True,
+                })
+                print("[TURN] answer ready -> auto re-armed turn=%s "
+                      "(mic/VAD/STT untouched)" % next_turn)
+
         except asyncio.CancelledError:
             try:
                 await self.send(EventType.ANSWER_CANCELLED, {
@@ -1271,6 +1872,17 @@ class LiveSession:
                 })
             except Exception:
                 pass
+            # A cancelled turn stays usable and the mic keeps running
+            # (Phase 5.4.1 §1: CANCELLED -> LISTENING).
+            if self._listening_mode:
+                self._recover_after_failed_generation()
+                await self.send(EventType.LISTENING_STARTED, {
+                    "listening": self._listening_active,
+                    "state": self._state.value,
+                    "turn_id": self._turn_id,
+                    "can_send": self.turn.can_send,
+                    "previous_answer": True,
+                })
             raise
         except ProviderUnavailableError as e:
             self._set_state(RealtimeState.PROVIDER_UNAVAILABLE)
@@ -1279,14 +1891,20 @@ class LiveSession:
                 "message": str(e),
                 "recoverable": True,
             })
-            self._set_state(RealtimeState.LISTENING)
+            if self._listening_mode:
+                self._recover_after_failed_generation()
+            else:
+                self._set_state(RealtimeState.LISTENING)
         except AIProviderError as e:
             await self.send(EventType.SESSION_ERROR, {
                 "code": "answer_generation_failed",
                 "message": str(e),
                 "recoverable": True,
             })
-            self._set_state(RealtimeState.LISTENING)
+            if self._listening_mode:
+                self._recover_after_failed_generation()
+            else:
+                self._set_state(RealtimeState.LISTENING)
         except Exception as e:
             print(f"[Session {self.session.id}] Generation error: {e}\n{traceback.format_exc()}")
             try:
@@ -1297,14 +1915,20 @@ class LiveSession:
                 })
             except Exception:
                 pass
-            self._set_state(RealtimeState.LISTENING)
+            if self._listening_mode:
+                self._recover_after_failed_generation()
+            else:
+                self._set_state(RealtimeState.LISTENING)
         finally:
             if drain is not None and not drain.done():
                 drain.cancel()
             if self._current_request_id == request_id:
                 self._answer_task = None
                 self._current_request_id = None
-                if self._running:
+                # In listening mode the turn owns its terminal state
+                # (ANSWER_READY / CANCELLED / ERROR) so the user can see why
+                # it ended and SEND again. Only auto-detect mode resumes.
+                if self._running and not self._listening_mode:
                     self._set_state(RealtimeState.LISTENING)
 
     # ────────────────────────────────────────────────────────────────────────
@@ -1362,10 +1986,14 @@ class LiveSession:
             resolution = self._get_memory().resolve(question)
         except Exception:
             resolution = Resolution.identity(question)
+        project_names, project_active, _gh = self._project_scope()
         analysis = analyze_question(
             resolution.resolved_question or question,
             source="voice",
-            previous=self._last_analysis,
+            previous=getattr(self, "_last_analysis", None),
+            followup=bool(resolution.followup),
+            project_names=project_names,
+            project_active=project_active,
         )
         if analysis.intent or analysis.requires_code:
             self._last_analysis = analysis
@@ -1375,17 +2003,37 @@ class LiveSession:
                 '[LLM] generation started request_id=%s speculative=1 question="%s"'
                 % (request_id, question[:80])
             )
+            project_info = None
+            project_match = None
+            if analysis.project_related:
+                project_match = self._resolve_project_match(
+                    resolution.resolved_question or question, resolution)
+                if project_match is not None:
+                    project_info = {
+                        "id": project_match.project.project_id,
+                        "name": project_match.project.project_name,
+                        "repo": project_match.project.full_name,
+                    }
             await self.send(EventType.ANSWER_GENERATING, {
                 "agent": "realtime_answer",
                 "question": question,
                 "request_id": request_id,
                 "speculative": True,
                 "analysis": analysis.to_dict(),
+                "project": project_info,
             })
             self._set_state(RealtimeState.RETRIEVING_CONTEXT)
 
             context, rag_note = await self._bounded_rag(
                 question, resolution=resolution, perf=spec_perf)
+            project_evidence = ""
+            if analysis.project_related:
+                ev, gh_note, _pi = await self._github_evidence(
+                    resolution.resolved_question or question, analysis,
+                    resolution, match=project_match)
+                project_evidence = ev
+                if gh_note:
+                    rag_note = f"{rag_note}|{gh_note}"
             self._set_state(RealtimeState.GENERATING)
 
             memory = self._get_memory()
@@ -1395,7 +2043,8 @@ class LiveSession:
             spec_perf.span("context_ms", ctx_start)
 
             prompt_start = time.monotonic()
-            system = realtime_system(settings.answer_mode)
+            system = realtime_system(
+                settings.answer_mode, requires_code=bool(analysis.requires_code))
             user_prompt = ContextBuilder.assemble(
                 question=question,
                 candidate_name=self.session.profile.name or "the candidate",
@@ -1404,6 +2053,7 @@ class LiveSession:
                 resolution=resolution,
                 sections=sections,
                 analysis=analysis,
+                project_evidence=project_evidence or None,
             )
             spec_perf.mark("prompt_construction")
             spec_perf.span("prompt_ms", prompt_start)
@@ -1581,6 +2231,38 @@ class LiveSession:
         msg_type = msg.get("type")
         payload = msg.get("payload", {})
 
+        # ── Interview Listening Mode (Phase 5.4) ───────────────────────────
+        if msg_type == "mode.set":
+            await self._set_listening_mode(
+                payload.get("mode") == "interview_listening"
+                or bool(payload.get("enabled")))
+            return
+
+        if msg_type == "listening.start":
+            await self._start_listening()
+            return
+
+        if msg_type == "listening.stop":
+            await self._stop_listening()
+            return
+
+        if msg_type == "turn.send":
+            await self._submit_turn(
+                text=payload.get("text") or "",
+                turn_id=payload.get("turn_id"),
+            )
+            return
+
+        if msg_type == "answer.cancel":
+            self._cancel_inflight()
+            if self._answer_task and not self._answer_task.done():
+                self._answer_task.cancel()
+            self._turn_submitting = False
+            self._set_state(RealtimeState.CANCELLED)
+            await self.send(EventType.ANSWER_CANCELLED,
+                            {"reason": payload.get("reason", "user")})
+            return
+
         if msg_type == "generate_answer":
             question = payload.get("question", "")
             if question:
@@ -1593,6 +2275,11 @@ class LiveSession:
         elif msg_type == "transcript.text":
             content = payload.get("text", "")
             if not content:
+                return
+            # Listening mode: typed/pushed text is part of the open turn and is
+            # never auto-submitted, exactly like spoken segments.
+            if self._listening_mode:
+                await self._append_typed_segment(content)
                 return
             entry = self._transcripts.add_fragment(
                 content, speaker=payload.get("speaker", "unknown")
@@ -1623,6 +2310,305 @@ class LiveSession:
 
         elif msg_type == "session.end":
             self._running = False
+
+    # ────────────────────────────────────────────────────────────────────────
+    # Interview Listening Mode (Phase 5.4)
+    # ────────────────────────────────────────────────────────────────────────
+
+    async def _set_listening_mode(self, enabled: bool):
+        """Enable/disable Interview Listening Mode for this connection."""
+        self._listening_mode = bool(enabled)
+        if not self._listening_mode:
+            self.turn.clear()
+        self._set_state(RealtimeState.LISTENING if enabled
+                        else RealtimeState.IDLE)
+        await self.send(EventType.MODE_CHANGED, {
+            "mode": "interview_listening" if enabled else "auto_detect",
+            "listening_mode": self._listening_mode,
+        })
+        print(f"[TURN] listening_mode={self._listening_mode}")
+
+    def _next_turn_id(self) -> str:
+        """Advance to a new turn id (turn ownership, Phase 5.4.1 §8)."""
+        self._turn_no = getattr(self, "_turn_no", 0) + 1
+        self._turn_id = f"t{self._turn_no}"
+        self._turn_seq = 0
+        self._seg_seq = 0
+        return self._turn_id
+
+    def _rearm_turn(self, *, listening: bool = True) -> str:
+        """Rotate to a fresh turn WITHOUT touching the mic, VAD or STT model.
+
+        Called after an answer completes so the interviewer can speak again
+        immediately (Phase 5.4.1 §5-§6). Resets only per-turn state:
+        transcript buffer, VAD utterance segmentation, segment counter, SEND
+        availability. The audio device, VAD and Whisper model are untouched —
+        a reload here would cost seconds and drop the start of the question.
+        """
+        self._next_turn_id()
+        self.turn.clear()          # fresh, open buffer (clear() un-pauses)
+        self._turn_submitting = False
+        self._turn_submitted_text = None
+        self._turn_listen_ms = 0.0
+        self._listening_active = bool(listening)
+        if listening:
+            # Segmentation state only — UtteranceReceiver keeps its config.
+            try:
+                self._receiver.reset()
+            except Exception:
+                pass
+            self._turn_start_ts = time.monotonic()
+        return self._turn_id
+
+    async def _start_listening(self):
+        """START LISTENING: fresh turn, listening state, nothing generated.
+
+        Keeps the last answer, question history and memory on screen — only
+        the live transcript and the current turn's audio state are reset
+        (Phase 5.4.1 §21).
+        """
+        turn_id = self._rearm_turn(listening=True)
+        self._set_state(RealtimeState.LISTENING)
+        await self.send(EventType.LISTENING_STARTED, {
+            "listening": True,
+            "state": RealtimeState.LISTENING.value,
+            "turn_id": turn_id,
+            "can_send": False,
+            "segment_count": 0,
+        })
+        print("[TURN] listening started turn=%s" % turn_id)
+
+    async def _stop_listening(self):
+        """STOP: end capture, KEEP the transcript, never generate."""
+        self._listening_active = False
+        self.turn.pause()
+        # Rotate ownership immediately so an in-flight STT result can never
+        # append into this stopped turn (Phase 5.4.1 §8/§20).
+        self._next_turn_id()
+        current = self.turn.get_current()
+        if self._turn_start_ts is not None:
+            self._turn_listen_ms = (time.monotonic() - self._turn_start_ts) * 1000
+        await self.send(EventType.LISTENING_STOPPED, {
+            "listening": False,
+            "current": current,
+            "char_count": len(current),
+            "can_send": self.turn.can_send,
+            "listen_ms": int(self._turn_listen_ms),
+            # STOP must not generate anything.
+            "generated": False,
+        })
+        # STOP is explicit and terminal: IDLE (Phase 5.4.1 §20). The answer,
+        # history and memory all stay on screen; the transcript is kept so a
+        # START can still send what was captured before STOP.
+        self._set_state(RealtimeState.IDLE)
+        print(f"[TURN] listening stopped chars={len(current)} "
+              f"can_send={self.turn.can_send} state=IDLE")
+
+    async def _append_typed_segment(self, content: str):
+        """Append externally supplied text (manual entry) to the open turn."""
+        self._turn_seq += 1
+        stored = self.turn.append(content, segment_id=f"t{self._turn_seq}")
+        current = self.turn.get_current()
+        await self.send(EventType.TRANSCRIPT_SEGMENT, {
+            "segment_id": f"t{self._turn_seq}",
+            "text": content,
+            "current": current,
+            "duplicate": stored is None,
+            "char_count": len(current),
+            "can_send": self.turn.can_send,
+            "segment_count": self.turn.segment_count,
+            "source": "typed",
+        })
+        if self.turn.can_send:
+            self._set_state(RealtimeState.READY_TO_SEND)
+
+    async def _submit_turn(self, text: str = "", turn_id: str | None = None):
+        """SEND — the authoritative, single-flight question submission.
+
+        Order matters (spec §6/§7):
+          1. refuse a second concurrent submission
+          2. stop accepting new text
+          3. bounded final flush of the trailing STT segment
+          4. snapshot (never clear before acceptance)
+          5. normalize + minimum-useful-length check
+          6. exactly one generation
+        """
+        # 1. Single-flight: a repeated click while GENERATING is ignored.
+        if self._turn_submitting:
+            print("[TURN] send ignored: generation already in flight")
+            await self.send(EventType.SESSION_ERROR, {
+                "code": "already_generating",
+                "message": "Already generating an answer.",
+                "recoverable": True,
+            })
+            return
+
+        # 2. Freeze input for this turn, and bank how long the user actually spoke.
+        if self._turn_start_ts is not None:
+            self._turn_listen_ms = (time.monotonic() - self._turn_start_ts) * 1000
+        self.turn.pause()
+
+        # 3. Bounded final flush so trailing speech is not silently discarded.
+        await self._flush_turn_tail()
+
+        # 4. Snapshot — the buffer is intentionally NOT cleared here, so a
+        #    failed generation can be retried without losing the question.
+        question = self.turn.snapshot()
+        if text:
+            question = normalize_whitespace(f"{question} {text}")
+
+        # 5. Usability gate.
+        if len(question) < settings.turn_min_useful_chars:
+            self.turn.resume()
+            self._turn_submitting = False
+            self._set_state(RealtimeState.LISTENING)
+            await self.send(EventType.SESSION_ERROR, {
+                "code": "empty_turn",
+                "message": "Nothing to send yet — keep listening.",
+                "recoverable": True,
+            })
+            print("[TURN] send rejected: transcript too short")
+            return
+
+        self._turn_submitting = True
+        self._turn_submitted_text = question
+        # Ownership of the turn being submitted — recorded before the id
+        # rotates at re-arm so history keeps the right turn_id.
+        self._submitted_turn_id = self._turn_id or ""
+        self._set_state(RealtimeState.GENERATING)
+        await self.send(EventType.TURN_SUBMITTED, {
+            "turn_id": self._submitted_turn_id,
+            "question": question,
+            "char_count": len(question),
+            "segment_count": self.turn.segment_count,
+            "listen_ms": int(self._turn_listen_ms),
+        })
+        print(f'[TURN] submitted chars={len(question)} q="{question[:140]}"')
+
+        # Remember it for the Previous Questions panel.
+        self.recent_questions.append({
+            "question": question,
+            "ts": time.time(),
+        })
+        del self.recent_questions[:-8]
+
+        is_q, confidence = self._detector.detect(question)
+        if not is_q:
+            # SEND is authoritative: an explicit submission is never second-guessed
+            # by the auto-detector.
+            confidence = 1.0
+        await self._trigger_question(question, confidence, -1, source="send")
+
+    async def _flush_turn_tail(self):
+        """Transcribe + append any speech buffered at SEND time (bounded).
+
+        Uses the SAME `finalize_only` path as disconnect, and is a no-op when the
+        last utterance was already finalized, so nothing is duplicated.
+        """
+        receiver = getattr(self, "_receiver", None)
+        if receiver is None:
+            return
+        try:
+            # `flush()` is a no-op when nothing is buffered (it just resets),
+            # so it doubles as the "is anything pending?" check.
+            utterance = receiver.flush()
+        except Exception:
+            return
+        if utterance is None:
+            return
+        if utterance.audio.size == 0 or utterance.speech_seconds <= 0:
+            return
+        # The buffer is frozen for this turn, but this tail belongs to the very
+        # question being submitted: briefly allow the append, then re-freeze.
+        was_paused = self.turn.is_paused
+        if was_paused:
+            self.turn.resume()
+        try:
+            await asyncio.wait_for(
+                self._handle_utterance(utterance, time.monotonic(),
+                                       finalize_only=True,
+                                       turn_id=self._turn_id),
+                timeout=settings.turn_final_flush_timeout,
+            )
+        except asyncio.TimeoutError:
+            print("[TURN] final flush timed out; using buffered transcript")
+        except Exception as e:
+            print(f"[TURN] final flush failed: {e}")
+        finally:
+            if was_paused:
+                self.turn.pause()
+
+    async def _send_memory_snapshot(self):
+        """Push concise topic/previous-question context to the overlay.
+
+        ``topic`` is preserved across answers, never blanked (§16), and
+        ``previous`` carries the navigable history with a stable index.
+        """
+        memory = self._memory or self._get_memory()
+        history = list(self.question_history)
+        last_turn = getattr(self, "_submitted_turn_id", None)
+        previous = [
+            {"index": i + 1,
+             "turn_id": h.get("turn_id", ""),
+             "sequence": h.get("sequence"),
+             "question": (h.get("question") or "")[:220],
+             "answer_available": bool(h.get("answer")),
+             "answer": (h.get("answer") or "")[:400],
+             "topic": h.get("topic", "") or "",
+             "ts": h.get("ts"),
+             "current": h.get("turn_id") == last_turn}
+            for i, h in enumerate(history[-8:])
+        ]
+        payload = {
+            "topic": (getattr(memory, "active_topic", "") or "") or
+                     (history[-1].get("topic", "") if history else ""),
+            "project": getattr(memory, "active_project", "") or "",
+            "previous": previous,
+            "history_index": len(previous) - 1 if previous else -1,
+            "history_count": len(previous),
+            "memory_points": _memory_points(memory),
+        }
+        await self.send(EventType.MEMORY_UPDATED, payload)
+
+    @property
+    def question_history(self) -> list:
+        """Ordered list of completed SENDs (Phase 5.4.1 §9).
+
+        Session-scoped in-memory navigation index over the turns already
+        persisted by ``_record_turn`` — no second source of truth.
+        """
+        hist = self.__dict__.get("_question_history")
+        if hist is None:
+            hist = []
+            self.__dict__["_question_history"] = hist
+        return hist
+
+    def _record_question_history(self, *, question: str, answer: str,
+                                 turn_id: str, topic: str = "") -> dict:
+        """Append one completed turn to the navigable history."""
+        hist = self.question_history
+        entry = {
+            "turn_id": turn_id or "",
+            "sequence": len(hist) + 1,
+            "question": question or "",
+            "answer": answer or "",
+            "answer_available": bool(answer),
+            "topic": topic or "",
+            "ts": time.time(),
+        }
+        hist.append(entry)
+        return entry
+
+    def _recover_after_failed_generation(self):
+        """§19: keep the previous answer, release the turn, stay usable.
+
+        The failed question's transcript is preserved so SEND can retry, and
+        the mic stays live so the candidate can keep talking.
+        """
+        self._turn_submitting = False
+        self.turn.resume() if self.turn.is_paused else None
+        self._set_state(RealtimeState.READY_TO_SEND if self.turn.can_send
+                        else RealtimeState.LISTENING)
 
     async def _trigger_question(self, question: str, confidence: float, segment_id: int,
                                 note: str = "", source: str = ""):

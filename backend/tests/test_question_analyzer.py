@@ -48,13 +48,17 @@ def test_write_nodejs_http_server_is_coding():
 
 def test_how_did_i_implement_is_project_explanation():
     a = analyze_question("How did I implement authentication in my project?")
-    assert a.intent == "project_explanation"
+    assert a.intent == "project_implementation"
+    assert a.project_related is True
+    assert a.project_intent == "project_implementation"
     assert a.requires_code is False
 
 
 def test_show_me_code_from_project_is_project_coding():
     a = analyze_question("Show me the authentication code from my project")
-    assert a.intent == "project_coding"
+    assert a.intent == "project_code"
+    assert a.project_related is True
+    assert a.project_intent == "project_code"
     assert a.requires_code is True
 
 
@@ -209,6 +213,7 @@ def test_analysis_to_dict_shape():
     assert set(d) == {
         "intent", "requires_code", "language", "framework",
         "question_type", "source", "followup",
+        "project_related", "project_intent",
     }
     assert d["intent"] == "coding"
     assert d["requires_code"] is True

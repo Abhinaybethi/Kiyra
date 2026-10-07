@@ -30,13 +30,17 @@ def _norm(text: str) -> str:
 
 
 def _has(haystack: str, phrase: str) -> bool:
-    """Word-bounded substring check on space-joined text."""
+    """Word-bounded substring check; punctuation-blind (a trailing '?' or
+    comma must not break 'in my project'). Also matches the raw text for
+    punctuation-bearing phrases like "isn't working"."""
+    if f" {phrase} " in f" {_norm(haystack)} ":
+        return True
     return f" {phrase} " in f" {haystack} "
 
 
 def _has_any(haystack: str, phrases) -> bool:
     for p in phrases:
-        if _has(haystack, p) or f" {p} " in f" {haystack} ":
+        if _has(haystack, p):
             return True
     return False
 
@@ -48,6 +52,7 @@ _COMPOUND = [
     ("nodejs", "javascript", "node.js"),
     ("express.js", "javascript", "express"),
     ("expressjs", "javascript", "express"),
+    ("express", "javascript", "express"),
     ("next.js", "react", "next.js"),
     ("nextjs", "react", "next.js"),
     ("django", "python", "django"),
@@ -73,7 +78,8 @@ _WORD_ALIASES = [
     ("sql", "sql", ""),
     ("react", "react", ""),
 ]
-_C_RAW_RE = re.compile(r"c\+\+|\bcpp\b|\bin\s+c\b|\busing\s+c\b|\bc\s+code\b")
+_C_RAW_RE = re.compile(
+    r"c\+\+|\bcpp\b|\bin\s+c\b|\busing\s+c\b|\bc\s+code\b|\bc\s+program\b")
 
 
 def _detect_language_framework(text: str) -> tuple[str, str]:
@@ -110,7 +116,26 @@ _PROJECT_REFS = [
     "why did you choose", "what did you use", "what did you build",
     "explain this project", "talk about this project", "your project",
     "the project you built", "the implementation of",
+    "the project", "this project",
 ]
+
+# "my <code-noun>" also routes to the candidate's project (Mode B) even when
+# the fuller "my project" phrasing is absent ("my auth middleware",
+# "my login page", "my endpoints").
+_MY_PROJECT_NOUNS = [
+    "auth", "authentication", "login", "signin", "signup", "register",
+    "registration", "middleware", "endpoint", "endpoints", "api", "backend",
+    "frontend", "database", "db", "schema", "models", "model", "services",
+    "service", "server", "component", "components", "pages", "page", "store",
+    "hooks", "hook", "security", "redis", "jwt", "docker", "dockerfile",
+    "ci", "pipeline", "deployment", "handler", "controller", "repo",
+    "repository", "navigation", "theming", "logging", "monitoring",
+    "cron", "scheduler", "handlers", "routes", "route",
+]
+
+
+def _my_project_ref(raw: str) -> bool:
+    return _has_any(raw, ["my %s" % n for n in _MY_PROJECT_NOUNS])
 
 # Unambiguous requests for executable code.
 _STRONG_CODING = [
@@ -149,8 +174,13 @@ _DEBUG_PHRASES = [
     "not working", "isn't working", "is broken", "it crashes",
     "it keeps crashing", "stack trace", "traceback", "fix this", "fix the",
     "how would you fix", "how to fix", "fix my", "bug", "buggy",
-    "segfault", "null reference", "nullpointerexception", "exception",
-    "the error", "error message",
+    "segfault", "null reference", "nullpointerexception",
+    "crashing", "crashes", "crashed", "is crashing", "keeps crashing",
+    "exception", "the error", "error message",
+    "returning 401", "returning 404", "returning 500", "returning 403",
+    "returning an error", "http 401", "http 404", "http 500",
+    "401 error", "404 error", "500 error", "status code",
+    "why is my login", "why does my login",
 ]
 
 _TECH_CONCEPT_PHRASES = [
@@ -181,6 +211,192 @@ _RESUME_PHRASES = [
     "what technologies have you used",
 ]
 
+# ── Project-intent phrase tables (Phase 5.2, only used when project_related) ──
+
+# Explicit "show me the actual code" → PROJECT CODE MODE.
+_PROJECT_CODE_PHRASES = [
+    "show me the code", "show me your code", "show the code",
+    "give me the code", "give me the code for", "show my code",
+    "the code for", "code to", "actual code", "the actual code",
+    "show me the implementation",
+]
+
+# "How was X implemented / built" → implementation walkthrough.
+_PROJECT_IMPLEMENTATION_PHRASES = [
+    "how did i implement", "how did you implement", "how did you build",
+    "how did i build", "how was it implemented", "how was this implemented",
+    "how is this implemented", "how is it implemented", "how do i implement",
+    "how did i set up", "how did you set up", "how did i create",
+    "how did you create", "implemented", "implementation of",
+    "how does it work", "how does this work", "walk me through",
+    "how did i configure", "how did you configure", "how did i integrate",
+    "how did you integrate", "how did i add", "how did you add",
+    "how did i handle", "how did you handle", "how did i use",
+    "how did you use",
+]
+
+# "Why did you use/choose X" → technology decision.
+_PROJECT_TECH_CHOICE_PHRASES = [
+    "why did you use", "why did you choose", "why did you pick",
+    "why did you go with", "why did you decide", "why did i use",
+    "why did i choose", "why did we use", "why use", "why did you opt",
+]
+
+# Structural/organizational questions.
+_PROJECT_ARCH_PHRASES = [
+    "architecture", "structure", "layers", "tiers", "how is it organized",
+    "how is the project organized", "how is it structured", "design of",
+    "monolith", "microservice", "microservices", "modules",
+]
+
+# Stack-specific areas (checked in priority order).
+_PROJECT_DB_PHRASES = [
+    "database", "database schema", " db", "schema", "migration",
+    "sequelize", "prisma", "drizzle", "orm", "knex", "sqlalchemy",
+    "mysql", "postgres", "postgresql", "sqlite", "mongodb", "mongos",
+    "query", "queries", "models", "entity",
+]
+
+_PROJECT_API_PHRASES = [
+    "api", "apIs", "endpoint", "endpoints", "route", "routes",
+    "router", "rest", "restful", "request", "response", "graphql",
+    "controller", "controllers", "handler", "handlers",
+]
+
+_PROJECT_FRONTEND_PHRASES = [
+    "frontend", "front-end", "front end", "ui", "user interface",
+    "component", "components", "page", "pages", "react", "vue",
+    "angular", "store", "redux", "hook", "hooks", "state management",
+    "styles", "styling", "tailwind",
+]
+
+_PROJECT_BACKEND_PHRASES = [
+    "backend", "back-end", "back end", "server", "server-side",
+    "serverside", "express", "fastify", "nest", "flask", "django",
+    "fastapi", "spring", "spring boot", "service", "services",
+    "middleware", "deployment", "api index", "worker", "workers",
+    "socket", "websocket", "container",
+]
+
+_PROJECT_ALL_INTENTS = {
+    "project_explanation": [],
+    "project_architecture": _PROJECT_ARCH_PHRASES,
+    "project_implementation": _PROJECT_IMPLEMENTATION_PHRASES,
+    "project_code": _PROJECT_CODE_PHRASES,
+    "project_debugging": _DEBUG_PHRASES,
+    "project_technology_choice": _PROJECT_TECH_CHOICE_PHRASES,
+    "project_database": _PROJECT_DB_PHRASES,
+    "project_api": _PROJECT_API_PHRASES,
+    "project_frontend": _PROJECT_FRONTEND_PHRASES,
+    "project_backend": _PROJECT_BACKEND_PHRASES,
+}
+
+
+_PROJECT_NAME_STOP = {
+    "the", "and", "for", "from", "with", "that", "this", "app", "web",
+    "my", "our", "your", "pro",
+}
+
+
+def _project_name_hit(raw: str, project_names) -> bool:
+    """True when a configured project name/repo appears in the question.
+
+    Matches by (a) the repo slug verbatim, (b) the normalized project name
+    contained in the normalized question, or (c) all meaningful tokens of the
+    name appearing in the question.
+    """
+    if not project_names:
+        return False
+    qn = _norm(raw)
+    qtoks = set(qn.split())
+    for name in project_names:
+        if not name:
+            continue
+        slug = (name or "").lower()
+        if len(slug) >= 3 and slug in raw:
+            return True
+        nn = _norm(name)
+        if not nn:
+            continue
+        if nn in qn:
+            return True
+        toks = {t for t in nn.split() if len(t) >= 3 and t not in _PROJECT_NAME_STOP}
+        if toks and toks.issubset(qtoks):
+            return True
+    return False
+
+
+def _resolve_project_intent(
+    analysis: "QuestionAnalysis",
+    raw: str,
+    *,
+    language: str,
+    framework: str,
+    debugging: bool,
+    coding_requested: bool,
+    tech_detected: bool,
+) -> None:
+    """Classify *which* facet of the candidate's project a question targets.
+
+    Priority: debugging → code → tech choice → architecture → database →
+    api → frontend → backend → implementation → explanation.
+    """
+    # Debug / "not working" → the most concrete project intent.
+    if debugging:
+        analysis.project_intent = "project_debugging"
+        analysis.requires_code = True
+        analysis.question_type = "project_debugging"
+        return
+
+    # Explicit code request → PROJECT CODE MODE.
+    if _has_any(raw, _PROJECT_CODE_PHRASES) or (" code" in f" {raw} "):
+        analysis.project_intent = "project_code"
+        analysis.requires_code = True
+        analysis.question_type = "project_code"
+        return
+
+    # "Why did you use/choose/bcrypt/Express/..." → technology decision.
+    if _has_any(raw, _PROJECT_TECH_CHOICE_PHRASES) and (
+            tech_detected or language or framework):
+        analysis.project_intent = "project_technology_choice"
+        analysis.question_type = "project_technology_choice"
+        return
+
+    # Architecture / organization of the project.
+    if _has_any(raw, _PROJECT_ARCH_PHRASES):
+        analysis.project_intent = "project_architecture"
+        analysis.question_type = "project_architecture"
+        return
+
+    # Stack-area facets (db first, then api, frontend, backend).
+    if _has_any(raw, _PROJECT_DB_PHRASES):
+        analysis.project_intent = "project_database"
+        analysis.question_type = "project_database"
+        return
+    if _has_any(raw, _PROJECT_API_PHRASES):
+        analysis.project_intent = "project_api"
+        analysis.question_type = "project_api"
+        return
+    if _has_any(raw, _PROJECT_FRONTEND_PHRASES):
+        analysis.project_intent = "project_frontend"
+        analysis.question_type = "project_frontend"
+        return
+    if _has_any(raw, _PROJECT_BACKEND_PHRASES):
+        analysis.project_intent = "project_backend"
+        analysis.question_type = "project_backend"
+        return
+
+    # Implementation walkthrough ("how did I set up / how does it work").
+    if (_has_any(raw, _PROJECT_IMPLEMENTATION_PHRASES)
+            or (coding_requested and not analysis.requires_code)):
+        analysis.project_intent = "project_implementation"
+        analysis.question_type = "project_implementation"
+        return
+
+    # Broad "tell me about / explain the project" fallback.
+    analysis.project_intent = "project_explanation"
+    analysis.question_type = "project_explanation"
+
 
 @dataclass
 class QuestionAnalysis:
@@ -192,6 +408,9 @@ class QuestionAnalysis:
     question_type: str = "general"
     source: str = ""
     followup: bool = False
+    # Project (GitHub) grounding metadata — see _resolve_project_intent.
+    project_related: bool = False
+    project_intent: str = ""
 
     def to_dict(self) -> dict:
         return {
@@ -202,6 +421,8 @@ class QuestionAnalysis:
             "question_type": self.question_type or "",
             "source": self.source or "",
             "followup": bool(self.followup),
+            "project_related": bool(self.project_related),
+            "project_intent": self.project_intent or "",
         }
 
 
@@ -211,6 +432,8 @@ def analyze_question(
     source: str = "",
     previous: Optional[QuestionAnalysis] = None,
     followup: bool = False,
+    project_names: Optional[list[str]] = None,
+    project_active: bool = False,
 ) -> QuestionAnalysis:
     """Classify ``question`` into structured metadata.
 
@@ -218,6 +441,16 @@ def analyze_question(
     no explicit intent AND the previous question required code, the new
     question inherits the coding intent / language / framework (follow-up
     continuity) instead of falling back to "general".
+
+    ``project_names`` lists the configured project names/repo slugs; when any
+    of them appears in the question the question is treated as project-related
+    (Mode B) even if the generic "my project" phrasing is absent.
+
+    ``project_active`` is True when the session has a firmly-known project
+    (single configured project, or an active project from memory). Combined
+    with a non-generic question about a project area/framework/technology it
+    also turns the question project-related — BUT generic-technology frames
+    ("How does Express work?", "What is JWT?") are never boosted into Mode B.
     """
     text = (question or "").strip()
     raw = text.lower()
@@ -230,12 +463,41 @@ def analyze_question(
     technical = _has_any(raw, _TECH_CONCEPT_PHRASES)
     behavioral = _has_any(raw, _BEHAVIORAL_PHRASES)
     resume = _has_any(raw, _RESUME_PHRASES)
-    project = _has_any(raw, _PROJECT_REFS)
+    project = bool(_has_any(raw, _PROJECT_REFS) or _my_project_ref(raw))
+    tech_detected = bool(language or framework or _has(raw, "jwt")
+                        or _has(raw, "bcrypt") or _has(raw, "redis")
+                        or _has(raw, "docker"))
+    name_hit = _project_name_hit(raw, project_names)
+
+    # Mode-B boost for an established project session: project-area questions
+    # ("why did you use Postgres", "how did you set up auth") become project-
+    # related, but generic technology frames stay generic ("how does Express
+    # work", "what is jwt" must never reach GitHub retrieval).
+    generic_tech_frame = _has_any(raw, [
+        "how does", "how do", "what is", "what are", "what's", "explain",
+        "define", "difference between", "versus", "when would you use",
+        "when do you use", "pros and cons", "best practices",
+    ])
+    area_hit = bool(
+        _has_any(raw, _PROJECT_ARCH_PHRASES)
+        or _has_any(raw, _PROJECT_DB_PHRASES)
+        or _has_any(raw, _PROJECT_API_PHRASES)
+        or _has_any(raw, _PROJECT_FRONTEND_PHRASES)
+        or _has_any(raw, _PROJECT_BACKEND_PHRASES)
+        or _has_any(raw, _PROJECT_TECH_CHOICE_PHRASES)
+        or _has_any(raw, _PROJECT_IMPLEMENTATION_PHRASES))
+    active_boost = bool(
+        project_active and area_hit and not generic_tech_frame
+        and not strong_coding and not weak_coding)
+
+    project_related = bool(project or name_hit or active_boost)
 
     analysis = QuestionAnalysis(source=source, followup=bool(followup))
 
-    # SQL questions are first-class (queries are code too).
-    if sql_marker:
+    # SQL questions are first-class (queries are code too). A SQL-token
+    # question framed as a technology choice ("why did you use PostgreSQL")
+    # is deliberately routed to project/technical analysis instead and here.
+    if sql_marker and not _has_any(raw, _PROJECT_TECH_CHOICE_PHRASES):
         analysis.language = language or "sql"
         analysis.framework = framework
         analysis.requires_code = bool(
@@ -245,16 +507,20 @@ def analyze_question(
         analysis.intent = "sql"
         analysis.question_type = "sql_query" if analysis.requires_code else "sql_concept"
 
-    # Project questions keep the resume/project RAG first-person style and
-    # only escalate to code when code is explicitly requested.
-    elif project:
+    # Project questions: get GitHub-grounded answers about the candidate's
+    # actual code. Escalates to code only when code is explicitly requested.
+    elif project_related:
         analysis.language = language
         analysis.framework = framework
-        analysis.requires_code = bool(
-            strong_coding or debugging or _has(raw, "code"))
-        analysis.question_type = (
-            "project_coding" if analysis.requires_code else "project_explanation")
-        analysis.intent = analysis.question_type
+        coding_requested = bool(strong_coding or debugging or _has(raw, "code"))
+        analysis.requires_code = coding_requested
+        _resolve_project_intent(
+            analysis, raw, language=language, framework=framework,
+            debugging=debugging, coding_requested=coding_requested,
+            tech_detected=tech_detected,
+        )
+        analysis.project_related = True
+        analysis.intent = analysis.project_intent
 
     elif strong_coding:
         analysis.language = language
@@ -304,6 +570,26 @@ def analyze_question(
         analysis.intent = previous.intent
         analysis.requires_code = True
         analysis.question_type = previous.question_type or "code_generation"
+        if not analysis.language:
+            analysis.language = previous.language
+            # Framework only travels with the inherited language: an explicit
+            # new language ("redo it in Python") drops the old framework.
+            if not analysis.framework:
+                analysis.framework = previous.framework
+
+    # Project follow-up continuity: a follow-up to a project-grounded turn with
+    # no explicit shape keeps GitHub grounding ("explain my auth flow" then
+    # "what about the JWT?"). Requires the followup flag so a mid-interview
+    # topic switch to a generic question is NOT silently treated as project QA.
+    if (not analysis.project_related and not analysis.requires_code
+            and analysis.intent in ("general", "technical_concept")
+            and previous is not None and previous.project_related
+            and followup):
+        analysis.project_related = True
+        analysis.project_intent = previous.project_intent or "project_explanation"
+        analysis.intent = analysis.project_intent
+        analysis.question_type = (previous.question_type
+                                  or analysis.project_intent)
         if not analysis.language:
             analysis.language = previous.language
         if not analysis.framework:

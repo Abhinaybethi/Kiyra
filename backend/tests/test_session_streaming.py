@@ -162,6 +162,90 @@ async def test_generate_answer_ws_note_lands_in_user_prompt(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_coding_question_injects_strict_code_block_into_prompt(monkeypatch):
+    """Phase 5.1: a screenshot 'write a program how to use nodejs' question is
+    understood as coding and the Bonsai prompt MUST get the strict CODE
+    GENERATION block (fenced code mandatory, node.js language notes)."""
+    provider = FakeProvider()
+    sess = make_session(provider)
+    monkeypatch.setattr(
+        session_mod, "retrieve_context_sync",
+        lambda *a, **k: ("", {"embed_ms": 1.0, "search_ms": 1.0}),
+    )
+    seen: dict = {}
+
+    async def fake_complete(messages, stream=False, **kwargs):
+        seen["system"] = messages[0]["content"]
+        seen["user"] = messages[1]["content"]
+        return provider._stream()
+
+    monkeypatch.setattr(provider, "complete", fake_complete)
+
+    await sess._handle_text_message(json.dumps({
+        "type": "generate_answer",
+        "payload": {
+            "question": "write a program how to use nodejs",
+            "source": "screenshot",
+            "note": "",
+        },
+    }))
+    await asyncio.sleep(0.6)
+
+    user = seen.get("user", "")
+    assert "CODE GENERATION" in user
+    assert "MUST provide actual executable code" in user
+    assert "The answer MUST contain a fenced code block" in user
+    assert "node.js" in user
+    assert "browser-only APIs" in user
+    assert "CODING ANSWER FORMAT" in user
+    # Phase 5.1.1: the SYSTEM role must ALSO carry the coding directive so the
+    # generic "plain text only / terse" system rules cannot override it.
+    system = seen.get("system", "")
+    assert "CODING QUESTION OVERRIDE" in system
+    assert "MUST contain a fenced code block" in system
+    # analysis metadata attached to the generating event, source preserved
+    gen = [e for e in sess.ws.sent
+           if e["type"] == EventType.ANSWER_GENERATING.value]
+    assert gen and gen[0]["payload"]["analysis"]["intent"] == "coding"
+    assert gen[0]["payload"]["analysis"]["requires_code"] is True
+    assert gen[0]["payload"]["analysis"]["source"] == "screenshot"
+
+
+@pytest.mark.asyncio
+async def test_manual_non_coding_question_gets_no_code_block(monkeypatch):
+    """Phase 5.1 #7/#9: manual questions use the SAME analyzer, and questions
+    that do not require code never get the coding instruction block."""
+    provider = FakeProvider()
+    sess = make_session(provider)
+    monkeypatch.setattr(
+        session_mod, "retrieve_context_sync",
+        lambda *a, **k: ("", {"embed_ms": 1.0, "search_ms": 1.0}),
+    )
+    seen: dict = {}
+
+    async def fake_complete(messages, stream=False, **kwargs):
+        seen["user"] = messages[1]["content"]
+        return provider._stream()
+
+    monkeypatch.setattr(provider, "complete", fake_complete)
+
+    await sess._handle_text_message(json.dumps({
+        "type": "generate_answer",
+        "payload": {"question": "Explain Node.js event loop"},
+    }))
+    await asyncio.sleep(0.6)
+    user = seen.get("user", "")
+    assert "CODE GENERATION" not in user
+    assert "fenced code block" not in user
+    system = seen.get("system", "")
+    assert "CODING QUESTION OVERRIDE" not in system
+    gen = [e for e in sess.ws.sent
+           if e["type"] == EventType.ANSWER_GENERATING.value]
+    assert gen and gen[0]["payload"]["analysis"]["intent"] == "technical_concept"
+    assert gen[0]["payload"]["analysis"]["requires_code"] is False
+
+
+@pytest.mark.asyncio
 async def test_streaming_answer_emits_full_event_sequence(monkeypatch):
     provider = FakeProvider()
     sess = make_session(provider)
