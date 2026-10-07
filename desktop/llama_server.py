@@ -24,6 +24,7 @@ import re
 import subprocess
 import sys
 import time
+import urllib.error
 import urllib.request
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -98,6 +99,7 @@ class LlamaCppServerManager:
         self.command: list[str] = []
         self.evidence: dict = {}   # human-visible GPU proof / fallback reason
         self.startup_health_s = None
+        self._probes: list = []    # scratch-port probes, reaped on promote
 
     # ────────────────────────────────────────────────────────────────────────
     # Detection (Part 2 / Part 3)
@@ -266,10 +268,17 @@ class LlamaCppServerManager:
         for i, layers in enumerate(attempts):
             cmd = self._gpu_command(scratch, layers)
             probe_log = self.log_path + f".probe{i}"
-            self._launch(cmd, log_path=probe_log)
+            probe = self._launch(cmd, log_path=probe_log)
+            self._probes.append(probe)
             ok = self._poll_health(port=scratch, timeout_s=120.0)
             evidence = self._offload_evidence(probe_log,
                                               requested_layers=layers)
+            # Always reap the probe BEFORE promoting. The probe holds a full
+            # copy of the model in VRAM, and promoting while it lives both
+            # starves the GPU (verified: repeated starts left 12 probe servers
+            # holding 5.5/6 GB and Bonsai could no longer load) and loses the
+            # handle entirely, because the real launch reassigns self.proc.
+            self._stop(probe)
             if ok and evidence.get("offloaded_count", 0) > 0:
                 # Promote: same args on the real port, using the PROVEN layer
                 # count so the actual server offloads exactly what we measured.
@@ -331,6 +340,40 @@ class LlamaCppServerManager:
                 continue
         return 19081
 
+    def stop(self, timeout: float = 10.0) -> None:
+        """Stop every server this manager started (probes + the real one).
+
+        Never raises. Waits for the port to actually stop listening, because
+        llama-server releases its CUDA buffers asynchronously after exit and a
+        restart that races that release fails to load the model.
+        """
+        for proc in list(self._probes) + ([self.proc] if self.proc else []):
+            if proc is None:
+                continue
+            try:
+                if proc.poll() is None:
+                    self._stop(proc)
+            except Exception:
+                pass
+        self._probes.clear()
+
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            if not self._port_open():
+                break
+            time.sleep(0.25)
+
+    def _port_open(self, port: int | None = None) -> bool:
+        import socket
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        s.settimeout(0.5)
+        try:
+            return s.connect_ex((self.host, port or self.port)) == 0
+        except OSError:
+            return False
+        finally:
+            s.close()
+
     def _report(self) -> dict:
         start_s = getattr(self, "startup_health_s", None)
         return {
@@ -341,6 +384,137 @@ class LlamaCppServerManager:
             "evidence": self.evidence,
             "health_s": start_s,
         }
+
+
+class ModelServerLauncher:
+    """Ensure Bonsai's llama-server is up; start it only if it is not running.
+
+    The reuse contract mirrors ``backend_server.BackendLauncher`` exactly:
+
+    * Reuses an already-serving model server (never double-starts it).
+    * Never kills a server it did not start.
+    * Never raises — ``ensure()`` returns ``(ready, message)`` so a missing
+      model degrades with an actionable message instead of a traceback.
+
+    ``ensure_provider_ready()`` in the backend turns a missing model server
+    into an opaque 503 on session start, which is why the overlay now brings
+    the model up itself.
+    """
+
+    def __init__(self,
+                 port: int = DEFAULT_PORT,
+                 host: str = DEFAULT_HOST,
+                 model: str = DEFAULT_MODEL,
+                 log_path: str = LLAMA_LOG,
+                 startup_timeout: float = 180.0,
+                 manager_factory=None):
+        self.port = int(port)
+        self.host = host
+        self.model = model
+        self.log_path = log_path
+        self.startup_timeout = float(startup_timeout)
+        self._factory = manager_factory or LlamaCppServerManager
+        self.manager = None
+        self.proc: subprocess.Popen | None = None
+        self.started_here = False
+
+    # ── Health probe ─────────────────────────────────────────────────────
+
+    def models_url(self) -> str:
+        return f"http://{self.host}:{self.port}/v1/models"
+
+    def is_running(self, timeout: float = 3.0) -> bool:
+        """True when /v1/models answers 200 with a model descriptor."""
+        try:
+            with urllib.request.urlopen(self.models_url(), timeout=timeout) as r:
+                if not (200 <= r.status < 300):
+                    return False
+                body = r.read().decode("utf-8", "replace")
+                return bool(_HEALTH_RE.search(body))
+        except (urllib.error.URLError, OSError, ValueError):
+            return False
+
+    def port_in_use(self, timeout: float = 0.5) -> bool:
+        """Something owns the port but /v1/models never answers."""
+        import socket
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        s.settimeout(timeout)
+        try:
+            return s.connect_ex((self.host, self.port)) == 0
+        except OSError:
+            return False
+        finally:
+            s.close()
+
+    def log_tail(self, limit: int = 900) -> str:
+        try:
+            with open(self.log_path, "rb") as fh:
+                fh.seek(0, os.SEEK_END)
+                size = fh.tell()
+                fh.seek(max(0, size - limit * 4))
+                raw = fh.read().decode("utf-8", errors="replace")
+            lines = [ln for ln in raw.splitlines() if ln.strip()]
+            return "\n".join(lines[-12:])[-limit:]
+        except Exception:
+            return "(no log output)"
+
+    # ── Start / stop ─────────────────────────────────────────────────────
+
+    def ensure(self, prefer_gpu: bool = True) -> tuple[bool, str]:
+        """Reuse a serving model server, otherwise start one. Never raises."""
+        if self.is_running():
+            return True, (f"model server already running on "
+                          f"http://{self.host}:{self.port}")
+        if self.port_in_use():
+            return False, (f"port {self.port} is busy but /v1/models does not "
+                           f"answer — stop that process or set KIYRA_LLAMA_PORT")
+
+        self.manager = self._factory(model=self.model, port=self.port,
+                                     host=self.host, log_path=self.log_path)
+        try:
+            report = self.manager.start(prefer_gpu=prefer_gpu)
+        except RuntimeError as e:
+            return False, (f"model server failed to start: {e}\n"
+                           f"          Log: {self.log_path}")
+        except Exception as e:
+            return False, f"model server failed to start: {e}"
+
+        self.proc = report.get("proc")
+        self.started_here = True
+        mode = (report.get("mode") or "?").upper()
+        pid = report.get("pid")
+        return True, f"model server ready ({mode}, pid {pid}) on port {self.port}"
+
+    def stop(self, timeout: float = 10.0) -> None:
+        """Terminate ONLY a model server this process started. Never raises."""
+        if not self.started_here:
+            return
+        proc = self.proc or (self.manager.proc if self.manager else None)
+        if proc is None:
+            return
+        if os.name == "nt":
+            try:
+                subprocess.run(["taskkill", "/PID", str(proc.pid), "/T", "/F"],
+                               capture_output=True, timeout=timeout + 5,
+                               creationflags=_FLAGS)
+            except Exception:
+                pass
+        if self.manager is not None:
+            try:
+                self.manager.stop(timeout=timeout)
+            except Exception:
+                pass
+        else:
+            LlamaCppServerManager._stop(proc)
+
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline and self.is_running(timeout=1.0):
+            time.sleep(0.25)
+        if self.is_running(timeout=1.0):
+            print(f"[Model] warning: something is still serving "
+                  f"{self.models_url()} after stop()")
+        else:
+            print(f"[Model] stopped (pid {proc.pid})")
 
 
 def main(argv: list[str] | None = None) -> int:

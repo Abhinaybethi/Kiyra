@@ -825,6 +825,11 @@ export default function LiveWorkspacePage({ params }: { params: Promise<{ id: st
                     <Copy className="w-3.5 h-3.5" />
                   </button>
                 </div>
+                <p className="text-[11px] text-slate-400">
+                  This is the only command you need — the AI model server
+                  (Bonsai) and the backend both start automatically and the
+                  overlay connects to them.
+                </p>
               </div>
 
               <div className="space-y-1 text-slate-400 text-[11px]">
