@@ -56,6 +56,15 @@ class Settings(BaseSettings):
     minimum_speech_duration: float = 0.25  # Utterances shorter than this are noise
     maximum_utterance_duration: float = 12.0  # Hard cap — force-finalize long speech
     stt_timeout: float = 8.0  # Max allowed STT wall time before we give up
+    # One bounded retry after stt_timeout. Absorbs a cold Whisper load without
+    # ever discarding the candidate's audio (losing speech is unrecoverable).
+    stt_retry_timeout: float = 25.0
+
+    # ── Interview Listening Mode (Phase 5.4) ─────────────────────────────
+    # The user, not VAD, decides where the question ends. A turn is only
+    # submitted by an explicit SEND.
+    turn_min_useful_chars: int = 8  # shorter transcripts cannot be sent
+    turn_final_flush_timeout: float = 3.0  # bounded wait for the trailing STT
 
     # Early / partial transcription (incremental STT + speculative preparation)
     realtime_partial_speech_s: float = 1.2  # Accumulated speech before the first partial STT fires
@@ -110,6 +119,32 @@ class Settings(BaseSettings):
     knowledge_chunk_size: int = 512  # tokens per chunk
     knowledge_chunk_overlap: int = 50  # overlap tokens
     knowledge_similarity_threshold: float = 0.3  # Min similarity score
+
+    # ─── GitHub Project Intelligence (Phase 5.2) ─────────────────────────────
+    # Project-aware retrieval: the question analyzer marks project questions and
+    # the GitHub retriever pulls repository evidence — never the whole repo and
+    # never direct repo access for Bonsai. Token is read from GITHUB_TOKEN and
+    # must never be logged.
+    kiyra_github_enabled: bool = True
+    kiyra_github_token: Optional[str] = Field(
+        default=None,
+        validation_alias=AliasChoices("kiyra_github_token", "github_token"),
+    )
+    # Single-repo, env-only configuration (simplest production setup).
+    kiyra_github_owner: str = ""
+    kiyra_github_repo: str = ""
+    kiyra_github_project_id: str = ""
+    kiyra_github_project_name: str = ""
+    kiyra_github_default_branch: str = "main"
+    # Multi-project configuration: JSON array of project sources.
+    kiyra_github_projects_file: str = "./data/github_projects.json"
+    # Retrieval limits — keep Bonsai's context lean (default 6 chunks).
+    kiyra_github_top_k: int = 6
+    kiyra_github_snapshot_ttl_s: float = 600.0  # cache tree+blobs this long
+    kiyra_github_http_timeout: float = 15.0
+    kiyra_github_max_file_bytes: int = 300_000
+    kiyra_github_max_files: int = 400  # hard cap on indexed files per repo
+    kiyra_github_real_timeout: float = 3.0  # hard ceiling inside the live path
 
     # ─── Agent Caching ───────────────────────────────────────────────────────
     cache_answers: bool = True  # Cache similar question answers

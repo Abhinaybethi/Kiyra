@@ -97,6 +97,39 @@ uv run python seed.py
 uv run uvicorn main:app --reload --port 8000
 ```
 
+> **Desktop overlay:** you do NOT need to start the backend or Bonsai yourself.
+> `python desktop/stealth_overlay.py` checks `GET /health` first, launches the
+> backend automatically (hidden console, logged to
+> `%TEMP%\opencode\kiyra-backend.log`) if nothing is serving, waits for it to
+> become healthy, creates the live session, then opens the overlay.
+>
+> It also starts **Bonsai's llama-server** (`desktop/llama_server.py`, GPU-first
+> with the proven CPU fallback) when `/v1/models` is not answering. Without it,
+> session start fails with a 503 and *listening never begins*. A model server or
+> backend that was already running is reused, never double-started and never
+> stopped by the overlay.
+>
+> ```bash
+> # one command — Bonsai + backend included
+> python desktop/stealth_overlay.py
+>
+> # options
+> python desktop/stealth_overlay.py --api-url http://localhost:9000
+> python desktop/stealth_overlay.py --no-backend          # never start it
+> python desktop/stealth_overlay.py --no-model           # never start Bonsai
+> python desktop/stealth_overlay.py --startup-timeout 180
+> python desktop/stealth_overlay.py --stop-backend-on-exit
+> ```
+>
+> By default both are left running when the overlay closes (keep-warm), so the
+> next start is instant. `--stop-backend-on-exit` stops them and frees the GPU.
+>
+> Environment overrides: `KIYRA_API_URL`, `KIYRA_BACKEND_PYTHON`,
+> `KIYRA_BACKEND_STARTUP_TIMEOUT`, `KIYRA_STOP_BACKEND_ON_EXIT`.
+> An already-running backend is reused, never restarted, and never killed on
+> exit (only a backend this script started, and only with
+> `--stop-backend-on-exit`).
+
 ### 3. Frontend Setup
 ```bash
 cd frontend

@@ -112,13 +112,23 @@ def extract_text(image_bytes: bytes) -> dict:
 
 
 def extract_question(text: str) -> str:
-    """Pull the first question-like sentence from OCR'd text, else return text."""
+    """Pull the first question-like sentence from OCR'd text, else return text.
+
+    OCR engines often return ONE box per word, so the joined text is
+    newline-separated words ("Write\\nNode.js\\na\\nprogram..."). Flatten first,
+    then look for the question sentence — otherwise the analyzer would receive
+    a newline-smashed question that degrades Bonsai's answer format.
+    """
     if not text:
         return ""
-    for line in text.splitlines():
-        line = line.strip()
-        if line.endswith("?") and len(line) > 4:
-            return line
-    sentences = re.split(r"(?<=[.!?])\s+", text.strip())
-    sentence = next((s.strip() for s in sentences if s.strip().endswith("?") and len(s.strip()) > 4), None)
-    return sentence or (text.strip()[:400] if text.strip() else "")
+    flat = re.sub(r"\s+", " ", text.strip())
+    if not flat:
+        return ""
+    if flat.endswith("?") and len(flat) > 4:
+        return flat
+    sentences = re.split(r"(?<=[.!?])\s+", flat)
+    sentence = next(
+        (s.strip() for s in sentences if s.strip().endswith("?") and len(s.strip()) > 4),
+        None,
+    )
+    return sentence or flat[:400]
