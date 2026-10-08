@@ -18,6 +18,7 @@ import asyncio
 import re
 import threading
 from typing import Optional
+from urllib.parse import quote
 
 import httpx
 
@@ -150,7 +151,7 @@ class GitHubRepositoryProvider:
         the indexer decides what to keep — this just fetches."""
         if _path_is_binary(path):
             return b""
-        url = f"{_API}/repos/{project.github_owner}/{project.github_repo}/contents/{path}"
+        url = f"{_API}/repos/{project.github_owner}/{project.github_repo}/contents/{quote(path, safe='/')}"
         resp = self._get(url)
         self._handle_api_error(resp, project)
         return resp.content
@@ -171,7 +172,7 @@ class GitHubRepositoryProvider:
         """Recent commits touching a path (optional, best-effort)."""
         url = (
             f"{_API}/repos/{project.github_owner}/{project.github_repo}/commits"
-            f"?path={path}&per_page={per_page}"
+            f"?path={quote(path, safe='/')}&per_page={per_page}"
         )
         resp = self._get(url)
         if resp.status_code != 200:
@@ -186,7 +187,7 @@ class GitHubRepositoryProvider:
     def search_code(self, query: str) -> list[dict]:
         """GitHub code search (requires a token; best-effort passthrough)."""
         self._require_auth()
-        url = f"{_API}/search/code?q={query}"
+        url = f"{_API}/search/code?q={quote(query, safe='')}"
         resp = self._get(url)
         if resp.status_code != 200:
             return []
