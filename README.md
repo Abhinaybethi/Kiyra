@@ -4,7 +4,7 @@
 A production-grade, local-first, free-first AI interview assistance platform for candidates preparing for and navigating real-time interviews.
 
 ![Local-First](https://img.shields.io/badge/Architecture-Local--First-blue.svg)
-![AI-Powered](https://img.shields.io/badge/AI-Ollama%20%7C%20Whisper-orange.svg)
+![AI-Powered](https://img.shields.io/badge/AI-Bonsai%20%7C%20Whisper-orange.svg)
 ![License](https://img.shields.io/badge/License-MIT-green.svg)
 
 ---
@@ -22,14 +22,16 @@ A production-grade, local-first, free-first AI interview assistance platform for
      - **Center**: Question detection & AI answer recommendations (STAR framing, technical trade-offs, supporting points).
      - **Right**: Candidate context, skills, projects, and manual trigger controls.
    - Heuristic question detection with mandatory manual "Generate Answer" trigger fallback.
+   - **Interview Listening Mode**: you own the question boundary. Speech accumulates into a turn, only an explicit SEND submits it (a repeated SEND is ignored while generating), and the answer auto-re-arms to listening with the turn rotated — no re-pressing START between questions. Works in the web `/live` workspace and the desktop overlay.
 
 3. **Candidate Knowledge Base & RAG**
    - Local document ingestion for resumes (PDF, DOCX, TXT) and job descriptions.
    - Chunking (512 tokens with 50-token overlap) and local embeddings via `sentence-transformers` (`all-MiniLM-L6-v2`).
    - Persistent vector retrieval using **ChromaDB** to ensure answers are strictly personalized to your actual experience without hallucinating fake credentials.
+   - **GitHub-grounded project retrieval** (optional, `KIYRA_GITHUB_ENABLED`): answer questions about your actual repositories using a fine-grained read-only `GITHUB_TOKEN`. Only project-specific questions trigger retrieval — generic tech questions never leave the local models. Single- and multi-project config in `.env.example`.
 
 4. **Centralized Model Abstraction Layer**
-   - Zero hardcoded models: easily switch between local Ollama models (`llama3.2:3b`, `mistral`, `deepseek-r1`, `qwen2.5-coder`) or OpenAI-compatible endpoints directly in Settings.
+   - Zero hardcoded models: the default is local **Bonsai** (llama.cpp `llama-server`, an 8B-class GGUF served OpenAI-compatibly on :8080, GPU-first with a proven CPU fallback, auto-started by the desktop overlay). Switch to Ollama (legacy) or any OpenAI-compatible endpoint directly in Settings.
 
 5. **Analytics & Performance Tracking**
    - Real analytics computed from database session history: score trends, completion rates, strengths, weaknesses, and improvement roadmaps.
@@ -45,16 +47,19 @@ A production-grade, local-first, free-first AI interview assistance platform for
 │   ├── src/components/     # UI components & Navigation
 │   └── src/lib/            # API client & WebSocket hooks
 │
-├── backend/                # FastAPI (Python 3.11+) async backend
+├── backend/                # FastAPI (Python 3.13+) async backend
 │   ├── agents/             # Multi-agent implementations (Resume, JD, Question, Answer, Coach, Orchestrator)
-│   ├── ai/                 # Unified AIProvider abstraction (Ollama, OpenAI-compatible)
+│   ├── ai/                 # Unified AIProvider abstraction (Bonsai, Ollama, OpenAI-compatible)
 │   ├── api/                # REST endpoints (/profile, /resume, /jobs, /interviews, /analytics, /settings)
 │   ├── db/                 # SQLAlchemy 2.0 ORM models & Alembic migrations
 │   ├── knowledge/          # Chunking, local embeddings, and ChromaDB vector store
 │   ├── realtime/           # WebSocket session manager & faster-whisper STT
+│   ├── github_repo/        # GitHub-grounded project retrieval (provider, indexer, retriever)
+│   ├── vision/             # Screenshot/OCR question capture
 │   ├── services/           # Document parsing & security validation
 │   └── tests/              # Pytest unit & integration test suite
 │
+├── desktop/                # Windows overlay + backend/model auto-start launchers
 ├── docker-compose.yml      # Multi-container setup (Backend, Frontend, Ollama)
 ├── Makefile                # Dev automation commands
 └── .env.example            # Environment template
@@ -65,19 +70,22 @@ A production-grade, local-first, free-first AI interview assistance platform for
 ## 🚀 Quickstart
 
 ### Prerequisites
-- **Python 3.11+**
+- **Python 3.13+**
 - **Node.js 18+** & npm
 - [uv](https://github.com/astral-sh/uv) (recommended) or pip
-- [Ollama](https://ollama.ai) (for local free LLM inference)
+- (Legacy only) [Ollama](https://ollama.ai) if you set `AI_PROVIDER=ollama`
 
-### 1. Setup Ollama (Local AI)
+### 1. Bonsai (Local AI) — auto-started for you
+The desktop overlay starts Bonsai's `llama-server` automatically
+(`desktop/llama_server.py`) whenever nothing answers `/v1/models` on
+`127.0.0.1:8080` — CUDA offload first, proven CPU fallback. It loads the GGUF
+at `C:\AI\models\Bonsai-8B-Q1_0.gguf` (override with `KIYRA_LLAMA_MODEL`) using
+the llama.cpp binaries under `%TEMP%\opencode\llama-bin-*`.
+
+Or run the model server on its own:
 ```bash
-# Start Ollama
-ollama serve
-
-# Pull default models
-ollama pull llama3.2:3b
-ollama pull nomic-embed-text
+uv run desktop/llama_server.py          # GPU-first, CPU fallback
+uv run desktop/llama_server.py --cpu    # force CPU
 ```
 
 ### 2. Backend Setup
