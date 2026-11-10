@@ -130,7 +130,7 @@ async def analyze_image(
         )
         rag_used = bool(context)
         rag_ms = rag_metrics.get("embed_ms", 0.0) + rag_metrics.get("search_ms", 0.0)
-    except Exception:
+    except Exception as e:
         rag_used = False
 
     # 4. Bonsai answer (short real-time mode)

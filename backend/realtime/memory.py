@@ -451,6 +451,67 @@ _ANSWER_REQUIREMENTS = """\
   valid answer to CURRENT QUESTION, write a fresh answer to it instead."""
 
 
+# General / concept / definition questions ("What is an LLM?", "difference
+# between a list and a tuple"). The experience block above tells the model to
+# answer in first person as the candidate — correct for behavioral / resume /
+# project turns, but for a plain technical question it made the model bolt
+# fabricated personal framing onto a generic answer ("I built a model and
+# fine-tuned it on 10 million articles…"). For these intents the answer must
+# stand on the question alone; personal claims are allowed only when context
+# actually supports them.
+_ANSWER_REQUIREMENTS_GENERAL = """\
+- Answer the CURRENT QUESTION directly and correctly: give the accurate
+  technical answer or definition first, then explain it with a concrete example.
+- This is a general/technical question, not a request for the candidate's
+  personal history. Do NOT frame the answer as personal experience and do NOT
+  open with or pad it using "I built…", "in my project…" style claims. Only
+  mention the candidate's own work when RELEVANT KNOWLEDGE or PREVIOUS
+  CONTEXT explicitly supports it; never invent projects, tools, employers,
+  metrics or experience.
+- Plain speakable text only: no headings, citations, or meta commentary.
+  Follow the length rules from the system prompt.
+- Answer ONLY the CURRENT QUESTION. Earlier answers in RECENT CONVERSATION
+  are background for references and consistency only — never reuse, quote,
+  paraphrase, or continue them."""
+
+
+def _length_rule() -> str:
+    """Mode-specific length rule, restated where the model reads last.
+
+    The block above only said "follow the length rules from the system prompt",
+    and a small local model ignored it: detailed mode produced a single
+    paragraph (~50-140 words) instead of the 150-220 word answer the mode
+    promises. The ANSWER REQUIREMENTS block is the final thing in the user
+    prompt, so the target length has to be spelled out here, not by reference.
+    """
+    mode = (settings.answer_mode or "short").lower()
+    if mode == "detailed":
+        return ("Length: detailed mode means 150-220 words. Cover a one-sentence "
+                "thesis, four bullets that each name a concrete mechanism, API "
+                "or number, one concrete example, and one trade-off. A "
+                "one-paragraph definition is NOT enough.")
+    if mode == "medium":
+        return ("Length: medium mode means 120-250 words: a thesis, 2-3 key "
+                "points and one concrete example.")
+    return "Length: short mode means 2-6 sentences and under 180 words."
+
+
+def _answer_requirements(analysis=None) -> str:
+    """Pick the ANSWER REQUIREMENTS block for ``analysis``.
+
+    Concept / general questions get the non-first-person block; everything
+    else (behavioral, resume, project, coding, debugging, sql, and the
+    no-analysis default) keeps the first-person experience block. Both blocks
+    end with the mode's explicit length rule.
+    """
+    intent = getattr(analysis, "intent", "") or "" if analysis is not None else ""
+    if intent in ("technical_concept", "general"):
+        block = _ANSWER_REQUIREMENTS_GENERAL
+    else:
+        block = _ANSWER_REQUIREMENTS
+    return f"{block}\n- {_length_rule()}"
+
+
 class ContextBuilder:
     """Assembles the sectioned user prompt for the realtime answer path.
 
@@ -497,6 +558,7 @@ class ContextBuilder:
         sections: Optional[dict[str, str]] = None,
         analysis: Optional[QuestionAnalysis] = None,
         project_evidence: Optional[str] = None,
+        qtype: str = "conceptual",
     ) -> str:
         try:
             memory = memory or SessionMemory()
@@ -518,6 +580,7 @@ class ContextBuilder:
                 ("PREVIOUS CONTEXT", sections.get("PREVIOUS CONTEXT", "(none)")),
                 ("RELEVANT KNOWLEDGE",
                  (context or "").strip() or "(no retrieved context)"),
+                ("QUESTION TYPE", qtype),
             ]
             # Project (GitHub) evidence: only when the question is
             # project-related; the block carries its own grounding rules and
@@ -532,7 +595,7 @@ class ContextBuilder:
             # top and RECENT CONVERSATION at the bottom it copied the *previous*
             # answer verbatim instead of answering the question in hand.
             ordered.append(("CURRENT QUESTION", current_block or "(none)"))
-            ordered.append(("ANSWER REQUIREMENTS", _ANSWER_REQUIREMENTS))
+            ordered.append(("ANSWER REQUIREMENTS", _answer_requirements(analysis)))
             # Strict coding mode: appended ONLY when requires_code is True, so
             # behavioral/project/technical questions keep the humanized format
             # and the prompt is never overloaded with coding instructions.

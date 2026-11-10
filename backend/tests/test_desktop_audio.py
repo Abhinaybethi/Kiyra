@@ -286,6 +286,53 @@ def test_encode_wav_bytes_contract():
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Mixing sink — signal-selective, no fixed gate
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _tone(level: float, seed: int, n: int) -> np.ndarray:
+    rng = np.random.default_rng(seed)
+    x = rng.standard_normal(n).astype(np.float32)
+    x /= np.sqrt(np.mean(x ** 2)) or 1.0
+    return (x * level).astype(np.float32)
+
+
+def _rms_pcm16(wav: bytes) -> float:
+    s = _decode_wav(wav)["samples"].astype(np.float32) / 32768.0
+    return float(np.sqrt(np.mean(s ** 2)))
+
+
+def test_mixing_sink_passes_solo_carrier_at_unity():
+    """A solo-active mic must NOT be halved by averaging with a quiet peer.
+
+    (0.020 + 0.008)/2 = 0.014 would drop below the backend VAD start
+    threshold (~0.015); unity passthrough keeps 0.020 audible.
+    """
+    emitted = []
+    mixer = audio_loopback._MixingChunkSink(
+        emitted.append, n_sources=2, source_names=("mic", "loopback"))
+    n = audio_loopback.CHUNK_SAMPLES
+    h = n // 2
+    mic = _tone(0.020, 1, n)
+    loop = _tone(0.008, 2, n)
+    mixer.feed(0, mic[:h])
+    mixer.feed(1, loop[:h])
+    mixer.feed(0, mic[h:])
+    mixer.feed(1, loop[h:])
+    assert emitted
+    assert _rms_pcm16(emitted[0]) > 0.017
+
+
+def test_mixing_sink_does_not_gate_quiet_audio():
+    """The old fixed 0.015 mic gate zeroed this mic's whole signal (noise floor
+    ~0.007). Quiet frames must survive untouched."""
+    emitted = []
+    mixer = audio_loopback._MixingChunkSink(emitted.append, n_sources=1)
+    mixer.feed(0, np.full(audio_loopback.CHUNK_SAMPLES, 0.010, dtype=np.float32))
+    assert emitted
+    assert 0.008 < _rms_pcm16(emitted[0]) < 0.012
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 
 def _decode_wav(wav: bytes) -> dict:
     import io as _io

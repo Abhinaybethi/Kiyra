@@ -63,27 +63,24 @@ def looks_like_code(text: str) -> bool:
     return code_lines >= 2 or code_lines / max(len(text.splitlines()), 1) > 0.4
 
 
-def extract_text(image_bytes: bytes) -> dict:
-    """OCR an image. Returns extracted text + metadata.
+def _contrast_enhanced(img: np.ndarray) -> np.ndarray:
+    """Histogram-equalize a capture so OCR can read faint/washed-out text.
 
-    Raises RuntimeError when OCR is unavailable or extraction fails — callers
-    surface that as a recoverable error.
+    Dark-theme apps, HDR/tonemapped screens and low-contrast UIs can produce
+    text the detector misses at raw contrast (measured: a grey-on-grey
+    screenshot yields 0 boxes raw but both lines after equalization). Returns
+    the boosted image in BGR, ready for the engine.
     """
-    engine = _get_engine()
-    if engine is None:
-        raise RuntimeError(
-            "OCR engine is not available. Install: pip install rapidocr-onnxruntime"
-        )
+    import cv2
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    equalized = cv2.equalizeHist(gray)
+    return cv2.cvtColor(equalized, cv2.COLOR_GRAY2BGR)
 
-    img = _decode_image(image_bytes)
-    if img is None:
-        raise RuntimeError("Could not decode image. Use PNG/JPEG/WebP/BMP.")
 
-    # RapidOCR consumes a numpy image; run on CPU and normalize output shapes.
-    result, _elapse = engine(img)
+def _parse_result(result) -> dict:
+    """Normalize a RapidOCR result into text + metadata ({} when empty)."""
     if not result:
-        raise RuntimeError("No text detected in the image (OCR returned empty).")
-
+        return {}
     lines = []
     confidence_sum = 0.0
     for item in result:
@@ -98,10 +95,8 @@ def extract_text(image_bytes: bytes) -> dict:
             confidence_sum += float(item[2])
         except (TypeError, ValueError):
             pass
-
     if not lines:
-        raise RuntimeError("No text detected in the image (OCR returned empty).")
-
+        return {}
     raw = "\n".join(lines)
     return {
         "text": raw,
@@ -109,6 +104,41 @@ def extract_text(image_bytes: bytes) -> dict:
         "avg_confidence": round(confidence_sum / len(lines), 3),
         "likely_code": looks_like_code(raw),
     }
+
+
+def extract_text(image_bytes: bytes) -> dict:
+    """OCR an image. Returns extracted text + metadata.
+
+    Tries the raw capture first; if the detector finds nothing, retries once on
+    a contrast-equalized copy so low-contrast / washed-out (dark theme, HDR)
+    screenshots do not fail with a false "No text detected". Raises
+    RuntimeError when OCR is unavailable, the image cannot be decoded, or no
+    text is found even after enhancement — callers surface that as a
+    recoverable error.
+    """
+    engine = _get_engine()
+    if engine is None:
+        raise RuntimeError(
+            "OCR engine is not available. Install: pip install rapidocr-onnxruntime"
+        )
+
+    img = _decode_image(image_bytes)
+    if img is None:
+        raise RuntimeError("Could not decode image. Use PNG/JPEG/WebP/BMP.")
+
+    # RapidOCR consumes a numpy image; run on CPU and normalize output shapes.
+    result, _elapse = engine(img)
+    parsed = _parse_result(result)
+    if not parsed:
+        try:
+            result, _elapse = engine(_contrast_enhanced(img))
+        except Exception:
+            result = None
+        parsed = _parse_result(result)
+
+    if not parsed:
+        raise RuntimeError("No text detected in the image (OCR returned empty).")
+    return parsed
 
 
 def extract_question(text: str) -> str:

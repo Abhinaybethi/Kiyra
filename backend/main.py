@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import os
+import sys
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, Request
@@ -11,6 +12,17 @@ from fastapi.responses import JSONResponse
 from config import settings
 from db.database import Base, engine
 from ai.provider import ProviderUnavailableError
+
+# The backend's stdout is frequently a redirected pipe / log file. On Windows
+# that defaults to a legacy code page (cp1252), so printing a transcript that
+# contains any non-ASCII character (CJK, accented letters, emoji) raised
+# UnicodeEncodeError — which propagated out of the WebSocket loop and tore the
+# live session down. Force UTF-8 and never crash on an unencodable char.
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
 
 
 @asynccontextmanager
@@ -39,7 +51,16 @@ async def lifespan(app: FastAPI):
     # utterance in a live session doesn't eat the STT/RAG time budgets with
     # one-time model loading or downloads.
     import threading as _threading
-    from realtime.transcription import _get_model as _warm_whisper
+
+    def _warm_whisper():
+        try:
+            from realtime.transcription import _get_model, _get_partial_model
+            _get_model()
+            # Also warm the dedicated partial lane so the first preview call
+            # doesn't pay a one-time model-load behind its own lock.
+            _get_partial_model()
+        except Exception as e:
+            print(f"[Warmup] whisper failed: {e}")
 
     def _warm_embeddings():
         try:
@@ -47,9 +68,46 @@ async def lifespan(app: FastAPI):
             embed_text("warmup")
         except Exception as e:
             print(f"[Warmup] embeddings failed: {e}")
+        # If the vector store was reset (corruption) or is simply empty while
+        # the SQL knowledge base has chunks, rebuild the derived index so RAG
+        # works without the user re-uploading anything. Runs after the
+        # embedding model is warm above.
+        if os.environ.get("TESTING"):
+            return
+        try:
+            from knowledge.reindex import reindex_empty_collections
+            reindex_empty_collections()
+        except Exception as e:
+            print(f"[Warmup] knowledge re-index failed: {e}")
+
+    def _warm_llm():
+        """Prime the local LLM so the FIRST live answer doesn't pay the cold
+        model-load / prompt-eval cost (CPU-only llama can otherwise stall the
+        first answer for tens of seconds). Best-effort: a missing server just
+        logs and moves on — the real request still runs normally."""
+        if os.environ.get("TESTING"):
+            return  # never touch the network under the test suite
+        try:
+            import asyncio as _a
+            from ai.provider import get_provider
+            provider = get_provider()
+
+            async def _go():
+                try:
+                    await provider.complete(
+                        [{"role": "user", "content": "ping"}],
+                        stream=False, max_tokens=1,
+                    )
+                except Exception:
+                    pass
+
+            _a.run(_go())
+        except Exception as e:
+            print(f"[Warmup] LLM failed: {e}")
 
     _threading.Thread(target=_warm_whisper, name="whisper-warmup", daemon=True).start()
     _threading.Thread(target=_warm_embeddings, name="embeddings-warmup", daemon=True).start()
+    _threading.Thread(target=_warm_llm, name="llm-warmup", daemon=True).start()
 
     yield
     # Shutdown: nothing to clean up

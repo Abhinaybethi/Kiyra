@@ -62,11 +62,43 @@ class _FailingNVIDIA:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# command construction (Part 1 asks to preserve the exact current command)
+# command construction (Part 1 preserves the exact Phase-3 command)
 # ─────────────────────────────────────────────────────────────────────────────
-def test_cpu_command_preserves_phase3_baseline():
-    m = MGR()
-    assert m.build_command("cpu") == CPU_BASELINE
+def _mk_bins(tmp_path, cpu: bool, gpu: bool):
+    """Controlled llama-server.exe stubs + a manager pointing at them.
+
+    The binaries are made explicit so these tests are deterministic regardless
+    of which builds happen to exist on the machine (the dedicated CPU build
+    lives in a temp dir that may be cleaned).
+    """
+    cpu_p = tmp_path / "cpu" / "llama-server.exe"
+    gpu_p = tmp_path / "gpu" / "llama-server.exe"
+    cpu_p.parent.mkdir(parents=True, exist_ok=True)
+    gpu_p.parent.mkdir(parents=True, exist_ok=True)
+    if cpu:
+        cpu_p.write_bytes(b"x")
+    if gpu:
+        gpu_p.write_bytes(b"x")
+    m = MGR(cpu_bin=str(cpu_p), gpu_bin=str(gpu_p),
+            log_path=str(tmp_path / "llama.log"))
+    return m, cpu_p, gpu_p
+
+
+def _cpu_cmd(bin_path):
+    return [str(bin_path), "-m", ls.DEFAULT_MODEL, "--port", "8080",
+            "--host", "127.0.0.1"]
+
+
+def test_cpu_command_preserves_phase3_baseline(tmp_path):
+    m, cpu_p, _ = _mk_bins(tmp_path, cpu=True, gpu=True)
+    assert m.build_command("cpu") == _cpu_cmd(cpu_p)
+
+
+def test_cpu_command_reuses_cuda_bin_with_zero_offload_when_cpu_missing(tmp_path):
+    # Dedicated CPU build gone -> CPU-only inference runs on the CUDA build with
+    # explicit zero GPU offload (never a missing-binary WinError 2).
+    m, _, gpu_p = _mk_bins(tmp_path, cpu=False, gpu=True)
+    assert m.build_command("cpu") == _cpu_cmd(gpu_p) + ["-n-gpu-layers", "0"]
 
 
 def test_gpu_command_only_adds_offload_flag():
@@ -83,7 +115,7 @@ def test_gpu_command_only_adds_offload_flag():
 # TEST 4 — CPU fallback (Part 5), unit: decision logic without real processes
 # ─────────────────────────────────────────────────────────────────────────────
 def test_cpu_fallback_when_gpu_unavailable(monkeypatch, tmp_path):
-    m = MGR(log_path=str(tmp_path / "llama.log"))
+    m, cpu_p, _ = _mk_bins(tmp_path, cpu=True, gpu=True)
     launcher = {}
     captured_cmd = []
 
@@ -114,12 +146,12 @@ def test_cpu_fallback_when_gpu_unavailable(monkeypatch, tmp_path):
     assert launcher.get("ran"), "fallback did not launch a server"
     assert m.mode == "cpu"
     assert report["mode"] == "cpu"
-    assert captured_cmd and captured_cmd[0] == CPU_BASELINE
+    assert captured_cmd and captured_cmd[0] == _cpu_cmd(cpu_p)
     assert "reason" in m.evidence  # GPU failure is never hidden
 
 
 def test_prefer_gpu_false_goes_straight_to_cpu(monkeypatch, tmp_path):
-    m = MGR(log_path=str(tmp_path / "llama.log"))
+    m, cpu_p, _ = _mk_bins(tmp_path, cpu=True, gpu=True)
     captured_cmd = []
 
     class _DummyProc:
@@ -133,7 +165,7 @@ def test_prefer_gpu_false_goes_straight_to_cpu(monkeypatch, tmp_path):
     monkeypatch.setattr(m, "_poll_health", lambda port=None, timeout_s=90.0: True)
     r = m.start(prefer_gpu=False)
     assert r["mode"] == "cpu"
-    assert captured_cmd[0] == CPU_BASELINE
+    assert captured_cmd[0] == _cpu_cmd(cpu_p)
 
 
 # ─────────────────────────────────────────────────────────────────────────────

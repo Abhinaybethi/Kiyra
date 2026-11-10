@@ -33,17 +33,39 @@ class Utterance:
 
 
 class EnergyVAD:
-    """Configurable energy-based voice activity detection."""
+    """Configurable energy-based voice activity detection.
+
+    With ``adaptive=True`` the absolute thresholds act as a *floor* only: the
+    detector tracks the microphone's noise floor and requires speech to rise
+    meaningfully above it. A fixed threshold cannot work on real mics — a room
+    with a ~0.02 RMS noise floor sits *above* a 0.015 absolute start threshold,
+    so noise is classified as speech forever, utterances never end on silence,
+    and every one runs to the 12s cap before transcribing to garbage.
+    """
 
     def __init__(
         self,
         sample_rate: int = 16000,
         speech_start_threshold: float = 0.015,
         silence_rearm_threshold: float = None,  # hysteresis: stay voiced until lower
+        adaptive: bool = False,
+        noise_floor_seed: float = 0.05,
+        noise_floor_ratio: float = 2.2,
+        adapt_down: float = 0.3,
+        adapt_up: float = 0.0005,
     ):
         self.sample_rate = sample_rate
         self.start_threshold = speech_start_threshold
         self.rearm_threshold = silence_rearm_threshold or (speech_start_threshold * 0.6)
+        self.adaptive = adaptive
+        self.noise_floor_ratio = noise_floor_ratio
+        self.adapt_down = adapt_down
+        self.adapt_up = adapt_up
+        # Seed the floor ABOVE a plausible noise level so quiet frames are
+        # classified as non-speech at startup — that is what lets the estimate
+        # adapt *down* to the true floor instead of deadlocking (if the seed
+        # were below the floor, noise would read as speech and never update).
+        self.noise_floor = max(noise_floor_seed, self.start_threshold)
 
     @staticmethod
     def rms(frame: np.ndarray) -> float:
@@ -51,12 +73,28 @@ class EnergyVAD:
             return 0.0
         return float(np.sqrt(np.mean(np.square(frame.astype(np.float64)))))
 
+    def thresholds(self) -> tuple[float, float]:
+        """Effective (start, rearm) thresholds, adapted to the noise floor."""
+        if not self.adaptive:
+            return self.start_threshold, self.rearm_threshold
+        scaled = self.noise_floor * self.noise_floor_ratio
+        start = max(self.start_threshold, scaled)
+        rearm = max(self.rearm_threshold, scaled * 0.6)
+        return start, rearm
+
     def is_speech(self, frame: np.ndarray, currently_voiced: bool) -> bool:
         """Speech state with hysteresis to avoid flapping on noisy boundaries."""
         rms = self.rms(frame)
+        if self.adaptive:
+            # Track the floor down quickly toward quiet frames and relax upward
+            # very slowly, so a speaker's own voice barely moves it within an
+            # utterance but a changing room adapts over seconds.
+            rate = self.adapt_down if rms < self.noise_floor else self.adapt_up
+            self.noise_floor += rate * (rms - self.noise_floor)
+        start, rearm = self.thresholds()
         if currently_voiced:
-            return rms >= self.rearm_threshold
-        return rms >= self.start_threshold
+            return rms >= rearm
+        return rms >= start
 
 
 class UtteranceReceiver:
@@ -73,13 +111,22 @@ class UtteranceReceiver:
         minimum_speech_duration: float = 0.25,
         maximum_utterance_duration: float = 12.0,
         speech_start_threshold: float = 0.015,
+        vad_adaptive: bool = True,
+        noise_floor_seed: float = 0.05,
+        noise_floor_ratio: float = 2.2,
         on_utterance: Optional[Callable[[Utterance], None]] = None,
     ):
         self.sample_rate = sample_rate
         self.end_silence_ms = speech_end_silence_ms
         self.min_speech = minimum_speech_duration
         self.max_speech = maximum_utterance_duration
-        self.vad = EnergyVAD(sample_rate, speech_start_threshold=speech_start_threshold)
+        self.vad = EnergyVAD(
+            sample_rate,
+            speech_start_threshold=speech_start_threshold,
+            adaptive=vad_adaptive,
+            noise_floor_seed=noise_floor_seed,
+            noise_floor_ratio=noise_floor_ratio,
+        )
         self.on_utterance = on_utterance
 
         self._buffer = np.zeros(0, dtype=np.float32)

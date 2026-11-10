@@ -234,13 +234,22 @@ class _MixingChunkSink:
     Whisper's VAD rejects as non-speech — proven to yield empty transcripts.
     This sink instead keeps one buffer per source, pairs them positionally
     (both advance at the same 16 kHz rate, so pairing preserves each source's
-    timeline with a fixed start offset) and averages the samples, emitting a
-    single mixed stream.
+    timeline with a fixed start offset) and mixes them per chunk, emitting a
+    single stream.
 
     A source that stops feeding for > ``stale_after`` seconds is dropped from
     pairing (others keep streaming); its backlog is trimmed so memory stays
     bounded.  With only one source ever active, this degrades to that source
     alone.
+
+    Mixing is SIGNAL-SELECTIVE per chunk: a source whose chunk RMS is at or
+    above ``signal_floor`` "carries signal".  When exactly one source does, it
+    is passed through at UNITY — never averaged with a near-silent peer.
+    Averaging a solo-active mic with a near-silent loopback halves its level,
+    pushing quiet speech below the backend EnergyVAD start threshold (~0.015),
+    so utterances fragment into one-frame blips that Whisper's VAD rejects as
+    non-speech (empty transcripts).  Multiple carriers are averaged; when none
+    carry signal the active sources are averaged (near-silent either way).
     """
 
     def __init__(
@@ -249,19 +258,14 @@ class _MixingChunkSink:
         n_sources: int = 2,
         chunk_samples: int = CHUNK_SAMPLES,
         stale_after: float = 0.5,
-        source_gates: Optional[dict] = None,
+        signal_floor: float = 0.012,
         source_names: Optional[tuple] = None,
     ):
         self.on_chunk = on_chunk
         self.n_sources = n_sources
         self.chunk_samples = chunk_samples
         self.stale_after = stale_after
-        # {source_index: rms_threshold} — blocks below the gate are ZEROED
-        # (not dropped, so per-source timelines stay aligned for pairing).
-        # Align the gate with the backend EnergyVAD speech_start_threshold
-        # (0.015): gated-out mic noise can never start/extend a false
-        # utterance, while real mic speech passes through untouched.
-        self.source_gates = dict(source_gates or {})
+        self.signal_floor = signal_floor
         self.source_names = tuple(source_names) if source_names else \
             tuple(f"src{i}" for i in range(n_sources))
         self._bufs = [np.zeros(0, dtype=np.float32) for _ in range(n_sources)]
@@ -288,11 +292,6 @@ class _MixingChunkSink:
         if mono is None or mono.size == 0:
             return
         rms = float(np.sqrt(np.mean(np.square(mono.astype(np.float64)))))
-        gate = self.source_gates.get(src)
-        gated = False
-        if gate is not None and rms < gate:
-            mono = np.zeros_like(mono)
-            gated = True
         self._feed_counts[src] += 1
         now = time.monotonic()
         if now - self._last_src_diag[src] >= 2.0:
@@ -300,7 +299,7 @@ class _MixingChunkSink:
             print(
                 f"[AUDIO_CAPTURE] src={self.source_names[src]} "
                 f"frame={self._feed_counts[src]} samples={mono.size} "
-                f"rms={rms:.4f}" + (" gated=1" if gated else "")
+                f"rms={rms:.4f}"
             )
         with self._lock:
             buf = self._bufs[src]
@@ -322,12 +321,23 @@ class _MixingChunkSink:
             if i not in active and self._bufs[i].size > self.chunk_samples * 4:
                 self._bufs[i] = self._bufs[i][-self.chunk_samples:]
         while min(self._bufs[i].size for i in active) >= self.chunk_samples:
-            mixed = None
+            segs = {}
             for i in active:
-                seg = self._bufs[i][: self.chunk_samples]
+                segs[i] = self._bufs[i][: self.chunk_samples]
                 self._bufs[i] = self._bufs[i][self.chunk_samples:]
-                mixed = seg if mixed is None else mixed + seg
-            mixed = mixed / float(len(active))
+            loud = [
+                s for s in segs.values()
+                if float(np.sqrt(np.mean(np.square(s.astype(np.float64)))))
+                >= self.signal_floor
+            ]
+            if len(loud) == 1:
+                mixed = loud[0]  # solo carrier passes through at unity
+            else:
+                carriers = loud if loud else list(segs.values())
+                mixed = carriers[0].copy()
+                for s in carriers[1:]:
+                    mixed += s
+                mixed = mixed / float(len(carriers))
             wav = encode_wav_bytes(pcm16_from_float32(mixed), TARGET_SR)
             self.chunks_made += 1
             now_m = time.monotonic()

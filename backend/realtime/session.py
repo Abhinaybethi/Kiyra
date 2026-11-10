@@ -69,9 +69,10 @@ from realtime.audio import (
     encode_wav_float32,
 )
 from realtime.memory import ContextBuilder, Resolution, RetrievalCache, SessionMemory, Turn
+from realtime.formatting import plain_answer
 from realtime.question_analyzer import analyze_question
 from realtime.perf import PerformanceTracker
-from realtime.prompts import realtime_system
+from realtime.prompts import realtime_system, qtype_for_question
 from realtime.transcription import transcribe_with_lock
 from realtime.transcript import (
     InterviewTranscriptBuffer,
@@ -342,6 +343,9 @@ class LiveSession:
             minimum_speech_duration=settings.minimum_speech_duration,
             maximum_utterance_duration=settings.maximum_utterance_duration,
             speech_start_threshold=settings.speech_start_threshold,
+            vad_adaptive=settings.vad_adaptive,
+            noise_floor_seed=settings.vad_noise_floor_seed,
+            noise_floor_ratio=settings.vad_noise_floor_ratio,
         )
 
         self._transcripts = TranscriptBuffer()
@@ -411,6 +415,14 @@ class LiveSession:
         self._dropped_frames = 0
         self._start_time = time.time()
         self._audio_worker_task: Optional[asyncio.Task] = None
+        # Final-utterance handling runs on its OWN task + lock so the VAD drain
+        # loop keeps consuming audio while Whisper runs (~2-8s). Awaiting it
+        # inline stalled the loop: a question that resumed after a short pause
+        # was buffered/dropped behind the previous utterance's STT, so the tail
+        # of the question went missing ("listening feels stuck"). Serializing on
+        # the lock preserves the old one-at-a-time ordering.
+        self._utterance_task: Optional[asyncio.Task] = None
+        self._utterance_lock = asyncio.Lock()
         self._last_queue_log = 0.0
         self._last_queue_delay_ms = 0.0
         self._budget_warns: dict[str, float] = {}
@@ -619,17 +631,32 @@ class LiveSession:
 
         if utterance is not None:
             # Turn ownership: stamp the utterance with the turn that was OPEN
-            # when the VAD finalized it. STT happens inline below and can be
-            # slower than a WS `listening.start`, so the turn may rotate while
-            # this utterance is in flight. The stamp is what stops a late turn-N
-            # transcript from being appended into turn N+1.
+            # when the VAD finalized it. STT happens on a separate task (below)
+            # and can be slower than a WS `listening.start`, so the turn may
+            # rotate while this utterance is in flight. The stamp is what stops
+            # a late turn-N transcript from being appended into turn N+1.
             utterance_turn_id = self._turn_id
-            await self._handle_utterance(utterance, recv_ts,
-                                         turn_id=utterance_turn_id)
+            self._spawn_utterance_task(utterance, recv_ts, utterance_turn_id)
 
         # Partial / speculative trigger — fire-and-forget (drain loop never blocks)
         if self._receiver.is_voiced:
             self._maybe_trigger_partial()
+
+    def _spawn_utterance_task(self, utterance, recv_ts, turn_id):
+        """Transcribe a finalized utterance OFF the VAD drain loop.
+
+        The drain loop must keep consuming frames while Whisper runs; otherwise
+        speech that follows a short pause is buffered (and, on queue overflow,
+        dropped) behind STT. Ordering is preserved by ``_utterance_lock``
+        (same one-at-a-time semantics as the previous inline await).
+        """
+        self._utterance_task = asyncio.create_task(
+            self._run_utterance(utterance, recv_ts, turn_id))
+        return self._utterance_task
+
+    async def _run_utterance(self, utterance, recv_ts, turn_id):
+        async with self._utterance_lock:
+            await self._handle_utterance(utterance, recv_ts, turn_id=turn_id)
 
     def _start_utterance_perf(self) -> PerformanceTracker:
         """Anchor a fresh monotonic profiler at audio-end for this utterance."""
@@ -935,6 +962,17 @@ class LiveSession:
             "[STT] starting samples=%d audio=%.2fs"
             % (utterance.audio.size, utterance.duration)
         )
+        _dump_dir = os.environ.get("KIYRA_AUDIO_DUMP")
+        if _dump_dir:
+            try:
+                os.makedirs(_dump_dir, exist_ok=True)
+                _p = os.path.join(
+                    _dump_dir, "utt_%d.wav" % int(time.time() * 1000))
+                with open(_p, "wb") as _f:
+                    _f.write(audio_wav)
+                print("[STT] dumped %s rms=%.4f" % (_p, utterance.rms))
+            except Exception:
+                pass
 
         stt_start = time.monotonic()
         perf.mark("stt_start")
@@ -1054,6 +1092,11 @@ class LiveSession:
 
         if self.turn.can_send:
             self._set_state(RealtimeState.READY_TO_SEND)
+            # Warm RAG on the accumulated question now that the turn is
+            # sendable, so clicking SEND reuses this retrieval (same topic +
+            # the submitted text is this exact turn ⇒ similarity 1.0) instead
+            # of paying for a fresh one on the SEND critical path.
+            self._maybe_prefetch(current)
         else:
             self._set_state(RealtimeState.LISTENING)
 
@@ -1238,7 +1281,9 @@ class LiveSession:
 
         # Prefetch RAG context as soon as we have a strong candidate, so that
         # retrieval overlaps with everything else the pipeline has to do.
-        if not is_q and confidence >= 0.6:
+        # (Previously guarded by `not is_q`, which is unreachable here — the
+        # early return above already requires `is_q`.)
+        if confidence >= 0.6:
             self._maybe_prefetch(merged)
 
         self._set_state(RealtimeState.QUESTION_CANDIDATE)
@@ -1318,6 +1363,11 @@ class LiveSession:
 
     async def _prefetch_worker(self, question: str):
         try:
+            # Prefetch runs OFF the answer's critical path (its result is only
+            # reused if it finishes before SEND), so it may use the full
+            # non-realtime ceiling instead of the 0.8s realtime one — otherwise
+            # a cold RAG call times out at 0.8s and SEND pays a fresh retrieval
+            # anyway (the `rag=800ms` lines in the live logs).
             self._prefetch_context = await asyncio.wait_for(
                 asyncio.to_thread(
                     retrieve_context_sync,
@@ -1326,7 +1376,7 @@ class LiveSession:
                     top_k=settings.realtime_top_k,
                     max_context_chars=settings.realtime_max_context_chars,
                 ),
-                timeout=settings.realtime_rag_timeout,
+                timeout=settings.rag_timeout,
             )
         except asyncio.CancelledError:
             raise
@@ -1335,13 +1385,19 @@ class LiveSession:
 
     async def _bounded_rag(self, question: str,
                            resolution: Optional[Resolution] = None,
-                           perf: Optional[PerformanceTracker] = None
+                           perf: Optional[PerformanceTracker] = None,
+                           top_k: Optional[int] = None,
+                           max_context_chars: Optional[int] = None,
+                           qtype: str = "conceptual"
                            ) -> tuple[str, str]:
         """Cache → prefetch → hard-bounded retrieval. Never raises.
 
         Returns (context, rag_note). Slow RAG can never stall the answer:
         on timeout we answer without context. Cache reuse requires a topic
         match + query similarity — otherwise a fresh retrieval runs.
+
+        ``top_k``, ``max_context_chars`` and ``qtype`` allow per-question-type
+        retrieval depth (coding pulls more chunks for code examples).
         """
         try:
             memory = self._get_memory()
@@ -1390,8 +1446,11 @@ class LiveSession:
                     retrieve_context_sync,
                     self.session.profile.id,
                     question,
-                    top_k=settings.realtime_top_k,
-                    max_context_chars=settings.realtime_max_context_chars,
+                    top_k=top_k or settings.realtime_top_k,
+                    max_context_chars=max_context_chars
+                    or settings.realtime_max_context_chars,
+                    qtype=qtype,
+                    db=self.db,
                 ),
                 timeout=settings.realtime_rag_timeout,
             )
@@ -1604,6 +1663,20 @@ class LiveSession:
             project_active=project_active,
         )
         self._last_analysis = analysis
+
+        # Question-type routing: drives length target, RAG depth, temperature,
+        # and output-token cap. Coding gets more tokens (code blocks), SQL gets
+        # determinism (low temp), conceptual stays tight for speed.
+        qtype = qtype_for_question(resolution.resolved_question or question)
+        analysis.qtype = qtype  # surface to UI / logs
+        per_type_max = settings.answer_max_tokens_by_type.get(
+            qtype, settings.answer_max_tokens)
+        per_type_temp = settings.temperature_by_type.get(
+            qtype, settings.temperature_by_type["default"])
+        per_type_top_k = settings.realtime_top_k_by_type.get(
+            qtype, settings.realtime_top_k)
+        per_type_ctx_chars = settings.realtime_max_context_chars_by_type.get(
+            qtype, settings.realtime_max_context_chars)
         latency = {
             "stt_ms": 0.0, "detect_ms": 0.0, "rag_ms": 0.0,
             "llm_ttft_ms": 0.0, "total_ms": 0.0,
@@ -1646,7 +1719,9 @@ class LiveSession:
             self._set_state(RealtimeState.RETRIEVING_CONTEXT)
 
             context, rag_note = await self._bounded_rag(
-                question, resolution=resolution, perf=perf)
+                question, resolution=resolution, perf=perf,
+                top_k=per_type_top_k, max_context_chars=per_type_ctx_chars,
+                qtype=qtype)
             latency["rag_ms"] = perf.durations.get("rag_ms") or 0.0
             self._prefetch_context = None
             self._prefetch_question = None
@@ -1671,7 +1746,8 @@ class LiveSession:
 
             prompt_start = time.monotonic()
             system = realtime_system(
-                settings.answer_mode, requires_code=bool(analysis.requires_code))
+                settings.answer_mode, requires_code=bool(analysis.requires_code),
+                qtype=qtype)
             user_prompt = ContextBuilder.assemble(
                 question=question,
                 candidate_name=self.session.profile.name or "the candidate",
@@ -1681,6 +1757,7 @@ class LiveSession:
                 sections=sections,
                 analysis=analysis,
                 project_evidence=project_evidence or None,
+                qtype=qtype,
             )
             if note:
                 user_prompt = f"{user_prompt}\n\n{note}"
@@ -1698,8 +1775,8 @@ class LiveSession:
                     {"role": "user", "content": user_prompt},
                 ],
                 stream=True,
-                temperature=0.5,
-                max_tokens=settings.realtime_max_output_tokens,
+                temperature=per_type_temp,
+                max_tokens=per_type_max,
                 request_id=request_id,
             )
             perf.span("llm_request_ms", llm_call_t)
@@ -1773,7 +1850,10 @@ class LiveSession:
             if self._current_request_id != request_id:
                 return
 
-            answer = "".join(tokens).strip()
+            # Strip markdown decoration before it reaches the overlay: the
+            # model emits **Thesis:** labels and inline backticks that render
+            # as literal punctuation in the answer pane.
+            answer = plain_answer("".join(tokens))
             if _trace is not None:
                 print(
                     "[CODE-TRACE] first_chunk=%r fenced_so_far=%s chunk_count=%s "
@@ -1997,6 +2077,18 @@ class LiveSession:
         )
         if analysis.intent or analysis.requires_code:
             self._last_analysis = analysis
+
+        # Question-type routing for speculative path too.
+        qtype = qtype_for_question(resolution.resolved_question or question)
+        analysis.qtype = qtype
+        per_type_top_k = settings.realtime_top_k_by_type.get(
+            qtype, settings.realtime_top_k)
+        per_type_ctx_chars = settings.realtime_max_context_chars_by_type.get(
+            qtype, settings.realtime_max_context_chars)
+        per_type_temp = settings.temperature_by_type.get(
+            qtype, settings.temperature_by_type["default"])
+        per_type_max = settings.answer_max_tokens_by_type.get(
+            qtype, settings.answer_max_tokens)
         try:
             self._current_request_id = request_id
             print(
@@ -2025,7 +2117,9 @@ class LiveSession:
             self._set_state(RealtimeState.RETRIEVING_CONTEXT)
 
             context, rag_note = await self._bounded_rag(
-                question, resolution=resolution, perf=spec_perf)
+                question, resolution=resolution, perf=spec_perf,
+                top_k=per_type_top_k, max_context_chars=per_type_ctx_chars,
+                qtype=qtype)
             project_evidence = ""
             if analysis.project_related:
                 ev, gh_note, _pi = await self._github_evidence(
@@ -2044,7 +2138,8 @@ class LiveSession:
 
             prompt_start = time.monotonic()
             system = realtime_system(
-                settings.answer_mode, requires_code=bool(analysis.requires_code))
+                settings.answer_mode, requires_code=bool(analysis.requires_code),
+                qtype=qtype)
             user_prompt = ContextBuilder.assemble(
                 question=question,
                 candidate_name=self.session.profile.name or "the candidate",
@@ -2054,6 +2149,7 @@ class LiveSession:
                 sections=sections,
                 analysis=analysis,
                 project_evidence=project_evidence or None,
+                qtype=qtype,
             )
             spec_perf.mark("prompt_construction")
             spec_perf.span("prompt_ms", prompt_start)
@@ -2066,8 +2162,8 @@ class LiveSession:
                     {"role": "user", "content": user_prompt},
                 ],
                 stream=True,
-                temperature=0.5,
-                max_tokens=settings.realtime_max_output_tokens,
+                temperature=per_type_temp,
+                max_tokens=per_type_max,
                 request_id=request_id,
             )
             spec_perf.span("llm_request_ms", llm_call_t)
@@ -2137,7 +2233,7 @@ class LiveSession:
 
             if not abandoned and self._spec_released:
                 await self._flush_spec(request_id, spec_perf, llm_call_t)
-                answer = "".join(self._spec_tokens).strip()
+                answer = plain_answer("".join(self._spec_tokens))
                 self._answers_generated += 1
                 spec_perf.mark("generation_complete")
                 spec_perf.span("generation_ms", first_token_at or llm_call_t)
@@ -2446,6 +2542,25 @@ class LiveSession:
         # 2. Freeze input for this turn, and bank how long the user actually spoke.
         if self._turn_start_ts is not None:
             self._turn_listen_ms = (time.monotonic() - self._turn_start_ts) * 1000
+
+        # 2a. A finalized utterance may still be transcribing (STT runs on its
+        # own task so the VAD drain loop never blocks). Let it land BEFORE we
+        # freeze the turn: once paused, `TurnBuffer.append()` returns None and
+        # the segment is dropped — so a fast SEND would silently lose the very
+        # question being asked. Bounded (and shielded) so a stuck STT can never
+        # wedge SEND; the buffer snapshot below still owns whatever landed.
+        task = getattr(self, "_utterance_task", None)
+        if task is not None and not task.done():
+            try:
+                await asyncio.wait_for(
+                    asyncio.shield(task),
+                    timeout=settings.turn_final_flush_timeout,
+                )
+            except asyncio.TimeoutError:
+                print("[TURN] in-flight utterance slow; proceeding to SEND")
+            except Exception as e:
+                print(f"[TURN] in-flight utterance errored before SEND: {e}")
+
         self.turn.pause()
 
         # 3. Bounded final flush so trailing speech is not silently discarded.
@@ -2663,7 +2778,8 @@ class LiveSession:
 
     def _cancel_inflight_tasks(self):
         for task in (self._answer_task, self._prefetch_task, self._partial_task,
-                     self._spec_task, self._audio_worker_task):
+                     self._spec_task, self._audio_worker_task,
+                     self._utterance_task):
             if task and not task.done():
                 task.cancel()
 

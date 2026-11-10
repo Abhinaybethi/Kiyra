@@ -25,6 +25,10 @@ import tkinter as tk
 DESKTOP_DIR = Path(__file__).resolve().parents[2] / "desktop"
 sys.path.insert(0, str(DESKTOP_DIR))
 
+# Resize at a point far off the visible desktop so the suite never covers the
+# developer's screen; the window stays mapped so geometry still computes.
+_OFF = "+20000+20000"
+
 LONG_ANSWER = (
     "Streaming answers must stay visually stable: the container is created "
     "once and only its content grows. No blinking, no reset, no reflow per "
@@ -165,9 +169,9 @@ def test_width_resize_during_streaming_preserves_stable_widget(overlay):
         app._ui_stream_answer(delta, append=True)
     _pump(root)
 
-    root.geometry(f"{root.winfo_width() - 90}x640+60+60")
+    root.geometry(f"{root.winfo_width() - 90}x640{_OFF}")
     _pump(root)
-    root.geometry(f"{root.winfo_width() + 140}x640+60+60")
+    root.geometry(f"{root.winfo_width() + 140}x640{_OFF}")
     _pump(root)
 
     assert app._stable_answer_txt is txt0, "width change recreated the widget"
@@ -289,7 +293,7 @@ def test_long_answer_remains_vertically_scrollable(overlay):
 
     # Shrink to a narrow height so content MUST exceed the visible area.
     target_w = 300
-    root.geometry(f"{target_w}x380+60+60")
+    root.geometry(f"{target_w}x380{_OFF}")
     for _ in range(60):  # wait until the window manager applies the size
         _pump(root, rounds=1)
         if root.winfo_width() <= target_w + 10 and root.winfo_height() <= 410:

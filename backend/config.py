@@ -52,13 +52,31 @@ class Settings(BaseSettings):
 
     # VAD / utterance segmentation
     speech_start_threshold: float = 0.015  # RMS energy to consider speech active
-    speech_end_silence_ms: int = 300  # Trailing silence before finalizing an utterance (150–250 target zone)
+    # Adaptive VAD: track the mic's noise floor so a room noisier than the
+    # absolute threshold doesn't read as perpetual speech (never-ending
+    # utterances, empty transcripts). Seed sits above typical room noise; the
+    # detector adapts down to the real floor and requires speech to exceed it.
+    vad_adaptive: bool = True
+    vad_noise_floor_seed: float = 0.05  # initial floor estimate (RMS)
+    vad_noise_floor_ratio: float = 2.2  # speech must exceed floor * this
+    speech_end_silence_ms: int = 150  # Trailing silence before finalizing an utterance (150–250 target zone)
     minimum_speech_duration: float = 0.25  # Utterances shorter than this are noise
     maximum_utterance_duration: float = 12.0  # Hard cap — force-finalize long speech
-    stt_timeout: float = 8.0  # Max allowed STT wall time before we give up
+    stt_timeout: float = 5.0  # Max allowed STT wall time before we give up
     # One bounded retry after stt_timeout. Absorbs a cold Whisper load without
     # ever discarding the candidate's audio (losing speech is unrecoverable).
     stt_retry_timeout: float = 25.0
+
+    # Whisper model size: tiny (fastest, ~40MB), base (default, ~140MB),
+    # small (~500MB), medium (~1.5GB). Override with KIYRA_TRANSCRIPTION_MODEL.
+    # Smaller = faster TTFT, lower accuracy; larger = slower, more accurate.
+    transcription_model: str = "base"  # faster-whisper base model (~140MB)
+
+    # Partial / speculative STT interval — how often to run speculative
+    # transcription on accumulated speech. Lower = faster feedback but more
+    # CPU load. Override with KIYRA_REALTIME_PARTIAL_INTERVAL_S.
+    realtime_partial_interval_s: float = 1.0  # was 1.2 — faster partial loop
+    realtime_partial_speech_s: float = 1.0  # fire first partial after 1s of speech
 
     # ── Interview Listening Mode (Phase 5.4) ─────────────────────────────
     # The user, not VAD, decides where the question ends. A turn is only
@@ -83,16 +101,89 @@ class Settings(BaseSettings):
 
     # Answer generation (real-time mode)
     answer_generation_timeout: int = 15  # Max 15s between tokens once streaming
-    realtime_first_token_timeout: int = 90  # First-token deadline: CPU-only llama can need ~75s for a cold prompt eval
-    answer_mode: str = "short"  # short | medium | detailed (real-time default: short)
-    answer_max_tokens: int = 320  # Cap answer length to keep TTFT low (legacy / detailed path)
-    realtime_max_output_tokens: int = 140  # Realtime cap — short first-answer, low prompt cost
-    rag_top_k: int = 3  # Context chunks retrieved per question (non-realtime)
-    rag_max_context_chars: int = 2000  # Cap RAG context so prompts stay lean (non-realtime)
+    realtime_first_token_timeout: int = 20  # First-token deadline — Ollama TTFT is ~2-3s; CPU llama cold can need ~75s
+    answer_mode: str = "detailed"  # short | medium | detailed (real-time default: detailed)
+    answer_max_tokens: int = 260  # Default cap — keeps TTFT low (legacy / detailed path)
+
+    # Per-question-type output caps. Coding answers need more tokens for code
+    # blocks + complexity + edge cases; conceptual answers stay tight for speed.
+    answer_max_tokens_by_type: dict = {
+        "conceptual": 220,   # tight, speakable answers
+        "coding": 420,       # code block + complexity + example + edge cases
+        "behavioral": 260,   # STAR framing, personal experience
+        "debugging": 340,    # root cause + fix + prevention
+        "sql": 280,          # query + explanation + optimization
+        "default": 260,
+    }
+    realtime_max_output_tokens: int = 260  # Realtime default cap
+
+    # Standalone RAG defaults (kept for backward compatibility with callers
+    # that don't pass per-type values). Per-type overrides live in the
+    # _by_type dicts below.
+    rag_top_k: int = 6  # Context chunks retrieved per question (default)
+    rag_max_context_chars: int = 2500  # Cap RAG context (default)
+
+    # Per-question-type RAG depth. Coding pulls more chunks (code examples,
+    # multiple approaches); conceptual stays lean for speed.
+    rag_top_k_by_type: dict = {
+        "conceptual": 4,
+        "coding": 8,
+        "behavioral": 4,
+        "debugging": 6,
+        "sql": 5,
+        "default": 6,
+    }
+    rag_max_context_chars: int = 2000  # Default cap
+    rag_max_context_chars_by_type: dict = {
+        "conceptual": 1600,
+        "coding": 3200,   # more code snippets fit
+        "behavioral": 1800,
+        "debugging": 2400,
+        "sql": 2200,
+        "default": 2000,
+    }
     rag_timeout: float = 3.0  # Hard ceiling for non-realtime RAG
-    realtime_rag_timeout: float = 0.8  # Real-time ceiling — slow RAG must never block first answer
-    realtime_top_k: int = 2  # Realtime retrieval depth (small = fast = lean prompt)
-    realtime_max_context_chars: int = 900  # Realtime RAG context budget
+    realtime_rag_timeout: float = 1.5  # Real-time ceiling — slow RAG must never block first answer
+    realtime_top_k: int = 6  # Realtime retrieval depth (default)
+    realtime_top_k_by_type: dict = {
+        "conceptual": 4,
+        "coding": 8,
+        "behavioral": 4,
+        "debugging": 6,
+        "sql": 5,
+        "default": 6,
+    }
+    realtime_max_context_chars: int = 2500  # Realtime RAG context budget (default)
+    realtime_max_context_chars_by_type: dict = {
+        "conceptual": 1800,
+        "coding": 3600,
+        "behavioral": 2000,
+        "debugging": 2800,
+        "sql": 2400,
+        "default": 2500,
+    }
+
+    # Per-question-type temperature. Coding needs determinism (low), conceptual
+    # can be a touch more expressive (higher).
+    temperature_by_type: dict = {
+        "conceptual": 0.5,
+        "coding": 0.2,
+        "behavioral": 0.6,
+        "debugging": 0.3,
+        "sql": 0.2,
+        "default": 0.5,
+    }
+
+    # Keywords that signal a coding question — routes to the coding answer
+    # pipeline (code blocks, complexity, edge cases).
+    coding_keywords: list = [
+        "implement", "write code", "function", "algorithm", "complexity",
+        "big o", "time complexity", "space complexity", "code example",
+        "code block", "snippet", "execute", "runtime", "compile", "debug",
+        "stack overflow", "segmentation fault", "pointer", "recursion",
+        "data structure", "array", "linked list", "tree", "graph", "heap",
+        "sorting", "searching", "dynamic programming", "greedy", "backtracking",
+    ]
 
     # Session memory + retrieval cache (Phase 3)
     realtime_memory_turns: int = 6  # Turns kept in the live context window

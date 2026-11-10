@@ -240,11 +240,13 @@ def test_window_geometry_unchanged_by_styling(overlay):
 
 
 @needs_win
-def test_fixed_560x640_logical_size_preserved(overlay):
-    """Design size is 560x640 logical px, scaled by DPI. Tk's geometry() sizes
-    the CLIENT area, so the shell window is that plus frame decorations."""
+def test_fixed_design_size_logical_preserved(overlay):
+    """Design size is the reference-recreation size in logical px, scaled by
+    DPI. Tk's geometry() sizes the CLIENT area, so the shell window is that
+    plus frame decorations."""
     overlay.root.update_idletasks()
-    expected = (int(560 * overlay._ui_scale), int(640 * overlay._ui_scale))
+    expected = (int(so.DESIGN_WIDTH * overlay._ui_scale),
+                int(so.DESIGN_HEIGHT * overlay._ui_scale))
     assert (overlay.root.winfo_width(), overlay.root.winfo_height()) == expected
 
     overlay._apply_stealth_window_styles(reason="test-size")

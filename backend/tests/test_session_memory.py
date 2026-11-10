@@ -83,6 +83,16 @@ def _make_session_row():
     )
 
 
+@pytest.fixture(autouse=True)
+def _generous_rag_timeout(monkeypatch):
+    # _bounded_rag hard-caps fresh retrieval at settings.realtime_rag_timeout
+    # (0.8s in production). Under full-suite load, asyncio.to_thread scheduling
+    # can exceed that ceiling and flip an instant fake retrieval into
+    # "no-rag-timeout". Raise it for these tests so wall-clock jitter — not
+    # behaviour — decides the outcome.
+    monkeypatch.setattr(settings, "realtime_rag_timeout", 30.0)
+
+
 def make_session(provider, db=None, session_row=None):
     session = session_row or _make_session_row()
     if db is None:
@@ -516,7 +526,7 @@ def test_system_prompt_followup_voice_grounding_rules():
     assert "PREVIOUS CONTEXT" in system
     assert "RECENT CONVERSATION" in system
     assert "NEVER invent" in system
-    assert "Under 180 words" in system
+    assert "150-220 words" in system
 
     prompt = ContextBuilder.build(
         question="Why did you choose that approach?",
@@ -542,6 +552,39 @@ def test_system_prompt_coding_override_only_when_requires_code():
     assert "CODING QUESTION OVERRIDE" in coding
     assert "MUST contain a fenced code block" in coding
     assert "plain text only" in coding
+
+
+def test_detailed_mode_length_rule_is_stated_where_the_model_reads_last():
+    """Detailed mode used to promise 250-400 words but produce ~140.
+
+    The ANSWER REQUIREMENTS block is the last thing in the user prompt, and it
+    only said "follow the length rules from the system prompt" while asking for
+    "a brief explanation or example" — small models obeyed the word "brief".
+    """
+    from realtime.memory import _answer_requirements
+    from realtime.question_analyzer import QuestionAnalysis
+
+    system = realtime_system("detailed")
+    assert "150-220 words" in system
+    assert "Hard minimum 130 words" in system
+
+    concept = QuestionAnalysis(intent="technical_concept", question_type="technical")
+
+    original = settings.answer_mode
+    try:
+        settings.answer_mode = "detailed"
+        rules = _answer_requirements(concept)
+        assert "brief explanation" not in rules
+        assert "detailed mode means 150-220 words" in rules
+        # The mode-specific rule is the final line of the block.
+        assert rules.rstrip().endswith("NOT enough.")
+
+        settings.answer_mode = "short"
+        short_rules = _answer_requirements(concept)
+        assert "2-6 sentences" in short_rules
+        assert "150-220 words" not in short_rules
+    finally:
+        settings.answer_mode = original
 
 
 # ── TEST 12: answer survives retrieval + persistence failures ──────────────

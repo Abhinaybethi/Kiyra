@@ -79,6 +79,22 @@ async def create_job(
     return jd
 
 
+@router.post("/{jd_id}/activate", response_model=JobDescriptionResponse)
+def activate_job(jd_id: int, db: Session = Depends(get_db)):
+    """Make an existing job description the active one for this profile."""
+    profile = get_profile(db)
+    jd = db.query(JobDescription).filter_by(id=jd_id, profile_id=profile.id).first()
+    if not jd:
+        raise HTTPException(status_code=404, detail="Job description not found")
+
+    db.query(JobDescription).filter_by(
+        profile_id=profile.id, is_active=True).update({"is_active": False})
+    jd.is_active = True
+    db.commit()
+    db.refresh(jd)
+    return jd
+
+
 @router.delete("/{jd_id}", response_model=OKResponse)
 def delete_job(jd_id: int, db: Session = Depends(get_db)):
     profile = get_profile(db)

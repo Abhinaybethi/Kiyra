@@ -82,6 +82,77 @@ class ScreenshotCapture:
         )
         return ScreenshotInput(image_bytes=data, mime="image/png")
 
+    # ── Region capture (manual selection) ───────────────────────────────────
+    def capture_region(self, bbox) -> ScreenshotInput:
+        """Capture a specific rectangular region (left, top, right, bottom).
+
+        Falls back to full-screen capture if the region is invalid.
+        """
+        if self.prefer_pil and ImageGrab is not None:
+            try:
+                return self._capture_region_pil(bbox)
+            except Exception as e:
+                print(f"[SCREENSHOT] PIL region capture failed ({e}); using GDI fallback")
+        return self._capture_region_gdi(bbox)
+
+    def _capture_region_pil(self, bbox) -> ScreenshotInput:
+        left, top, right, bottom = bbox
+        if right <= left or bottom <= top:
+            raise ValueError(f"Invalid region bbox: {bbox}")
+        image = ImageGrab.grab(bbox=(left, top, right, bottom), all_screens=True)
+        bio = io.BytesIO()
+        image.save(bio, format="PNG")
+        data = bio.getvalue()
+        print(
+            "[SCREENSHOT] PIL region captured size=%dB %dx%d at %s"
+            % (len(data), image.width, image.height, bbox)
+        )
+        return ScreenshotInput(image_bytes=data, mime="image/png")
+
+    def _capture_region_gdi(self, bbox) -> ScreenshotInput:
+        if sys.platform != "win32":
+            raise RuntimeError("GDI screenshot capture requires Windows")
+        import ctypes
+        from ctypes import wintypes
+
+        user32 = ctypes.windll.user32
+        gdi32 = ctypes.windll.gdi32
+
+        left, top, right, bottom = bbox
+        w = right - left
+        h = bottom - top
+        if w <= 0 or h <= 0:
+            raise ValueError(f"Invalid region bbox: {bbox}")
+
+        SRCCOPY = 0x00CC0020
+        hdc_screen = user32.GetDC(0)
+        try:
+            hdc_mem = gdi32.CreateCompatibleDC(hdc_screen)
+            hbmp = gdi32.CreateCompatibleBitmap(hdc_screen, w, h)
+            old = gdi32.SelectObject(hdc_mem, hbmp)
+            try:
+                ok = gdi32.BitBlt(hdc_mem, 0, 0, w, h, hdc_screen, left, top, SRCCOPY)
+                if not ok:
+                    raise OSError("BitBlt region capture failed")
+                bmi = struct.pack("<IiiHHIIiiII", 40, w, -h, 1, 32, 0, 0, 0, 0, 0, 0)
+                raw = ctypes.create_string_buffer(w * h * 4)
+                lines = gdi32.GetDIBits(hdc_mem, hbmp, 0, h, raw, bmi, 0)
+                if lines != h:
+                    raise OSError(f"GetDIBits returned {lines} of {h} rows")
+                header = struct.pack("<2sIHHI", b"BM", 54 + len(raw.raw), 0, 0, 54)
+                data = header + bmi + raw.raw
+            finally:
+                gdi32.SelectObject(hdc_mem, old)
+                gdi32.DeleteObject(hbmp)
+                gdi32.DeleteDC(hdc_mem)
+        finally:
+            user32.ReleaseDC(0, hdc_screen)
+        print(
+            "[SCREENSHOT] GDI region captured %dB %dx%d at %s"
+            % (len(data), w, h, bbox)
+        )
+        return ScreenshotInput(image_bytes=data, mime="image/bmp")
+
     # ── GDI fallback (dependency-free, emits a BMP) ─────────────────────────
     def _capture_gdi_bmp(self) -> ScreenshotInput:
         if sys.platform != "win32":
