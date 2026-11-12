@@ -97,6 +97,64 @@ class CandidateProfile(Base):
     interview_sessions: Mapped[list["InterviewSession"]] = relationship(back_populates="profile")
 
 
+# ── Authentication (desktop email-OTP sign-in) ─────────────────────────────
+
+class AuthAccount(Base):
+    """A desktop user account: full name + phone + email, verified by OTP."""
+
+    __tablename__ = "auth_accounts"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    full_name: Mapped[str] = mapped_column(String(200))
+    phone: Mapped[str] = mapped_column(String(32))
+    email: Mapped[str] = mapped_column(String(255), unique=True, index=True)
+    is_verified: Mapped[bool] = mapped_column(Boolean, default=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    last_login_at: Mapped[Optional[datetime]] = mapped_column(DateTime)
+
+    sessions: Mapped[list["AuthSession"]] = relationship(
+        back_populates="account", cascade="all, delete-orphan")
+
+
+class AuthOtp(Base):
+    """A hashed one-time code. Plaintext never touches the database."""
+
+    __tablename__ = "auth_otps"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    email: Mapped[str] = mapped_column(String(255))
+    purpose: Mapped[str] = mapped_column(String(20), default="login")  # register | login
+    code_hash: Mapped[str] = mapped_column(String(128))
+    attempts: Mapped[int] = mapped_column(Integer, default=0)
+    max_attempts: Mapped[int] = mapped_column(Integer, default=5)
+    expires_at: Mapped[datetime] = mapped_column(DateTime)
+    consumed_at: Mapped[Optional[datetime]] = mapped_column(DateTime)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+
+    __table_args__ = (
+        Index("ix_auth_otps_email", "email"),
+        Index("ix_auth_otps_created", "created_at"),
+    )
+
+
+class AuthSession(Base):
+    """A bearer session issued after a successful OTP verification."""
+
+    __tablename__ = "auth_sessions"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    account_id: Mapped[int] = mapped_column(ForeignKey("auth_accounts.id"))
+    token_hash: Mapped[str] = mapped_column(String(128), unique=True, index=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    expires_at: Mapped[datetime] = mapped_column(DateTime)
+    last_seen_at: Mapped[Optional[datetime]] = mapped_column(DateTime)
+    revoked_at: Mapped[Optional[datetime]] = mapped_column(DateTime)
+
+    account: Mapped["AuthAccount"] = relationship(back_populates="sessions")
+
+
 # ── Resume ─────────────────────────────────────────────────────────────────
 
 class Resume(Base):

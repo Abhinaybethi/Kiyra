@@ -62,7 +62,7 @@ class Settings(BaseSettings):
     speech_end_silence_ms: int = 150  # Trailing silence before finalizing an utterance (150–250 target zone)
     minimum_speech_duration: float = 0.25  # Utterances shorter than this are noise
     maximum_utterance_duration: float = 12.0  # Hard cap — force-finalize long speech
-    stt_timeout: float = 5.0  # Max allowed STT wall time before we give up
+    stt_timeout: float = 3.0  # Max allowed STT wall time before we give up
     # One bounded retry after stt_timeout. Absorbs a cold Whisper load without
     # ever discarding the candidate's audio (losing speech is unrecoverable).
     stt_retry_timeout: float = 25.0
@@ -101,7 +101,7 @@ class Settings(BaseSettings):
 
     # Answer generation (real-time mode)
     answer_generation_timeout: int = 15  # Max 15s between tokens once streaming
-    realtime_first_token_timeout: int = 20  # First-token deadline — Ollama TTFT is ~2-3s; CPU llama cold can need ~75s
+    realtime_first_token_timeout: int = 10  # First-token deadline — Ollama TTFT is ~2-3s
     answer_mode: str = "detailed"  # short | medium | detailed (real-time default: detailed)
     answer_max_tokens: int = 260  # Default cap — keeps TTFT low (legacy / detailed path)
 
@@ -143,7 +143,7 @@ class Settings(BaseSettings):
         "default": 2000,
     }
     rag_timeout: float = 3.0  # Hard ceiling for non-realtime RAG
-    realtime_rag_timeout: float = 1.5  # Real-time ceiling — slow RAG must never block first answer
+    realtime_rag_timeout: float = 0.5  # Real-time ceiling — slow RAG must never block first answer
     realtime_top_k: int = 6  # Realtime retrieval depth (default)
     realtime_top_k_by_type: dict = {
         "conceptual": 4,
@@ -200,6 +200,30 @@ class Settings(BaseSettings):
     realtime_rag_budget_ms: int = 500
     realtime_ttft_budget_ms: int = 800
     realtime_first_answer_budget_ms: int = 1500
+
+    # ─── Authentication (desktop sign-in) ────────────────────────────────────
+    # Real-world email-OTP auth for the desktop overlay. Accounts are created
+    # with full name + phone + email; every sign-in is email + a 6-digit OTP.
+    auth_enabled: bool = True                # False blocks new sign-ins (existing sessions still work)
+    auth_otp_ttl_seconds: int = 600          # OTP lifetime (10 minutes)
+    auth_otp_length: int = 6                 # digits in the OTP
+    auth_otp_max_attempts: int = 5           # wrong guesses before the code dies
+    auth_otp_resend_cooldown_seconds: int = 30
+    auth_otp_max_per_hour: int = 6           # abuse ceiling per email
+    auth_session_days: int = 30              # desktop session lifetime
+    auth_otp_secret: str = ""                # HMAC key; random per process if unset
+    auth_dev_otp: bool = False               # force OTP into the API response (dev only)
+
+    # SMTP transport. When unset, the OTP is printed to the backend console and
+    # returned as ``dev_code`` so a local install works with zero config.
+    smtp_host: str = ""
+    smtp_port: int = 587
+    smtp_username: str = ""
+    smtp_password: str = ""
+    smtp_from: str = ""
+    smtp_use_tls: bool = True
+    smtp_use_ssl: bool = False
+    smtp_timeout: float = 15.0
 
     # ─── Stealth Mode (Desktop App) ───────────────────────────────────────────
     stealth_window_alpha: float = 0.92  # 92% opacity (balances visibility + stealth)

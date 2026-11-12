@@ -2,7 +2,7 @@
 
 Shown *before* the main overlay window:
 
-  1. Sign in        — local access-code gate (no backend accounts needed)
+  1. Sign in        — email one-time code (full name + phone on first signup)
   2. Job description — pick a saved one or add a new one, then activate it
   3. Instructions   — how to drive the overlay, then "Start Kiyra"
 
@@ -25,7 +25,9 @@ import os
 import queue
 import sys
 import threading
+import time
 import tkinter as tk
+from pathlib import Path
 from typing import Optional
 
 # ── Palette (mirrors stealth_overlay's dark slate / green-accent tokens) ─────
@@ -52,10 +54,9 @@ def _fs(size) -> int:
     """Apply the global +2pt font bump to an integer point size."""
     return int(size) + FONT_BUMP
 
-DEFAULT_ACCESS_CODE = "kiyra"
 
 WIZARD_WIDTH = 780
-WIZARD_HEIGHT = 660
+WIZARD_HEIGHT = 720
 
 _STEP_NAMES = ("Sign in", "Job description", "Instructions")
 
@@ -75,17 +76,64 @@ def should_skip_setup() -> bool:
             or _env_flag("KIYRA_OVERLAY_HIDDEN", False))
 
 
-def access_code() -> str:
-    """The configured local access code.
+# ── Local session store ─────────────────────────────────────────────────────
 
-    ``KIYRA_ACCESS_CODE`` overrides the built-in default. Setting it to an
-    empty string disables the check (handy for demos); otherwise the entered
-    code must match exactly.
-    """
-    raw = os.environ.get("KIYRA_ACCESS_CODE")
-    if raw is None:
-        return DEFAULT_ACCESS_CODE
-    return raw.strip()
+def auth_store_path() -> Path:
+    """Where the desktop keeps its bearer token between launches."""
+    override = os.environ.get("KIYRA_AUTH_STORE")
+    if override:
+        return Path(override).expanduser()
+    if sys.platform == "win32":
+        base = os.environ.get("APPDATA") or str(Path.home())
+        return Path(base) / "Kiyra" / "auth.json"
+    return Path.home() / ".kiyra" / "auth.json"
+
+
+def load_auth_session() -> Optional[dict]:
+    """Return ``{"token": ..., "account": {...}}`` or None if unreadable."""
+    try:
+        raw = auth_store_path().read_text(encoding="utf-8")
+        data = json.loads(raw)
+    except Exception:
+        return None
+    if not isinstance(data, dict):
+        return None
+    token = data.get("token")
+    account = data.get("account")
+    if not isinstance(token, str) or not token.strip():
+        return None
+    if not isinstance(account, dict):
+        account = {}
+    return {"token": token.strip(), "account": account}
+
+
+def save_auth_session(token: str, account: dict) -> None:
+    """Persist the session atomically. Never raises (best-effort)."""
+    path = auth_store_path()
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        payload = {
+            "token": token,
+            "account": account,
+            "saved_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        }
+        tmp = path.with_suffix(path.suffix + ".tmp")
+        tmp.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+        os.replace(tmp, path)
+        if os.name == "posix":
+            try:
+                os.chmod(path, 0o600)
+            except OSError:
+                pass
+    except Exception:
+        pass
+
+
+def clear_auth_session() -> None:
+    try:
+        auth_store_path().unlink(missing_ok=True)
+    except Exception:
+        pass
 
 
 # ── Tiny JSON HTTP helpers (stdlib only) ────────────────────────────────────
@@ -97,14 +145,50 @@ def _api_get(api_url: str, path: str, timeout: float = 5.0):
         return json.loads(resp.read() or b"null")
 
 
-def _api_post(api_url: str, path: str, payload: dict, timeout: float = 10.0):
+def _api_post(api_url: str, path: str, payload: dict, timeout: float = 10.0,
+              token: Optional[str] = None):
     import urllib.request
     body = json.dumps(payload).encode()
+    headers = {"Content-Type": "application/json"}
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
     req = urllib.request.Request(
-        f"{api_url}{path}", data=body,
-        headers={"Content-Type": "application/json"}, method="POST")
+        f"{api_url}{path}", data=body, headers=headers, method="POST")
     with urllib.request.urlopen(req, timeout=timeout) as resp:
         return json.loads(resp.read() or b"null")
+
+
+def _api_get_auth(api_url: str, path: str, token: str, timeout: float = 5.0):
+    import urllib.request
+    req = urllib.request.Request(
+        f"{api_url}{path}", method="GET",
+        headers={"Authorization": f"Bearer {token}"})
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        return json.loads(resp.read() or b"null")
+
+
+def _api_error(exc: Exception) -> str:
+    """Turn a urllib/HTTP failure into a sentence a user can act on."""
+    import urllib.error
+    if isinstance(exc, urllib.error.HTTPError):
+        try:
+            raw = exc.read().decode("utf-8", "replace")
+            data = json.loads(raw)
+            detail = data.get("detail") if isinstance(data, dict) else None
+            if isinstance(detail, list) and detail:
+                detail = detail[0].get("msg") if isinstance(detail[0], dict) else detail[0]
+            if detail:
+                return str(detail)
+        except Exception:
+            pass
+        if exc.code == 429:
+            return "Too many attempts. Wait a moment and try again."
+        return f"Request failed ({exc.code}). Please try again."
+    if isinstance(exc, urllib.error.URLError):
+        return "Cannot reach the Kiyra backend. Is it running?"
+    if isinstance(exc, TimeoutError):
+        return "The request timed out. Please try again."
+    return str(exc) or "Something went wrong. Please try again."
 
 
 # ── Wizard ──────────────────────────────────────────────────────────────────
@@ -123,6 +207,19 @@ class SetupWizard:
         )
         self.username = "local"
         self.job_description_id: Optional[int] = None
+
+        # Authentication state. `account` is only set after a verified OTP or
+        # a valid stored session; the footer's Continue stays disabled until
+        # then.
+        self.account: Optional[dict] = None
+        self.auth_token: Optional[str] = None
+        self._pending_email: str = ""
+        self._pending_purpose: str = "login"
+        self._dev_code: Optional[str] = None
+        self._smtp_configured = False
+        self._auth_busy = False
+        self._resend_until = 0.0
+        self._resend_job = None
 
         self._jobs: list[dict] = []
         self._jobs_loaded = False
@@ -145,6 +242,7 @@ class SetupWizard:
             self.win.lift()
         except Exception:
             pass
+        self._bootstrap_auth_async()
         self._load_jobs_async()
 
     # ── layout ──────────────────────────────────────────────────────────────
@@ -187,6 +285,8 @@ class SetupWizard:
         if value:
             ent.insert(0, value)
         ent.pack(fill="x", ipady=8, ipadx=8)
+        # Keep a handle so callers can hide the whole label+entry row.
+        ent._row = row
         return ent
 
     def _build(self):
@@ -242,35 +342,138 @@ class SetupWizard:
 
     def _build_login(self, parent):
         page = tk.Frame(parent, bg=PANEL)
-        inner = tk.Frame(page, bg=PANEL)
-        inner.pack(fill="both", expand=True, padx=40, pady=34)
 
-        tk.Label(inner, text="Sign in", bg=PANEL, fg=PRIMARY,
-                 font=(FONT, _fs(20), "bold"), anchor="w").pack(fill="x")
-        tk.Label(inner, text="Welcome back. Sign in to start your session.",
-                 bg=PANEL, fg=SECONDARY, font=(FONT, _fs(10)),
-                 anchor="w").pack(fill="x", pady=(4, 22))
+        self.login_view = tk.Frame(page, bg=PANEL)
+        self.login_view.pack(fill="both", expand=True)
 
-        self.ent_user = self._labeled_entry(
-            inner, "Name", value=os.environ.get("USERNAME") or "local")
-        self.ent_code = self._labeled_entry(inner, "Access code", show="•")
+        # ── credentials view ────────────────────────────────────────────────
+        self.login_credentials = tk.Frame(self.login_view, bg=PANEL)
+        inner = tk.Frame(self.login_credentials, bg=PANEL)
+        inner.pack(fill="both", expand=True, padx=40, pady=26)
 
-        code = access_code()
-        if code == DEFAULT_ACCESS_CODE:
-            hint = "Default access code: kiyra  ·  set KIYRA_ACCESS_CODE to change"
-        elif not code:
-            hint = "Access-code check is disabled (KIYRA_ACCESS_CODE is empty)."
-        else:
-            hint = "Enter the access code configured for this machine."
-        tk.Label(inner, text=hint, bg=PANEL, fg=SECONDARY, font=(FONT, _fs(8)),
-                 anchor="w").pack(fill="x")
+        inner.grid_columnconfigure(0, weight=1)
+        inner.grid_rowconfigure(3, weight=1)
+
+        self.login_title = tk.Label(inner, text="Welcome back", bg=PANEL,
+                                    fg=PRIMARY, font=(FONT, _fs(20), "bold"),
+                                    anchor="w")
+        self.login_title.grid(row=0, column=0, sticky="ew")
+        self.login_subtitle = tk.Label(
+            inner, text="Sign in with your email — we'll send a one-time code.",
+            bg=PANEL, fg=SECONDARY, font=(FONT, _fs(10)), anchor="w",
+            justify="left", wraplength=620)
+        self.login_subtitle.grid(row=1, column=0, sticky="ew", pady=(4, 14))
+
+        # A restored session turns this into a confirmation panel.
+        self.login_signed = tk.Label(
+            inner, text="", bg=CARD, fg=ACCENT, font=(FONT, _fs(10)),
+            anchor="w", justify="left", padx=12, pady=10)
+        self.login_signed.grid(row=2, column=0, sticky="ew", pady=(0, 12))
+        self.login_signed.grid_remove()
+
+        self.login_form = tk.Frame(inner, bg=PANEL)
+        self.login_form.grid(row=3, column=0, sticky="nsew")
+
+        self.auth_mode = tk.StringVar(value="signin")
+        self.mode_row = tk.Frame(self.login_form, bg=PANEL)
+        self.mode_row.pack(fill="x", pady=(0, 12))
+        for val, text in (("signin", "Sign in"), ("signup", "Create account")):
+            tk.Radiobutton(
+                self.mode_row, text=text, value=val, variable=self.auth_mode,
+                command=self._on_auth_mode, bg=PANEL, fg=PRIMARY,
+                selectcolor=CARD, activebackground=PANEL,
+                activeforeground=PRIMARY, highlightthickness=0, bd=0,
+                font=(FONT, _fs(9)), anchor="w").pack(side="left", padx=(0, 18))
+
+        self.ent_full_name = self._labeled_entry(
+            self.login_form, "Full name",
+            value=(os.environ.get("USERNAME") or "").strip())
+        self.ent_phone = self._labeled_entry(self.login_form, "Phone number")
+        self.ent_email = self._labeled_entry(self.login_form, "Email address")
+
+        self.btn_send = self._button(
+            self.login_form, "Send code", self._request_code, bg=ACCENT, fg=INK,
+            bold=True, hover="#5fe79c")
+        self.btn_send.pack(fill="x", pady=(2, 10))
+
+        self.login_hint = tk.Label(
+            self.login_form, text="We'll email you a 6-digit code. No password needed.",
+            bg=PANEL, fg=SECONDARY, font=(FONT, _fs(8)), anchor="w",
+            justify="left", wraplength=620)
+        self.login_hint.pack(fill="x")
 
         self.login_error = tk.Label(inner, text="", bg=PANEL, fg=DANGER,
-                                    font=(FONT, _fs(9)), anchor="w")
-        self.login_error.pack(fill="x", pady=(10, 0))
-        self.ent_user.bind("<Return>", lambda _e: self.ent_code.focus_set())
-        self.ent_code.bind("<Return>", lambda _e: self._next())
+                                    font=(FONT, _fs(9)), anchor="w",
+                                    justify="left", wraplength=620)
+        self.login_error.grid(row=4, column=0, sticky="ew", pady=(8, 0))
+
+        self.btn_signout = self._button(
+            inner, "Sign out", self._sign_out, bg=PANEL, fg=SECONDARY,
+            hover=CARD, padx=0, pady=2)
+        self.btn_signout.grid(row=5, column=0, sticky="w", pady=(6, 0))
+        self.btn_signout.grid_remove()
+
+        self.ent_full_name.bind("<Return>", lambda _e: self.ent_phone.focus_set())
+        self.ent_phone.bind("<Return>", lambda _e: self.ent_email.focus_set())
+        self.ent_email.bind("<Return>", lambda _e: self._request_code())
+
+        # ── OTP view ────────────────────────────────────────────────────────
+        self.login_otp = tk.Frame(self.login_view, bg=PANEL)
+        otp_inner = tk.Frame(self.login_otp, bg=PANEL)
+        otp_inner.pack(fill="both", expand=True, padx=40, pady=26)
+
+        tk.Label(otp_inner, text="Check your email", bg=PANEL, fg=PRIMARY,
+                 font=(FONT, _fs(20), "bold"), anchor="w").pack(fill="x")
+        self.otp_subtitle = tk.Label(
+            otp_inner, text="", bg=PANEL, fg=SECONDARY, font=(FONT, _fs(10)),
+            anchor="w", justify="left", wraplength=620)
+        self.otp_subtitle.pack(fill="x", pady=(4, 16))
+
+        otp_row = tk.Frame(otp_inner, bg=PANEL)
+        otp_row.pack(fill="x", pady=(0, 6))
+        self.ent_otp = tk.Entry(
+            otp_row, bg=CARD, fg=ACCENT, insertbackground=ACCENT,
+            relief="flat", bd=0, font=(MONO, _fs(22), "bold"),
+            justify="center", width=12,
+            highlightthickness=1, highlightbackground=BORDER,
+            highlightcolor=ACCENT,
+            validate="key", validatecommand=(self.win.register(self._only_digits), "%P"))
+        self.ent_otp.pack(fill="x", ipady=10)
+        self.ent_otp.bind("<Return>", lambda _e: self._verify_code())
+
+        self.btn_verify = self._button(
+            otp_inner, "Verify & continue", self._verify_code, bg=ACCENT,
+            fg=INK, bold=True, hover="#5fe79c")
+        self.btn_verify.pack(fill="x", pady=(12, 8))
+
+        self.btn_resend = self._button(
+            otp_inner, "Resend code", self._resend_code, bg=CARD, fg=PRIMARY,
+            hover=BORDER)
+        self.btn_resend.pack(fill="x")
+
+        self.otp_hint = tk.Label(
+            otp_inner, text="", bg=PANEL, fg=SECONDARY, font=(FONT, _fs(8)),
+            anchor="w", justify="left", wraplength=620)
+        self.otp_hint.pack(fill="x", pady=(12, 0))
+
+        self.otp_error = tk.Label(
+            otp_inner, text="", bg=PANEL, fg=DANGER, font=(FONT, _fs(9)),
+            anchor="w", justify="left", wraplength=620)
+        self.otp_error.pack(fill="x", pady=(6, 0))
+
+        self.btn_different = self._button(
+            otp_inner, "Use a different email", self._use_different_email,
+            bg=PANEL, fg=SECONDARY, hover=CARD, padx=0, pady=2)
+        self.btn_different.pack(anchor="w", pady=(10, 0))
+
+        self._on_auth_mode()
+        self._show_credentials_view()
         return page
+
+    @staticmethod
+    def _only_digits(proposed: str) -> bool:
+        return proposed == "" or (proposed.isdigit() and len(proposed) <= 10)
+
 
     def _build_jd(self, parent):
         page = tk.Frame(parent, bg=PANEL)
@@ -393,21 +596,34 @@ class SetupWizard:
         self.btn_back.config(state="normal" if index > 0 else "disabled")
         if index == 0:
             self.btn_next.config(text="Continue")
+            self.btn_next.config(state="normal" if self.account else "disabled")
+            self._show_credentials_view()
             try:
-                self.ent_code.focus_set()
+                if self.account:
+                    self.btn_next.focus_set()
+                elif self.auth_mode.get() == "signup":
+                    self.ent_full_name.focus_set()
+                else:
+                    self.ent_email.focus_set()
             except Exception:
                 pass
         elif index == 1:
+            self.btn_next.config(state="normal")
             self.btn_next.config(text="Continue")
         else:
+            self.btn_next.config(state="normal")
             self.btn_next.config(text="Start Kiyra")
             self._update_summary()
 
     def _next(self):
         self.status.config(text="")
         if self._page == 0:
-            if self._validate_login():
+            if self.account:
                 self._show(1)
+            else:
+                self._show_credentials_view()
+                self.login_error.config(
+                    text="Sign in to continue — request a code and verify it first.")
         elif self._page == 1:
             if self._save_jd():
                 self._show(2)
@@ -426,20 +642,354 @@ class SetupWizard:
         elif self.jd_mode.get() == "existing":
             self.jd_existing.pack(fill="both", expand=True)
 
-    # ── login ───────────────────────────────────────────────────────────────
+    # ── authentication (email OTP) ──────────────────────────────────────────
 
-    def _validate_login(self) -> bool:
-        user = self.ent_user.get().strip()
-        if not user:
-            self.login_error.config(text="Enter your name.")
-            return False
-        code = access_code()
-        if code and self.ent_code.get().strip() != code:
-            self.login_error.config(text="Incorrect access code.")
-            return False
-        self.username = user
+    def _on_auth_mode(self):
+        """Show name/phone only while creating an account."""
+        signup = self.auth_mode.get() == "signup"
+        if signup:
+            self.login_title.config(text="Create your account")
+            self.login_subtitle.config(
+                text="Just your name, phone and email. We'll verify it with a "
+                     "one-time code — no password to remember.")
+            self.ent_full_name._row.pack(fill="x", pady=(0, 14),
+                                         before=self.ent_email._row)
+            self.ent_phone._row.pack(fill="x", pady=(0, 14),
+                                     before=self.ent_email._row)
+        else:
+            self.login_title.config(text="Welcome back")
+            self.login_subtitle.config(
+                text="Sign in with your email — we'll send a one-time code.")
+            self.ent_full_name._row.pack_forget()
+            self.ent_phone._row.pack_forget()
+            self.ent_email._row.pack(fill="x", pady=(0, 14),
+                                     before=self.btn_send)
         self.login_error.config(text="")
+
+    def _show_credentials_view(self):
+        self.login_otp.pack_forget()
+        if not self.login_credentials.winfo_manager():
+            self.login_credentials.pack(fill="both", expand=True)
+        self._update_signed_in_state()
+
+    def _show_otp_view(self):
+        self.login_credentials.pack_forget()
+        if not self.login_otp.winfo_manager():
+            self.login_otp.pack(fill="both", expand=True)
+        self.otp_error.config(text="")
+        self.ent_otp.delete(0, "end")
+        try:
+            self.ent_otp.focus_set()
+        except Exception:
+            pass
+
+    def _update_signed_in_state(self):
+        if self.account:
+            name = self.account.get("full_name") or self.account.get("email") or "you"
+            email = self.account.get("email") or ""
+            phone = self.account.get("phone") or ""
+            self.login_title.config(text=f"Signed in as {name}")
+            self.login_subtitle.config(
+                text="Continue to choose the role you're interviewing for.")
+            self.login_signed.config(
+                text=f"✓  {name}\n{email}" + (f"   ·   {phone}" if phone else ""))
+            self.login_form.grid_remove()
+            self.login_signed.grid()
+            self.btn_signout.grid()
+            self.login_error.config(text="")
+        else:
+            self.login_form.grid()
+            self.login_signed.grid_remove()
+            self.btn_signout.grid_remove()
+            self._on_auth_mode()
+        try:
+            self.btn_next.config(state="normal" if self.account else "disabled")
+        except Exception:
+            pass
+
+    def _set_signed_in(self, account: dict, token: str):
+        self.account = dict(account or {})
+        self.auth_token = token
+        self.username = self.account.get("full_name") or self.account.get("email") or "local"
+        save_auth_session(token, self.account)
+        self._update_signed_in_state()
+
+    def _sign_out(self):
+        token = self.auth_token
+        if token:
+            try:
+                _api_post(self.api_url, "/api/auth/logout", {}, token=token)
+            except Exception:
+                pass
+        clear_auth_session()
+        self.account = None
+        self.auth_token = None
+        self.username = "local"
+        self._pending_email = ""
+        self._dev_code = None
+        self.otp_hint.config(text="")
+        self.otp_error.config(text="")
+        self.login_error.config(text="")
+        self._show_credentials_view()
+
+    def _use_different_email(self):
+        self._pending_email = ""
+        self._dev_code = None
+        self._cancel_resend_countdown()
+        self._show_credentials_view()
+        try:
+            self.ent_email.focus_set()
+        except Exception:
+            pass
+
+    def _set_auth_busy(self, busy: bool):
+        self._auth_busy = busy
+        state = "disabled" if busy else "normal"
+        for btn in (self.btn_send, self.btn_verify):
+            try:
+                btn.config(state=state)
+            except Exception:
+                pass
+        if not busy:
+            self._tick_resend()
+
+    def _run_worker(self, work, on_ok, on_err):
+        """Run a blocking HTTP call off the Tk thread, then marshal back."""
+        results: "queue.Queue[tuple]" = queue.Queue()
+
+        def runner():
+            try:
+                results.put((True, work()))
+            except Exception as exc:  # noqa: BLE001 — shown in the UI
+                results.put((False, exc))
+
+        threading.Thread(target=runner, name="kiyra-auth", daemon=True).start()
+
+        def poll():
+            if self._closed:
+                return
+            try:
+                ok, value = results.get_nowait()
+            except queue.Empty:
+                try:
+                    self.win.after(60, poll)
+                except Exception:
+                    pass
+                return
+            self._set_auth_busy(False)
+            if ok:
+                on_ok(value)
+            else:
+                on_err(value)
+
+        try:
+            self.win.after(0, poll)
+        except Exception:
+            poll()
+
+    def _request_code(self, background: bool = True) -> bool:
+        signup = self.auth_mode.get() == "signup"
+        email = self.ent_email.get().strip()
+        name = self.ent_full_name.get().strip()
+        phone = self.ent_phone.get().strip()
+
+        self.login_error.config(text="")
+        if signup:
+            if not name:
+                self.login_error.config(text="Enter your full name.")
+                return False
+            if not phone:
+                self.login_error.config(text="Enter your phone number.")
+                return False
+        if not email:
+            self.login_error.config(text="Enter your email address.")
+            return False
+
+        if signup:
+            path = "/api/auth/register"
+            payload = {"full_name": name, "phone": phone, "email": email}
+        else:
+            path = "/api/auth/login"
+            payload = {"email": email}
+
+        def work():
+            return _api_post(self.api_url, path, payload, timeout=20.0)
+
+        if not background:
+            try:
+                data = work()
+            except Exception as exc:  # noqa: BLE001
+                self._on_auth_error(exc)
+                return False
+            self._on_challenge(data)
+            return True
+
+        self._set_auth_busy(True)
+        self._run_worker(work, self._on_challenge, self._on_auth_error)
         return True
+
+    def _resend_code(self, background: bool = True) -> bool:
+        if not self._pending_email:
+            self._use_different_email()
+            return False
+        payload = {"email": self._pending_email,
+                   "purpose": self._pending_purpose}
+
+        def work():
+            return _api_post(self.api_url, "/api/auth/resend", payload, timeout=20.0)
+
+        if not background:
+            try:
+                data = work()
+            except Exception as exc:  # noqa: BLE001
+                self._on_auth_error(exc)
+                return False
+            self._on_challenge(data)
+            return True
+
+        self._set_auth_busy(True)
+        self._run_worker(work, self._on_challenge, self._on_auth_error)
+        return True
+
+    def _verify_code(self, background: bool = True) -> bool:
+        code = self.ent_otp.get().strip()
+        if not self._pending_email:
+            self._use_different_email()
+            return False
+        if not code:
+            self.otp_error.config(text="Enter the code from your email.")
+            return False
+        if not code.isdigit():
+            self.otp_error.config(text="The code is all digits.")
+            return False
+
+        self.otp_error.config(text="")
+
+        def work():
+            return _api_post(self.api_url, "/api/auth/verify",
+                             {"email": self._pending_email, "code": code},
+                             timeout=20.0)
+
+        if not background:
+            try:
+                data = work()
+            except Exception as exc:  # noqa: BLE001
+                self._on_auth_error(exc)
+                return False
+            self._on_verified(data)
+            return True
+
+        self._set_auth_busy(True)
+        self._run_worker(work, self._on_verified, self._on_auth_error)
+        return True
+
+    def _on_challenge(self, data: dict):
+        data = data or {}
+        self._pending_email = (data.get("email") or self.ent_email.get().strip()).lower()
+        self._pending_purpose = data.get("purpose") or "login"
+        self._dev_code = data.get("dev_code")
+        self._smtp_configured = data.get("delivery") == "email"
+
+        ttl = int(data.get("expires_in") or 600)
+        minutes = max(1, round(ttl / 60))
+        self.otp_subtitle.config(
+            text=f"We sent a {len(self._dev_code) if self._dev_code else 6}-digit "
+                 f"code to {self._pending_email}. It expires in {minutes} minutes.")
+        if self._dev_code:
+            self.otp_hint.config(
+                text=f"Email isn't configured on this machine — your code is "
+                     f"{self._dev_code}. It is also printed in the backend log.")
+        else:
+            self.otp_hint.config(
+                text="Didn't get it? Check your spam folder, then resend.")
+        self._show_otp_view()
+        self._start_resend_countdown(int(data.get("resend_in") or 30))
+
+    def _on_verified(self, data: dict):
+        data = data or {}
+        account = data.get("account") or {}
+        token = data.get("token") or ""
+        if not token:
+            self.otp_error.config(
+                text="Verification succeeded but no session was returned. Try again.")
+            return
+        self._set_signed_in(account, token)
+        self._cancel_resend_countdown()
+        self._pending_email = ""
+        self._dev_code = None
+        self.otp_hint.config(text="")
+        self.otp_error.config(text="")
+        self._show(1)
+
+    def _on_auth_error(self, exc: Exception):
+        message = _api_error(exc)
+        try:
+            if self.login_otp.winfo_manager():
+                self.otp_error.config(text=message)
+                self.ent_otp.selection_range(0, "end")
+                self.ent_otp.focus_set()
+            else:
+                self.login_error.config(text=message)
+        except Exception:
+            pass
+
+    # ── resend countdown ────────────────────────────────────────────────────
+
+    def _cancel_resend_countdown(self):
+        if self._resend_job is not None:
+            try:
+                self.win.after_cancel(self._resend_job)
+            except Exception:
+                pass
+        self._resend_job = None
+        self._resend_until = 0.0
+        try:
+            self.btn_resend.config(text="Resend code", state="normal")
+        except Exception:
+            pass
+
+    def _start_resend_countdown(self, seconds: int):
+        self._resend_until = time.monotonic() + max(0, int(seconds))
+        self._tick_resend()
+
+    def _tick_resend(self):
+        if self._closed:
+            return
+        remaining = int(self._resend_until - time.monotonic())
+        try:
+            if remaining > 0:
+                self.btn_resend.config(
+                    text=f"Resend in {remaining}s", state="disabled")
+            else:
+                self.btn_resend.config(text="Resend code", state="normal")
+        except Exception:
+            return
+        if remaining > 0:
+            self._resend_job = self.win.after(500, self._tick_resend)
+        else:
+            self._resend_job = None
+
+    # ── stored session ──────────────────────────────────────────────────────
+
+    def _bootstrap_auth_async(self):
+        stored = load_auth_session()
+        if not stored:
+            return
+
+        def work():
+            return _api_get_auth(self.api_url, "/api/auth/me", stored["token"])
+
+        def ok(account):
+            if not account:
+                clear_auth_session()
+                return
+            self._set_signed_in(account, stored["token"])
+
+        def err(_exc):
+            # A stored token that the backend rejects is simply stale.
+            clear_auth_session()
+
+        self._run_worker(work, ok, err)
 
     # ── job description ─────────────────────────────────────────────────────
 
@@ -565,6 +1115,8 @@ class SetupWizard:
         self.result = {
             "username": self.username,
             "job_description_id": self.job_description_id,
+            "account": self.account,
+            "auth_token": self.auth_token,
         }
         self._close()
 
@@ -586,13 +1138,15 @@ def run_setup_wizard(root: tk.Tk, api_url: str, *,
                      force: bool = False) -> Optional[dict]:
     """Show the wizard modally and return the collected setup.
 
-    Returns ``{"username": ..., "job_description_id": ...}`` on finish, or
-    ``None`` if the user cancelled. When skipped (hide mode / automation) the
-    defaults are returned without opening a window. ``force`` overrides both
-    the skip flag and the environment (used by ``--setup``).
+    Returns ``{"username": ..., "job_description_id": ..., "account": ...,
+    "auth_token": ...}`` on finish, or ``None`` if the user cancelled. When
+    skipped (hide mode / automation) the defaults are returned without opening
+    a window. ``force`` overrides both the skip flag and the environment (used
+    by ``--setup``).
     """
     if not force and (skip or should_skip_setup()):
-        return {"username": "local", "job_description_id": None}
+        return {"username": "local", "job_description_id": None,
+                "account": None, "auth_token": None}
     wizard = SetupWizard(root, api_url, offscreen=offscreen)
     try:
         root.wait_window(wizard.win)

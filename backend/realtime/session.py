@@ -1718,10 +1718,18 @@ class LiveSession:
             })
             self._set_state(RealtimeState.RETRIEVING_CONTEXT)
 
-            context, rag_note = await self._bounded_rag(
-                question, resolution=resolution, perf=perf,
-                top_k=per_type_top_k, max_context_chars=per_type_ctx_chars,
-                qtype=qtype)
+            # Don't block LLM generation on RAG — wait only ~300ms for context.
+            # If RAG returns faster than LLM TTFT (~2-3s), we'll have context;
+            # otherwise proceed without it (non-fatal, answer still works).
+            try:
+                context, rag_note = await asyncio.wait_for(
+                    self._bounded_rag(
+                        question, resolution=resolution, perf=perf,
+                        top_k=per_type_top_k, max_context_chars=per_type_ctx_chars,
+                        qtype=qtype),
+                    timeout=0.3)
+            except asyncio.TimeoutError:
+                context, rag_note = "", "no-rag-fastpath"
             latency["rag_ms"] = perf.durations.get("rag_ms") or 0.0
             self._prefetch_context = None
             self._prefetch_question = None
@@ -2116,10 +2124,16 @@ class LiveSession:
             })
             self._set_state(RealtimeState.RETRIEVING_CONTEXT)
 
-            context, rag_note = await self._bounded_rag(
-                question, resolution=resolution, perf=spec_perf,
-                top_k=per_type_top_k, max_context_chars=per_type_ctx_chars,
-                qtype=qtype)
+            # Don't block LLM generation on RAG — wait only ~300ms for context.
+            try:
+                context, rag_note = await asyncio.wait_for(
+                    self._bounded_rag(
+                        question, resolution=resolution, perf=spec_perf,
+                        top_k=per_type_top_k, max_context_chars=per_type_ctx_chars,
+                        qtype=qtype),
+                    timeout=0.3)
+            except asyncio.TimeoutError:
+                context, rag_note = "", "no-rag-fastpath"
             project_evidence = ""
             if analysis.project_related:
                 ev, gh_note, _pi = await self._github_evidence(

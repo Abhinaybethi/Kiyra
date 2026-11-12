@@ -395,6 +395,11 @@ class OllamaProvider(AIProvider):
             "stream": stream,
             "options": {"temperature": temperature},
         }
+        # qwen3 models have a "thinking" mode that produces reasoning traces
+        # instead of direct answers. Disable it at the top level for direct
+        # speakable output.
+        if "qwen3" in (self._model or "").lower():
+            payload["think"] = False
         if max_tokens:
             payload["options"]["num_predict"] = max_tokens
 

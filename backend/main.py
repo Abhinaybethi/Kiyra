@@ -150,6 +150,7 @@ async def provider_unavailable_handler(request: Request, exc: ProviderUnavailabl
 # ── Routes ─────────────────────────────────────────────────────────────────
 
 from api.profile import router as profile_router
+from api.auth import router as auth_router
 from api.resume import router as resume_router
 from api.jobs import router as jobs_router
 from api.knowledge import router as knowledge_router
@@ -159,6 +160,7 @@ from api.settings import router as settings_router
 from api.vision import router as vision_router
 
 app.include_router(profile_router)
+app.include_router(auth_router)
 app.include_router(resume_router)
 app.include_router(jobs_router)
 app.include_router(knowledge_router)

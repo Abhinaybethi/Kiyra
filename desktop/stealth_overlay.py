@@ -3520,7 +3520,9 @@ def main(argv=None):
         except Exception:
             pass
         return 1
+    account = setup.get("account") or {}
     print(f"[Setup] user={setup.get('username')} "
+          f"email={account.get('email') or '—'} "
           f"jd={setup.get('job_description_id')}")
 
     # 3. Live session (retry briefly: /health can go green a moment before the
