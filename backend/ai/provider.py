@@ -373,6 +373,10 @@ class OllamaProvider(AIProvider):
         self._model = model or settings.model_name
         self._timeout = timeout or settings.ollama_timeout
         self._max_retries = max_retries
+        # Token counts from the last stream's `done` chunk (Ollama reports
+        # them there). Used for [KIYRA-PERF] prompt/completion accounting.
+        self.last_prompt_tokens: Optional[int] = None
+        self.last_completion_tokens: Optional[int] = None
 
     @property
     def model_name(self) -> str:
@@ -394,6 +398,10 @@ class OllamaProvider(AIProvider):
             "messages": messages,
             "stream": stream,
             "options": {"temperature": temperature},
+            # Keep the model resident across interview pauses. A cold reload is
+            # far slower than any first-token deadline and is the single biggest
+            # cause of "the answer never comes" in live use.
+            "keep_alive": getattr(settings, "ollama_keep_alive", "30m"),
         }
         # qwen3 models have a "thinking" mode that produces reasoning traces
         # instead of direct answers. Disable it at the top level for direct
@@ -402,6 +410,9 @@ class OllamaProvider(AIProvider):
             payload["think"] = False
         if max_tokens:
             payload["options"]["num_predict"] = max_tokens
+        num_ctx = getattr(settings, "ollama_num_ctx", 0)
+        if num_ctx:
+            payload["options"]["num_ctx"] = int(num_ctx)
 
         if stream:
             client = httpx.AsyncClient(timeout=self._timeout)
@@ -430,6 +441,8 @@ class OllamaProvider(AIProvider):
         raise ProviderUnavailableError(f"Ollama request failed: {last_err}")
 
     async def _stream_complete(self, client: httpx.AsyncClient, payload: dict) -> AsyncIterator[str]:
+        self.last_prompt_tokens = None
+        self.last_completion_tokens = None
         try:
             async with client.stream("POST", f"{self._base_url}/api/chat", json=payload) as resp:
                 resp.raise_for_status()
@@ -440,11 +453,30 @@ class OllamaProvider(AIProvider):
                             if content := chunk.get("message", {}).get("content"):
                                 yield content
                             if chunk.get("done"):
+                                self.last_prompt_tokens = chunk.get("prompt_eval_count")
+                                self.last_completion_tokens = chunk.get("eval_count")
                                 break
                         except json.JSONDecodeError:
                             continue
         finally:
             await client.aclose()
+
+    async def warmup(self) -> bool:
+        """Load the model into memory and pin it with ``keep_alive``.
+
+        Best-effort: returns False instead of raising so a missing Ollama never
+        blocks backend startup. Called from the lifespan warmup thread.
+        """
+        if not self._base_url:
+            return False
+        try:
+            await self.complete(
+                [{"role": "user", "content": "ping"}],
+                stream=False, temperature=0.0, max_tokens=1,
+            )
+            return True
+        except Exception:
+            return False
 
     async def embed(self, text: str) -> list[float]:
         if not self._base_url:

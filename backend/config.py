@@ -32,7 +32,15 @@ class Settings(BaseSettings):
     # Legacy: Ollama (only used when explicitly configured via provider="ollama")
     ollama_base_url: str = "http://localhost:11434"
     ollama_timeout: int = 120
-    ollama_keep_alive: str = "5m"  # Keep model in memory for fast inference
+    # Keep the model resident between turns. Ollama's default is 5 minutes; an
+    # interview easily has longer pauses, and a cold reload is ~20s (longer than
+    # the first-token deadline), which silently produced empty answers.
+    ollama_keep_alive: str = "30m"
+    # Pin the context window. Ollama otherwise allocates the model's full
+    # context (16k+ KV cells) and can reload the model whenever the requested
+    # context changes. Live prompts are ~1-2k tokens, so 4096 is ample and keeps
+    # VRAM low (the overlay may share a 6 GB laptop GPU).
+    ollama_num_ctx: int = 4096
 
     # ─── App ──────────────────────────────────────────────────────────────────
     app_name: str = "Kiyra — Interview Copilot"
@@ -71,6 +79,22 @@ class Settings(BaseSettings):
     # small (~500MB), medium (~1.5GB). Override with KIYRA_TRANSCRIPTION_MODEL.
     # Smaller = faster TTFT, lower accuracy; larger = slower, more accurate.
     transcription_model: str = "base"  # faster-whisper base model (~140MB)
+    # Whisper vocabulary hint. faster-whisper's `initial_prompt` biases the
+    # decoder toward these spellings. Without it the `base` model hears the
+    # product name "Kiyra" as "CURE", and the answer then confidently describes
+    # a caching layer that was never built. Deliberately short: a long hint
+    # biases short clips (and can be echoed back on near-silent audio).
+    # Override with TRANSCRIPTION_INITIAL_PROMPT (no KIYRA_ prefix — this
+    # Settings class sets no env_prefix).
+    transcription_initial_prompt: str = (
+        "Kiyra, an interview copilot. FastAPI, Next.js, TypeScript, Python, "
+        "WebSocket, Whisper, Ollama, PostgreSQL, SQLAlchemy, Alembic, "
+        "Tkinter, RAG, embeddings, asyncio, uvicorn, pytest, Docker, "
+        "Kubernetes, Redis, Celery, machine learning"
+    )
+    # Append the candidate's own project and skill names from the database so
+    # the hint matches the vocabulary of the interview actually being taken.
+    transcription_vocab_from_profile: bool = True
 
     # Partial / speculative STT interval — how often to run speculative
     # transcription on accumulated speech. Lower = faster feedback but more
@@ -101,7 +125,12 @@ class Settings(BaseSettings):
 
     # Answer generation (real-time mode)
     answer_generation_timeout: int = 15  # Max 15s between tokens once streaming
-    realtime_first_token_timeout: int = 10  # First-token deadline — Ollama TTFT is ~2-3s
+    # First-token deadline. A *warm* Ollama answers in ~2-3s, but a cold model
+    # load (disk -> VRAM) can take ~20s. The old 10s cap aborted the load, which
+    # unloaded the model again, so every turn paid the cold cost and produced
+    # zero tokens. Keep this above a worst-case cold load; warm turns are still
+    # fast because the first token arrives as soon as it is ready.
+    realtime_first_token_timeout: int = 60
     answer_mode: str = "detailed"  # short | medium | detailed (real-time default: detailed)
     answer_max_tokens: int = 260  # Default cap — keeps TTFT low (legacy / detailed path)
 

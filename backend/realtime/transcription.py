@@ -46,6 +46,71 @@ _transcription_cache_ttl = 30.0  # seconds — evict stale cached results
 _transcription_hits = 0
 
 
+# ── Vocabulary hint (faster-whisper `initial_prompt`) ──────────────────────
+#
+# `initial_prompt` is a decoder hint (Whisper caps it at ~224 tokens) that
+# biases *spelling*. The `base` model otherwise hears the product name "Kiyra"
+# as "CURE" — and because the answer is grounded in that transcript, it then
+# invents a caching layer that was never built. Two sources feed the hint:
+# a static domain list (settings) and this candidate's real project/skill
+# names from the DB. The result is capped and cached: a long hint biases short
+# clips, and a per-utterance DB query would add latency for no benefit.
+
+_vocab_cache = None  # (monotonic_ts, comma_joined_terms)
+_vocab_cache_ttl = 60.0  # seconds — picks up new projects/skills mid-session
+_vocab_max_chars = 240
+
+
+def _profile_vocab() -> str:
+    """Comma-joined project + skill names for the active candidate.
+
+    Best-effort: any DB problem degrades to an empty hint rather than failing
+    transcription (STT must never break because a lookup did).
+    """
+    global _vocab_cache
+    now = time.monotonic()
+    if _vocab_cache is not None and (now - _vocab_cache[0]) < _vocab_cache_ttl:
+        return _vocab_cache[1]
+
+    terms: list[str] = []
+    try:
+        from db.database import SessionLocal
+        from db.models import Project, Skill
+
+        db = SessionLocal()
+        try:
+            for (name,) in db.query(Project.name).limit(8).all():
+                if name:
+                    terms.append(str(name).strip())
+            for (name,) in db.query(Skill.name).limit(16).all():
+                if name:
+                    terms.append(str(name).strip())
+        finally:
+            db.close()
+    except Exception:
+        terms = []
+
+    text = ", ".join(t for t in terms if t)
+    _vocab_cache = (now, text)
+    return text
+
+
+def _initial_prompt() -> Optional[str]:
+    """Decoder hint teaching Whisper the vocabulary of this interview."""
+    parts: list[str] = []
+    base = (getattr(settings, "transcription_initial_prompt", "") or "").strip()
+    if base:
+        parts.append(base)
+    if getattr(settings, "transcription_vocab_from_profile", True):
+        vocab = _profile_vocab()
+        if vocab:
+            parts.append(vocab)
+    text = ", ".join(parts)
+    if not text:
+        return None
+    return text[:_vocab_max_chars].rstrip(" ,")
+
+
 def _build_model(cpu_threads: int):
     """Construct a WhisperModel from the local cache, falling back to a fetch.
 
@@ -173,8 +238,12 @@ def transcribe_audio_bytes(
         return result
 
     # faster-whisper accepts seekable BinaryIO — decode fully in memory.
+    # The vocabulary hint is resolved once per call (cached for a minute) so a
+    # project/skill rename is picked up without a per-utterance DB query.
+    prompt = _initial_prompt()
     try:
-        segments_stream, info = _transcribe(model, io.BytesIO(audio_bytes), fast=fast)
+        segments_stream, info = _transcribe(
+            model, io.BytesIO(audio_bytes), fast=fast, initial_prompt=prompt)
     except Exception:
         # Fallback: old path — write to a temp file for the decoder.
         import tempfile
@@ -183,7 +252,8 @@ def transcribe_audio_bytes(
             tmp.write(audio_bytes)
             tmp_path = tmp.name
         try:
-            segments_stream, info = _transcribe(model, tmp_path, fast=fast)
+            segments_stream, info = _transcribe(
+                model, tmp_path, fast=fast, initial_prompt=prompt)
         finally:
             try:
                 os.unlink(tmp_path)
@@ -229,11 +299,16 @@ def transcribe_audio_bytes(
     return result
 
 
-def _transcribe(model, audio_input, fast: bool = False):
+def _transcribe(model, audio_input, fast: bool = False,
+                initial_prompt: Optional[str] = None):
     """Greedy, low-latency transcription.
 
     `fast=True` skips per-word timestamps (`without_timestamps`) — strictly
     cheaper for the speculative/partial path where text-only is enough.
+
+    `initial_prompt` is a short vocabulary hint (see `_initial_prompt`). It
+    fixes domain-name mishearing such as "Kiyra" -> "CURE" at decode time
+    instead of post-editing the transcript.
 
     faster-whisper's own Silero ``vad_filter`` is deliberately OFF. The backend
     EnergyVAD (``realtime/audio.py``) already segments audio into
@@ -255,6 +330,7 @@ def _transcribe(model, audio_input, fast: bool = False):
         condition_on_previous_text=False,  # Reduce hallucination on short utterances
         no_speech_threshold=0.6,
         without_timestamps=fast,  # Skip word-timestamps on the speculative path
+        initial_prompt=initial_prompt,
     )
 
 

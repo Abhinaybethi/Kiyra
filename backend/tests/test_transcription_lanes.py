@@ -104,3 +104,64 @@ def test_silero_vad_disabled_so_quiet_mics_are_not_rejected():
         "Whisper's Silero VAD must stay off — the backend EnergyVAD already "
         "segments utterances and Silero rejects quiet-mic speech wholesale")
     assert m.kwargs["no_speech_threshold"] <= 0.6
+
+
+def test_transcribe_forwards_initial_prompt(monkeypatch):
+    """The vocabulary hint must actually reach faster-whisper."""
+    class FakeModel:
+        def __init__(self):
+            self.kwargs = None
+
+        def transcribe(self, audio_input, **kwargs):
+            self.kwargs = kwargs
+            return iter([]), type("Info", (), {"language": "en"})()
+
+    m = FakeModel()
+    T._transcribe(m, io.BytesIO(b""), fast=False,
+                  initial_prompt="Kiyra, FastAPI")
+    assert m.kwargs["initial_prompt"] == "Kiyra, FastAPI"
+
+
+def test_initial_prompt_contains_product_and_profile_vocabulary(monkeypatch):
+    """"Kiyra" must be in the hint — the `base` model hears it as "CURE"."""
+    monkeypatch.setattr(T, "_profile_vocab", lambda: "LedgerSync, GraphQL")
+    monkeypatch.setattr(T.settings, "transcription_initial_prompt",
+                        "Kiyra, FastAPI", raising=False)
+    monkeypatch.setattr(T.settings, "transcription_vocab_from_profile",
+                        True, raising=False)
+
+    prompt = T._initial_prompt()
+
+    assert prompt is not None
+    assert "Kiyra" in prompt, "product name must bias the decoder"
+    assert "LedgerSync" in prompt, "candidate project names must be included"
+    assert len(prompt) <= T._vocab_max_chars, (
+        "a long hint biases short clips and can be echoed on silence")
+
+
+def test_initial_prompt_is_none_when_nothing_configured(monkeypatch):
+    """No hint at all must mean None — not an empty string sent to Whisper."""
+    monkeypatch.setattr(T, "_profile_vocab", lambda: "")
+    monkeypatch.setattr(T.settings, "transcription_initial_prompt", "",
+                        raising=False)
+    monkeypatch.setattr(T.settings, "transcription_vocab_from_profile",
+                        True, raising=False)
+
+    assert T._initial_prompt() is None
+
+
+def test_profile_vocab_degrades_to_empty_string_on_db_failure(monkeypatch):
+    """A broken DB lookup must never fail transcription."""
+    import sys
+    import types
+
+    broken = types.ModuleType("db.database")
+
+    def _boom():
+        raise RuntimeError("db unavailable")
+
+    broken.SessionLocal = _boom
+    monkeypatch.setitem(sys.modules, "db.database", broken)
+    monkeypatch.setattr(T, "_vocab_cache", None, raising=False)
+
+    assert T._profile_vocab() == ""

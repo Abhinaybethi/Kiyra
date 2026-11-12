@@ -82,28 +82,45 @@ async def lifespan(app: FastAPI):
 
     def _warm_llm():
         """Prime the local LLM so the FIRST live answer doesn't pay the cold
-        model-load / prompt-eval cost (CPU-only llama can otherwise stall the
-        first answer for tens of seconds). Best-effort: a missing server just
-        logs and moves on — the real request still runs normally."""
+        model-load / prompt-eval cost (a cold Ollama load can take ~20s, longer
+        than any sane first-token deadline). Best-effort: a missing server just
+        logs and moves on — the real request still runs normally.
+
+        The provider MUST be resolved through the DB (`get_provider(db=...)`):
+        the active `ModelConfiguration` row is authoritative, and warming the
+        env-default provider (e.g. Bonsai) left the real model (Ollama) cold.
+        """
         if os.environ.get("TESTING"):
             return  # never touch the network under the test suite
+        db = None
         try:
             import asyncio as _a
             from ai.provider import get_provider
-            provider = get_provider()
+            db = SessionLocal()
+            provider = get_provider(db=db)
 
             async def _go():
                 try:
+                    if hasattr(provider, "warmup"):
+                        ok = await provider.warmup()
+                        print(f"[Warmup] LLM ready={ok} model={provider.model_name}")
+                        return
                     await provider.complete(
                         [{"role": "user", "content": "ping"}],
                         stream=False, max_tokens=1,
                     )
-                except Exception:
-                    pass
+                except Exception as e:
+                    print(f"[Warmup] LLM request failed: {e}")
 
             _a.run(_go())
         except Exception as e:
             print(f"[Warmup] LLM failed: {e}")
+        finally:
+            try:
+                if db is not None:
+                    db.close()
+            except Exception:
+                pass
 
     _threading.Thread(target=_warm_whisper, name="whisper-warmup", daemon=True).start()
     _threading.Thread(target=_warm_embeddings, name="embeddings-warmup", daemon=True).start()

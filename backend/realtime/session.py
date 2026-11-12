@@ -1892,8 +1892,9 @@ class LiveSession:
             self._emit_turn_perf(
                 perf, request_id,
                 chunks=len(tokens),
-                prompt_tokens=_trace.get("prompt_tokens") if _trace else None,
-                completion_tokens=_trace.get("completion_tokens") if _trace else None,
+                prompt_tokens=getattr(self.provider, "last_prompt_tokens", None),
+                completion_tokens=getattr(
+                    self.provider, "last_completion_tokens", None),
             )
             print(
                 "[REALTIME_LATENCY] stt=%.0fms detect=%.0fms rag=%.0fms "
