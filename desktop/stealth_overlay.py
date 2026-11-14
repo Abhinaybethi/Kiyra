@@ -75,6 +75,31 @@ LIVE_PLACEHOLDER = "Speech to Text of System Audio…"
 # UI (buttons, labels, transcript and answer sections).
 FONT_BUMP = 2
 
+# How far one mouse-wheel notch scrolls the answer panel, in canvas units.
+# Matches the Shift+Alt+W / Shift+Alt+X keyboard steps, so the wheel and the
+# shortcut feel the same.
+_WHEEL_SCROLL_STEP = 3
+
+
+def _wheel_units(event) -> int:
+    """Mouse-wheel event -> scroll steps for the answer panel.
+
+    Negative scrolls up, positive scrolls down. Windows reports ``delta`` in
+    multiples of 120 per notch; X11 reports ``num`` 4/5 instead; high-
+    resolution wheels report a much smaller ``delta``, which must never be
+    rounded away to zero (that would make the wheel feel dead).
+    """
+    num = getattr(event, "num", None)
+    if num == 4:
+        return -1
+    if num == 5:
+        return 1
+    delta = getattr(event, "delta", 0)
+    if not delta:
+        return 0
+    step = max(1, int(abs(delta) / 120))
+    return -step if delta > 0 else step
+
 # Audio-source combobox width (in Tk chars) per panel size preset. Fixed-size
 # widgets (like this combobox) are what make a shrunken panel clip; keeping the
 # preset -> chars map here lets set_panel_size re-fit instead of letting the
@@ -877,7 +902,7 @@ class StealthOverlayApp:
         self.ans_canvas = tk.Canvas(ans_container, bg=self.card_bg,
                                     highlightthickness=0, yscrollcommand=sec_scroll.set)
         self.ans_canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-        sec_scroll.config(command=self.ans_canvas.yview)
+        sec_scroll.config(command=self._answer_scrollbar)
 
         self.answer_inner = tk.Frame(self.ans_canvas, bg=self.card_bg)
         self._answer_inner_width = 0
@@ -886,6 +911,10 @@ class StealthOverlayApp:
             width=self.ans_canvas.winfo_reqwidth())
         self.answer_inner.bind("<Configure>", self._on_answer_inner_configure)
         self.ans_canvas.bind("<Configure>", self._on_answer_canvas_configure)
+
+        # Mouse-wheel scrolling over the answer panel.
+        self._bind_answer_wheel(self.ans_canvas)
+        self._bind_answer_wheel(self.answer_inner)
 
         self._answer_widgets = []
         self._answer_scroll = 0
@@ -1533,6 +1562,10 @@ class StealthOverlayApp:
         txt.pack(fill=tk.X)
         txt.insert("1.0", body_txt)
         txt.config(state=tk.DISABLED)
+        # The wheel must scroll the whole answer panel, not this Text's own
+        # (empty) scrollregion — Tk's native Text binding would swallow it.
+        self._bind_answer_wheel(txt)
+        self._bind_answer_wheel(frame)
         if code:
             frame.config(highlightthickness=1, highlightbackground=self.border_color)
         self._answer_widgets.append(frame)
@@ -2456,10 +2489,65 @@ class StealthOverlayApp:
         except Exception:
             pass
 
+    def _answer_scrollbar(self, *args):
+        """Scrollbar command — scrolls the canvas and keeps the pin honest.
+
+        Dragging the scrollbar is a manual scroll too, so it must clear the
+        auto-scroll pin exactly like the mouse wheel does.
+        """
+        try:
+            self.ans_canvas.yview(*args)
+        except Exception:
+            pass
+        self._update_answer_scroll_pin()
+
     def _scroll_answer(self, delta):
         try:
             if self.ans_canvas.winfo_exists():
                 self.ans_canvas.yview_scroll(delta, "units")
+        except Exception:
+            pass
+        self._update_answer_scroll_pin()
+
+    def _update_answer_scroll_pin(self):
+        """Remember whether the answer view is parked at the bottom.
+
+        The pin decides whether a still-streaming answer keeps scrolling
+        itself. A manual scroll up must clear it, so the candidate can read
+        back through the answer while the rest of it is still arriving; a
+        scroll back to the bottom re-pins it.
+        """
+        try:
+            if not self.ans_canvas.winfo_exists():
+                return
+            self._answer_scroll_pinned = self.ans_canvas.yview()[1] >= 0.999
+        except Exception:
+            pass
+
+    def _on_answer_wheel(self, event):
+        """Scroll the answer panel with the mouse wheel.
+
+        The answer is drawn inside a Canvas, and the Text widgets inside it
+        carry Tk's own ``<MouseWheel>`` class binding — that scrolls the
+        Text's (empty) scrollregion and does nothing at all. Binding the
+        wheel on every widget inside the panel routes the event to the
+        canvas instead, so the wheel scrolls the whole answer.
+
+        Returns "break" so Tk's native handling never runs afterwards.
+        """
+        units = _wheel_units(event)
+        if units:
+            self._scroll_answer(units * _WHEEL_SCROLL_STEP)
+        return "break"
+
+    def _bind_answer_wheel(self, widget):
+        """Route mouse-wheel events on ``widget`` to the answer canvas."""
+        if widget is None:
+            return
+        try:
+            widget.bind("<MouseWheel>", self._on_answer_wheel, add="+")
+            widget.bind("<Button-4>", self._on_answer_wheel, add="+")
+            widget.bind("<Button-5>", self._on_answer_wheel, add="+")
         except Exception:
             pass
 
