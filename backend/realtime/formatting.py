@@ -77,3 +77,36 @@ def plain_answer(text: str) -> str:
         return cleaned.strip()
     except Exception:  # noqa: BLE001 — formatting must never break a turn
         return text
+
+
+# Characters that can end a sentence.
+_SENTENCE_END = ".!?\"')]}"
+
+
+def trim_dangling_sentence(text: str) -> str:
+    """Drop a trailing incomplete sentence.
+
+    When the provider stops on its token cap the answer ends mid-word
+    ("...to maintain stability") and the candidate would read a broken
+    sentence to the interviewer. This cuts the text back to the last
+    complete sentence so the answer always ends cleanly.
+
+    Never trims across an unclosed code fence (that would corrupt the
+    block), and never raises — a formatting helper must not lose an answer.
+    """
+    if not text:
+        return text or ""
+    try:
+        stripped = text.rstrip()
+        if not stripped:
+            return text
+        if stripped[-1] in _SENTENCE_END:
+            return text
+        if stripped.count("```") % 2 == 1:
+            return text  # unclosed fence — leave the block alone
+        for i in range(len(stripped) - 1, 0, -1):
+            if stripped[i] in ".!?" and stripped[i + 1] in " \n":
+                return stripped[:i + 1]
+        return text
+    except Exception:  # noqa: BLE001 — formatting must never break a turn
+        return text

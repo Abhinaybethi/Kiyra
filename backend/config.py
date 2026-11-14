@@ -132,19 +132,26 @@ class Settings(BaseSettings):
     # fast because the first token arrives as soon as it is ready.
     realtime_first_token_timeout: int = 60
     answer_mode: str = "detailed"  # short | medium | detailed (real-time default: detailed)
-    answer_max_tokens: int = 260  # Default cap — keeps TTFT low (legacy / detailed path)
+    answer_max_tokens: int = 300  # Default cap (legacy / detailed path)
 
-    # Per-question-type output caps. Coding answers need more tokens for code
-    # blocks + complexity + edge cases; conceptual answers stay tight for speed.
+    # Per-question-type output caps, in TOKENS (the word targets live in
+    # `realtime/prompts.py::_LENGTH_TARGETS`).
+    #
+    # These must be sized FROM the word target, not equal to it: prose runs
+    # ~1.2 tokens/word and code ~1.6, so a cap below the band's top truncates
+    # the answer mid-sentence — the candidate read aloud "...which required
+    # dedicated engineering resources to maintain stability" with no ending.
+    # Caps sit ~15% above the token cost of the word band's upper end so an
+    # on-target answer always finishes, and only a runaway answer is clipped.
     answer_max_tokens_by_type: dict = {
-        "conceptual": 220,   # tight, speakable answers
-        "coding": 420,       # code block + complexity + example + edge cases
-        "behavioral": 260,   # STAR framing, personal experience
-        "debugging": 340,    # root cause + fix + prevention
-        "sql": 280,          # query + explanation + optimization
-        "default": 260,
+        "conceptual": 270,   # 150-190 words -> ~230 tokens
+        "coding": 520,       # 220-300 words -> ~490 tokens (code is denser)
+        "behavioral": 270,   # 150-190 words -> ~230 tokens
+        "debugging": 360,    # 180-230 words -> ~320 tokens
+        "sql": 340,          # 160-210 words -> ~315 tokens
+        "default": 270,
     }
-    realtime_max_output_tokens: int = 260  # Realtime default cap
+    realtime_max_output_tokens: int = 300  # Realtime default cap
 
     # Standalone RAG defaults (kept for backward compatibility with callers
     # that don't pass per-type values). Per-type overrides live in the

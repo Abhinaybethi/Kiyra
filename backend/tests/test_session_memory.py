@@ -526,7 +526,9 @@ def test_system_prompt_followup_voice_grounding_rules():
     assert "PREVIOUS CONTEXT" in system
     assert "RECENT CONVERSATION" in system
     assert "NEVER invent" in system
-    assert "150-220 words" in system
+    # An explicit word band must always be stated (the "150-190" target keeps
+    # the answer inside the 150-220 band the candidate is promised).
+    assert "150-190 words" in system
 
     prompt = ContextBuilder.build(
         question="Why did you choose that approach?",
@@ -565,7 +567,7 @@ def test_detailed_mode_length_rule_is_stated_where_the_model_reads_last():
     from realtime.question_analyzer import QuestionAnalysis
 
     system = realtime_system("detailed")
-    assert "150-220 words" in system
+    assert "150-190 words" in system
     assert "Hard minimum 130 words" in system
 
     concept = QuestionAnalysis(intent="technical_concept", question_type="technical")
@@ -575,14 +577,14 @@ def test_detailed_mode_length_rule_is_stated_where_the_model_reads_last():
         settings.answer_mode = "detailed"
         rules = _answer_requirements(concept)
         assert "brief explanation" not in rules
-        assert "detailed mode means 150-220 words" in rules
+        assert "detailed mode means 150-190 words" in rules
         # The mode-specific rule is the final line of the block.
-        assert rules.rstrip().endswith("NOT enough.")
+        assert rules.rstrip().endswith("sentence — a cut-off answer is a failed answer.")
 
         settings.answer_mode = "short"
         short_rules = _answer_requirements(concept)
         assert "2-6 sentences" in short_rules
-        assert "150-220 words" not in short_rules
+        assert "150-190 words" not in short_rules
     finally:
         settings.answer_mode = original
 

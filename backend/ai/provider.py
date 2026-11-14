@@ -34,6 +34,16 @@ class ProviderUnavailableError(AIProviderError):
     """Raised when the inference backend cannot be reached/used."""
 
 
+def _ns_to_ms(value) -> Optional[int]:
+    """Ollama reports durations in nanoseconds; perf wants milliseconds."""
+    try:
+        if value is None:
+            return None
+        return int(round(int(value) / 1_000_000))
+    except (TypeError, ValueError):
+        return None
+
+
 # Model capability registry
 MODEL_CAPABILITIES: Dict[str, dict] = {
     "bonsai-8b": {
@@ -377,6 +387,16 @@ class OllamaProvider(AIProvider):
         # them there). Used for [KIYRA-PERF] prompt/completion accounting.
         self.last_prompt_tokens: Optional[int] = None
         self.last_completion_tokens: Optional[int] = None
+        # Ollama's `done_reason`: "stop" (model finished) or "length" (the
+        # num_predict cap cut it off — the answer is truncated mid-sentence).
+        self.last_done_reason: Optional[str] = None
+        # Ollama's own timing breakdown from the `done` chunk (nanoseconds).
+        # `load_duration` is the per-request runner setup (a resident model
+        # still pays ~1s); `prompt_eval_duration` is the prefill cost. Seeing
+        # them separately is what makes a slow first token explainable.
+        self.last_load_ms: Optional[int] = None
+        self.last_prompt_eval_ms: Optional[int] = None
+        self.last_eval_ms: Optional[int] = None
 
     @property
     def model_name(self) -> str:
@@ -443,6 +463,7 @@ class OllamaProvider(AIProvider):
     async def _stream_complete(self, client: httpx.AsyncClient, payload: dict) -> AsyncIterator[str]:
         self.last_prompt_tokens = None
         self.last_completion_tokens = None
+        self.last_done_reason = None
         try:
             async with client.stream("POST", f"{self._base_url}/api/chat", json=payload) as resp:
                 resp.raise_for_status()
@@ -455,6 +476,11 @@ class OllamaProvider(AIProvider):
                             if chunk.get("done"):
                                 self.last_prompt_tokens = chunk.get("prompt_eval_count")
                                 self.last_completion_tokens = chunk.get("eval_count")
+                                self.last_done_reason = chunk.get("done_reason")
+                                self.last_load_ms = _ns_to_ms(chunk.get("load_duration"))
+                                self.last_prompt_eval_ms = _ns_to_ms(
+                                    chunk.get("prompt_eval_duration"))
+                                self.last_eval_ms = _ns_to_ms(chunk.get("eval_duration"))
                                 break
                         except json.JSONDecodeError:
                             continue

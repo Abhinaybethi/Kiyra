@@ -69,7 +69,7 @@ from realtime.audio import (
     encode_wav_float32,
 )
 from realtime.memory import ContextBuilder, Resolution, RetrievalCache, SessionMemory, Turn
-from realtime.formatting import plain_answer
+from realtime.formatting import plain_answer, trim_dangling_sentence
 from realtime.question_analyzer import analyze_question
 from realtime.perf import PerformanceTracker
 from realtime.prompts import realtime_system, qtype_for_question
@@ -671,7 +671,9 @@ class LiveSession:
 
     def _emit_turn_perf(self, tracker: Optional[PerformanceTracker],
                         request_id: str = "", prompt_tokens=None,
-                        completion_tokens=None, chunks: Optional[int] = None):
+                        completion_tokens=None, chunks: Optional[int] = None,
+                        truncated: Optional[bool] = None,
+                        load_ms=None, prefill_ms=None, gen_ms=None):
         """Structured per-turn latency line ([KIYRA-PERF], Phase 5.4 §10).
 
         Contains timings and counts only — never transcript or answer content.
@@ -707,6 +709,16 @@ class LiveSession:
             "prompt_tokens": int(prompt_tokens) if prompt_tokens else -1,
             "completion_tokens": (int(completion_tokens)
                                   if completion_tokens else -1),
+            # True when the provider stopped on the token cap instead of
+            # finishing its sentence ("done_reason": "length"). A truncated
+            # answer is a bug, not a style choice — it must be visible.
+            "truncated": 1 if truncated else 0,
+            # Provider-side breakdown of the first-token wait: runner setup
+            # ("load") + prompt prefill ("prefill"). Together they explain
+            # every millisecond between the request and the first token.
+            "load_ms": int(load_ms) if load_ms is not None else -1,
+            "prefill_ms": int(prefill_ms) if prefill_ms is not None else -1,
+            "gen_ms": int(gen_ms) if gen_ms is not None else -1,
         }
         print("[KIYRA-PERF] " + " ".join(
             f"{k}={v}" for k, v in record.items()))
@@ -1862,6 +1874,16 @@ class LiveSession:
             # model emits **Thesis:** labels and inline backticks that render
             # as literal punctuation in the answer pane.
             answer = plain_answer("".join(tokens))
+            # A generation stopped by the token cap ends mid-sentence. Cut it
+            # back to the last complete sentence so the candidate never reads
+            # a broken sentence to the interviewer.
+            if (getattr(self.provider, "last_done_reason", None) == "length"
+                    and answer):
+                trimmed = trim_dangling_sentence(answer)
+                if trimmed != answer:
+                    print("[LLM] trimmed truncated answer: %d -> %d chars"
+                          % (len(answer), len(trimmed)))
+                    answer = trimmed
             if _trace is not None:
                 print(
                     "[CODE-TRACE] first_chunk=%r fenced_so_far=%s chunk_count=%s "
@@ -1895,6 +1917,11 @@ class LiveSession:
                 prompt_tokens=getattr(self.provider, "last_prompt_tokens", None),
                 completion_tokens=getattr(
                     self.provider, "last_completion_tokens", None),
+                truncated=(getattr(self.provider, "last_done_reason", None)
+                           == "length"),
+                load_ms=getattr(self.provider, "last_load_ms", None),
+                prefill_ms=getattr(self.provider, "last_prompt_eval_ms", None),
+                gen_ms=getattr(self.provider, "last_eval_ms", None),
             )
             print(
                 "[REALTIME_LATENCY] stt=%.0fms detect=%.0fms rag=%.0fms "

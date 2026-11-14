@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import pytest
 
-from realtime.formatting import plain_answer
+from realtime.formatting import plain_answer, trim_dangling_sentence
 
 
 def test_bold_labels_keep_their_words_and_lose_the_asterisks():
@@ -89,3 +89,33 @@ def test_never_raises_on_odd_input():
     # A formatting helper must not be able to lose an answer.
     assert plain_answer("**unbalanced bold") == "unbalanced bold"
     assert plain_answer("__also unbalanced") == "also unbalanced"
+
+
+# ── Truncated answers (provider stopped on the token cap) ──────────────────
+
+def test_trimmed_answer_drops_the_dangling_sentence():
+    """A capped generation ends mid-word — the candidate must not read it."""
+    text = ("I built Kiyra to give live interview answers. It streams STT "
+            "through WebSockets and grounds replies in the resume. The "
+            "retrieval layer ranks chunks by")
+    out = trim_dangling_sentence(text)
+    assert out.endswith("the resume.")
+    assert "ranks chunks" not in out
+
+
+def test_complete_answer_is_left_untouched():
+    text = "I built Kiyra to give live interview answers. It streams STT."
+    assert trim_dangling_sentence(text) == text
+
+
+def test_unclosed_code_fence_is_never_trimmed():
+    """Trimming across an open fence would corrupt the code block."""
+    text = "Here is the fix:\n\n```python\ndef f():\n    return 1"
+    assert trim_dangling_sentence(text) == text
+
+
+def test_trim_never_raises_on_odd_input():
+    assert trim_dangling_sentence("") == ""
+    assert trim_dangling_sentence("   ") == "   "
+    # No sentence boundary at all — keep the text rather than lose it.
+    assert trim_dangling_sentence("no terminator here") == "no terminator here"

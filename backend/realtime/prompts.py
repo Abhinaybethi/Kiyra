@@ -8,26 +8,31 @@ from __future__ import annotations
 
 # Per-type length targets. Coding answers need room for code blocks +
 # complexity + edge cases; conceptual stays tight for speak-aloud speed.
+#
+# These are WORD counts. The matching token caps live in
+# `config.answer_max_tokens_by_type` and must be sized from them — prose runs
+# ~1.2 tokens/word and code ~1.6, so a cap set below the word band's top
+# truncates the answer mid-sentence (the "…maintain stability" bug).
 _LENGTH_TARGETS = {
-    "conceptual": ("150-220 words", "130 words",
+    "conceptual": ("150-190 words", "130 words",
                    "(1) a one-sentence thesis; (2) a short paragraph on how "
-                   "it actually works; (3) four bullets, each naming a concrete "
+                   "it actually works; (3) three bullets, each naming a concrete "
                    "mechanism, API or number; (4) one concrete example (generic, "
                    "never a personal project); (5) one trade-off or gotcha"),
-    "coding": ("220-340 words", "180 words",
+    "coding": ("220-300 words", "180 words",
                "(1) a one-sentence thesis naming the approach; (2) a fenced "
                "code block with correct, runnable code; (3) time/space "
                "complexity stated explicitly; (4) one concrete usage example; "
                "(5) edge cases or gotchas to watch for"),
-    "behavioral": ("150-220 words", "120 words",
+    "behavioral": ("150-190 words", "120 words",
                    "(1) the direct answer in first person; (2) the situation "
                    "and your role; (3) the action you took; (4) the measurable "
                    "result; (5) what you learned"),
-    "debugging": ("180-260 words", "140 words",
+    "debugging": ("180-230 words", "140 words",
                   "(1) the likely root cause in one sentence; (2) the fix with "
                   "a code snippet; (3) why the fix works; (4) how to verify; "
                   "(5) prevention for next time"),
-    "sql": ("160-240 words", "130 words",
+    "sql": ("160-210 words", "130 words",
             "(1) the direct SQL answer; (2) the query in a fenced code block; "
             "(3) how the query works (joins, filters, indexes); (4) one "
             "optimization tip; (5) edge case (NULLs, duplicates)"),
@@ -38,7 +43,9 @@ def _length_note(qtype: str) -> str:
     words, minimum, parts = _LENGTH_TARGETS.get(
         qtype, _LENGTH_TARGETS["conceptual"])
     return (f"LENGTH: write {words}. Hard minimum {minimum} words — a shorter "
-            f"answer is a failed answer. Cover all five parts before you stop: "
+            f"answer is a failed answer. Do not go over the range either: an "
+            f"answer that stops mid-sentence is a failed answer too. Cover all "
+            f"five parts before you stop: "
             f"{parts}. Prefer specific mechanisms, names and numbers over "
             f"generic statements. Never restate the question.")
 

@@ -486,10 +486,11 @@ def _length_rule() -> str:
     """
     mode = (settings.answer_mode or "short").lower()
     if mode == "detailed":
-        return ("Length: detailed mode means 150-220 words. Cover a one-sentence "
-                "thesis, four bullets that each name a concrete mechanism, API "
+        return ("Length: detailed mode means 150-190 words. Cover a one-sentence "
+                "thesis, three bullets that each name a concrete mechanism, API "
                 "or number, one concrete example, and one trade-off. A "
-                "one-paragraph definition is NOT enough.")
+                "one-paragraph definition is NOT enough. Finish on a complete "
+                "sentence — a cut-off answer is a failed answer.")
     if mode == "medium":
         return ("Length: medium mode means 120-250 words: a thesis, 2-3 key "
                 "points and one concrete example.")

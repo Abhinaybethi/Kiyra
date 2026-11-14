@@ -122,9 +122,30 @@ async def lifespan(app: FastAPI):
             except Exception:
                 pass
 
+    def _warn_gpu_power():
+        """Tell the user when the GPU is power-capped (battery).
+
+        A laptop GPU on battery runs at roughly half the throughput of AC
+        power, which looks exactly like a broken/slow model. Saying it once
+        at startup saves rediscovering it every time answers feel sluggish.
+        """
+        try:
+            from ai.gpu_status import gpu_power_state
+            state = gpu_power_state()
+            if state.get("on_battery"):
+                print("[GPU] WARNING: %s (battery %s%%, power plan %r)"
+                      % (state.get("note"), state.get("percent"),
+                         state.get("scheme")))
+            elif state.get("scheme"):
+                print("[GPU] power=%s on_battery=%s"
+                      % (state.get("scheme"), state.get("on_battery")))
+        except Exception as e:
+            print(f"[GPU] power state unavailable: {e}")
+
     _threading.Thread(target=_warm_whisper, name="whisper-warmup", daemon=True).start()
     _threading.Thread(target=_warm_embeddings, name="embeddings-warmup", daemon=True).start()
     _threading.Thread(target=_warm_llm, name="llm-warmup", daemon=True).start()
+    _threading.Thread(target=_warn_gpu_power, name="gpu-power-check", daemon=True).start()
 
     yield
     # Shutdown: nothing to clean up
@@ -189,7 +210,15 @@ app.include_router(vision_router)
 
 @app.get("/health")
 async def health():
-    return {"status": "ok", "version": "1.0.0"}
+    # The GPU power state is included because a battery-capped laptop GPU
+    # halves inference throughput — the single most common "answers got slow"
+    # cause, and invisible from the API response alone.
+    from ai.gpu_status import gpu_power_state
+    return {
+        "status": "ok",
+        "version": "1.0.0",
+        "gpu": gpu_power_state(),
+    }
 
 
 @app.get("/api/transcription/health")
