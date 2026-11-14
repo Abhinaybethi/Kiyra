@@ -2027,8 +2027,18 @@ class StealthOverlayApp:
                     self._ui_turn_submitted(payload)
                 elif ev_type == "memory.updated":
                     self._ui_memory_updated(payload)
-                elif ev_type == "perf":
-                    print(f"[PERF] {payload}")
+                elif ev_type in ("perf", "kiyra.perf"):
+                    # The backend emits "kiyra.perf" (EventType.PERF); "perf"
+                    # is kept for older/alternate backends.
+                    print(
+                        "[PERF] ttft=%sms total=%sms load=%sms prefill=%sms "
+                        "gen=%sms rag=%sms tokens=%s/%s truncated=%s"
+                        % (payload.get("llm_ttft_ms"), payload.get("total_ms"),
+                           payload.get("load_ms"), payload.get("prefill_ms"),
+                           payload.get("gen_ms"), payload.get("retrieval_ms"),
+                           payload.get("completion_tokens"),
+                           payload.get("prompt_tokens"),
+                           payload.get("truncated")))
                 elif ev_type == "session.error":
                     msg_text = payload.get("message", "Unknown error")
                     print(f"[WS] Error: {msg_text}")
