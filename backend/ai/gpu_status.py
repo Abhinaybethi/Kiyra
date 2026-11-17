@@ -1,12 +1,25 @@
 """GPU power-state probe — explains "the app got slow" from the outside.
 
-Local inference on a laptop is GPU-bound, and a laptop GPU running on
-battery is hard-capped by the OS: measured on this machine, the RTX 3050
-pulled only ~30 W at 100% utilization with clocks pinned near 1.1 GHz of a
-2.1 GHz maximum, which roughly halves token throughput versus AC power
-(~95 W). The symptom is indistinguishable from "the model got slower", so
-the backend reports the power state explicitly instead of leaving it to be
-rediscovered.
+Local inference on a laptop is GPU-bound, and the GPU's *power budget* is
+the single biggest factor in how fast an answer appears. Two different
+things cap it, and they need different fixes:
+
+  1. BATTERY. Running unplugged halves the token throughput. Fix: plug in
+     the charger and use the "Best performance" power plan.
+
+  2. HYBRID-GRAPHICS (Optimus). On a laptop with an Intel iGPU driving the
+     display, the NVIDIA dGPU runs *compute only* and the driver caps it to
+     a low TGP. Measured on this machine (Acer Aspire A715-79G, RTX 3050):
+     the dGPU was limited to **30 W** of its 60 W default / 75 W maximum
+     *while plugged in*, ran at ~1.2 GHz of a 2.1 GHz maximum, and drew
+     ~29 W at 100% utilization — so the power cap, not the battery, was
+     the limit. Fix: NVIDIA Control Panel → Manage 3D settings → Power
+     management mode → "Prefer maximum performance" (or an admin
+     `nvidia-smi -pl 60`).
+
+The probe reports which of these is actually in play, because "plug in the
+charger" is useless advice when the machine is already on AC and the
+battery is at 100%.
 
 Windows-only; every probe is best-effort and never raises.
 
@@ -58,6 +71,54 @@ def _power_scheme() -> str:
         return ""
 
 
+def _nvidia_gpu_state() -> dict:
+    """Probe the NVIDIA GPU: power limit, clocks and display routing.
+
+    Returns a dict with any of these keys (missing/None when nvidia-smi is
+    unavailable or the query fails):
+      power_limit_w        — the limit the driver is enforcing RIGHT NOW
+      default_power_limit_w — the card's default TGP
+      max_power_limit_w    — the card's maximum TGP
+      clock_mhz            — current SM clock
+      max_clock_mhz        — maximum SM clock
+      display_active       — True when the dGPU drives a display
+    """
+    out: dict = {}
+    try:
+        res = subprocess.run(
+            ["nvidia-smi",
+             "--query-gpu=clocks.sm,clocks.max.sm,display_active",
+             "--format=csv,noheader,nounits"],
+            capture_output=True, text=True, timeout=8)
+        row = (res.stdout or "").strip().splitlines()[0]
+        parts = [p.strip() for p in row.split(",")]
+        if len(parts) >= 3:
+            out["clock_mhz"] = int(float(parts[0]))
+            out["max_clock_mhz"] = int(float(parts[1]))
+            out["display_active"] = parts[2].lower().startswith("enabled")
+    except Exception:
+        pass
+
+    try:
+        res = subprocess.run(["nvidia-smi", "-q", "-d", "POWER"],
+                             capture_output=True, text=True, timeout=8)
+        text = res.stdout or ""
+        for label, key in (("Current Power Limit", "power_limit_w"),
+                           ("Default Power Limit", "default_power_limit_w"),
+                           ("Max Power Limit", "max_power_limit_w")):
+            for line in text.splitlines():
+                if line.strip().startswith(label):
+                    raw = line.split(":", 1)[1].strip().split()[0]
+                    try:
+                        out[key] = int(float(raw))
+                    except (ValueError, IndexError):
+                        pass
+                    break
+    except Exception:
+        pass
+    return out
+
+
 def gpu_power_state() -> dict:
     """Describe the machine's GPU power situation.
 
@@ -67,6 +128,8 @@ def gpu_power_state() -> dict:
       percent    — battery charge percentage, or None
       scheme     — active Windows power plan name
       note       — human-readable explanation, empty when nothing is wrong
+    plus the raw NVIDIA numbers (power_limit_w, clock_mhz, …) when a GPU
+    is present.
     """
     state = {
         "supported": platform.system() == "Windows",
@@ -91,10 +154,29 @@ def gpu_power_state() -> dict:
     except Exception:
         pass
 
+    gpu = _nvidia_gpu_state()
+    state.update(gpu)
+
     if state["on_battery"]:
         state["note"] = (
             "Running on battery: the GPU is power-capped, so answers take "
             "roughly twice as long. Plug in the charger and set the power "
             "plan to Best performance."
+        )
+        return state
+
+    # On AC. The remaining cap is the hybrid-graphics one: the dGPU runs
+    # compute-only (the iGPU drives the display) and the driver holds it at
+    # a fraction of its TGP. "Plug in the charger" would be useless advice
+    # here — the machine is already on AC.
+    limit = gpu.get("power_limit_w")
+    default = gpu.get("default_power_limit_w")
+    if limit and default and limit < default * 0.7:
+        state["note"] = (
+            f"GPU power-capped to {limit} W of its {default} W default "
+            f"(the iGPU drives the display, so the RTX card runs compute-only "
+            f"at a reduced TGP). This roughly doubles answer latency. Fix: "
+            f"NVIDIA Control Panel -> Manage 3D settings -> Power management "
+            f"mode -> 'Prefer maximum performance'."
         )
     return state

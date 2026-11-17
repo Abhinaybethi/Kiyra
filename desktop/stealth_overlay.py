@@ -765,8 +765,9 @@ class StealthOverlayApp:
         self.lbl_timer.pack(side=tk.LEFT, padx=(0, 8))
         self.btn_pin = self._btn(ctrls, "📌", lambda: self.toggle_pin(), font_size=9, padx=8, pady=4)
         self.btn_pin.pack(side=tk.LEFT, padx=1)
-        self.btn_visibility = self._btn(ctrls, "▁", self.toggle_visibility, font_size=9, padx=8, pady=4)
-        self.btn_visibility.pack(side=tk.LEFT, padx=1)
+        # The "▁" hide/show button was removed from the top-right cluster — it
+        # duplicated the F9 hotkey and ate a slot in the compact preset. The
+        # F9 hotkey (toggle_visibility) is unchanged.
         self.btn_settings = self._btn(ctrls, "⚙", self.open_settings, font_size=11, padx=8, pady=4)
         self.btn_settings.pack(side=tk.LEFT, padx=1)
         self.btn_close = self._btn(ctrls, "✕", self._on_close, fg=self.danger_color, font_size=11, padx=8, pady=4)

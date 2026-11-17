@@ -41,6 +41,36 @@ class Settings(BaseSettings):
     # context changes. Live prompts are ~1-2k tokens, so 4096 is ample and keeps
     # VRAM low (the overlay may share a 6 GB laptop GPU).
     ollama_num_ctx: int = 4096
+    # Prefill batch sizes. Ollama's default (512) processes the prompt in
+    # small batches, which costs ~1.1-2.1 s for a live prompt on this
+    # laptop GPU.
+    #
+    # Measured on the RTX 3050 / qwen3.5:4b (time to the FIRST streamed token
+    # on the real production prompt, 1192 tokens):
+    #
+    #     no batch     3979-4038 ms   prefill 1067-1092 ms
+    #     num_batch 1024  4430-4614 ms  prefill 1787-1840 ms  (SLOWER — the
+    #                         prompt no longer fits in one batch)
+    #     num_batch 2048  2917-3013 ms  prefill  156- 263 ms  (best)
+    #
+    # CAUTION when re-measuring: Ollama caches the KV state of a prompt, so
+    # replaying the SAME prompt twice reports a tiny prefill that has
+    # nothing to do with the setting (measured: 154 ms cached vs 2380 ms
+    # for the same prompt with one changed token). Always measure with a
+    # UNIQUE prompt — that is what the live path sends on every turn.
+    #
+    # On the live path (800-1900 token prompts) the prefill settles at
+    # ~1.7-2.0 ms/token and the batch size moves the total TTFT by less
+    # than the run-to-run noise, so 2048 is kept: it keeps the whole live
+    # prompt in ONE batch (the 1858-token coding prompt measured 2348 ms
+    # prefill at 2048 vs 2996 ms at 512) and costs ~300 MiB more VRAM
+    # (4.05 of 6.1 GB).
+    #
+    # These MUST stay identical on every request (including the startup
+    # warmup): Ollama reloads the runner when they change, and a reload costs
+    # ~20 s. Set them back to 1024 (or 512) on a GPU with less than ~5 GB.
+    ollama_num_batch: int = 2048
+    ollama_num_ubatch: int = 2048
 
     # ─── App ──────────────────────────────────────────────────────────────────
     app_name: str = "Kiyra — Interview Copilot"
@@ -180,6 +210,19 @@ class Settings(BaseSettings):
     }
     rag_timeout: float = 3.0  # Hard ceiling for non-realtime RAG
     realtime_rag_timeout: float = 0.5  # Real-time ceiling — slow RAG must never block first answer
+
+    # ── Hybrid retrieval / passage selection ────────────────────────────────
+    # A document shorter than this is returned WHOLE (there is nothing to
+    # select, and the complete answer is what the model needs). Longer
+    # documents are cut into sentence-aligned passages and the relevant ones
+    # are re-assembled verbatim.
+    rag_short_doc_chars: int = 1200
+    rag_passage_max_chars: int = 320   # Max size of one selected passage
+    rag_passage_min_chars: int = 40    # Merge a smaller trailing passage back
+    rag_passages_per_doc: int = 3      # Passages kept per selected document
+    # MMR: 1.0 = pure relevance, 0.0 = pure diversity. 0.7 keeps the best
+    # passage while still dropping near-duplicates.
+    rag_mmr_lambda: float = 0.7
     realtime_top_k: int = 6  # Realtime retrieval depth (default)
     realtime_top_k_by_type: dict = {
         "conceptual": 4,
@@ -191,12 +234,12 @@ class Settings(BaseSettings):
     }
     realtime_max_context_chars: int = 2500  # Realtime RAG context budget (default)
     realtime_max_context_chars_by_type: dict = {
-        "conceptual": 1800,
-        "coding": 3600,
-        "behavioral": 2000,
-        "debugging": 2800,
-        "sql": 2400,
-        "default": 2500,
+        "conceptual": 1600,
+        "coding": 2800,
+        "behavioral": 1800,
+        "debugging": 2400,
+        "sql": 2200,
+        "default": 2200,
     }
 
     # Per-question-type temperature. Coding needs determinism (low), conceptual

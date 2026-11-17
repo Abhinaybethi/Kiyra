@@ -127,6 +127,7 @@ async def analyze_image(
         context, rag_metrics = await asyncio.to_thread(
             retrieve_context_sync, profile.id, question or ocr["text"],
             top_k=settings.rag_top_k,
+            db=db,
         )
         rag_used = bool(context)
         rag_ms = rag_metrics.get("embed_ms", 0.0) + rag_metrics.get("search_ms", 0.0)

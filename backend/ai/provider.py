@@ -397,6 +397,13 @@ class OllamaProvider(AIProvider):
         self.last_load_ms: Optional[int] = None
         self.last_prompt_eval_ms: Optional[int] = None
         self.last_eval_ms: Optional[int] = None
+        # Client-side view of the wait: time to the response HEADERS (the
+        # request was accepted) and to the FIRST streamed token.
+        self.last_http_ms: Optional[int] = None
+        self.last_first_chunk_ms: Optional[int] = None
+        # The options actually sent with the last request. Surfaced in the
+        # perf record so a slow prefill can be traced to the exact payload.
+        self.last_options: dict = {}
 
     @property
     def model_name(self) -> str:
@@ -433,8 +440,23 @@ class OllamaProvider(AIProvider):
         num_ctx = getattr(settings, "ollama_num_ctx", 0)
         if num_ctx:
             payload["options"]["num_ctx"] = int(num_ctx)
+        # Prefill batch sizes. Bigger batches make the prompt evaluation
+        # (the "prefill" phase before the first token) dramatically faster on
+        # a local GPU: measured 1034 ms -> 143 ms for a 699-token prompt.
+        #
+        # These are sent on EVERY request — including the startup warmup — on
+        # purpose. Ollama re-allocates the compute pool when they change and
+        # reloads the runner (~20 s), so the warmup has to pin exactly the
+        # same values the live requests use.
+        num_batch = getattr(settings, "ollama_num_batch", 0)
+        if num_batch:
+            payload["options"]["num_batch"] = int(num_batch)
+        num_ubatch = getattr(settings, "ollama_num_ubatch", 0)
+        if num_ubatch:
+            payload["options"]["num_ubatch"] = int(num_ubatch)
 
         if stream:
+            self.last_options = dict(payload["options"])
             client = httpx.AsyncClient(timeout=self._timeout)
             return self._stream_complete(client, payload)
 
@@ -464,14 +486,24 @@ class OllamaProvider(AIProvider):
         self.last_prompt_tokens = None
         self.last_completion_tokens = None
         self.last_done_reason = None
+        self.last_http_ms = None
+        self.last_first_chunk_ms = None
+        t0 = time.monotonic()
         try:
             async with client.stream("POST", f"{self._base_url}/api/chat", json=payload) as resp:
                 resp.raise_for_status()
+                # Time to the response HEADERS: the request was accepted and
+                # the server started working. Everything after this is the
+                # server actually producing the first token.
+                self.last_http_ms = int((time.monotonic() - t0) * 1000)
                 async for line in resp.aiter_lines():
                     if line:
                         try:
                             chunk = json.loads(line)
                             if content := chunk.get("message", {}).get("content"):
+                                if self.last_first_chunk_ms is None:
+                                    self.last_first_chunk_ms = int(
+                                        (time.monotonic() - t0) * 1000)
                                 yield content
                             if chunk.get("done"):
                                 self.last_prompt_tokens = chunk.get("prompt_eval_count")

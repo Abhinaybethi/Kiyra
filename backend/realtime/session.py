@@ -432,6 +432,20 @@ class LiveSession:
         """[CODE-TRACE] final generation boundary: does the exact prompt about
         to reach the provider still carry the coding instruction? Logs ONLY
         marker booleans + the analysis fields — never resume/context/prompt."""
+        # Opt-in prompt dump for latency work (never on by default — the
+        # prompt contains the candidate's private documents):
+        #   KIYRA_DUMP_PROMPT=1 writes the exact messages to
+        #   %TEMP%/kiyra_prompt_dump.json so a bench can replay them.
+        if os.environ.get("KIYRA_DUMP_PROMPT"):
+            try:
+                import tempfile
+                path = os.path.join(tempfile.gettempdir(),
+                                    "kiyra_prompt_dump.json")
+                with open(path, "w", encoding="utf-8") as fh:
+                    json.dump([{"role": "system", "content": system},
+                               {"role": "user", "content": user_prompt}], fh)
+            except Exception:
+                pass
         q_safe = " ".join(str(question or "").split())[:100]
         had = analysis is not None
         req = bool(had and analysis.requires_code)
@@ -683,6 +697,7 @@ class LiveSession:
         if tracker is None:
             return
         d = tracker.durations
+        opts = getattr(self.provider, "last_options", None) or {}
 
         def _ms(key):
             val = d.get(key)
@@ -719,6 +734,21 @@ class LiveSession:
             "load_ms": int(load_ms) if load_ms is not None else -1,
             "prefill_ms": int(prefill_ms) if prefill_ms is not None else -1,
             "gen_ms": int(gen_ms) if gen_ms is not None else -1,
+            # The options the provider actually sent. If these do not match
+            # the configured values, Ollama reloads its runner on every turn
+            # (~20 s) — the single worst failure mode for live latency.
+            "num_batch": int(opts.get("num_batch", -1)) if opts else -1,
+            "num_ctx": int(opts.get("num_ctx", -1)) if opts else -1,
+            # Full option set — the only way to compare a live request with
+            # a replayed one byte for byte.
+            "opts": ",".join(f"{k}={v}" for k, v in sorted(opts.items()))
+            if opts else "",
+            # Client-side split of the first-token wait: "http" is the time
+            # until the server accepted the request, "first_chunk" until the
+            # first token actually arrived.
+            "http_ms": int(getattr(self.provider, "last_http_ms", -1) or -1),
+            "first_chunk_ms": int(
+                getattr(self.provider, "last_first_chunk_ms", -1) or -1),
         }
         print("[KIYRA-PERF] " + " ".join(
             f"{k}={v}" for k, v in record.items()))
@@ -1387,6 +1417,7 @@ class LiveSession:
                     question,
                     top_k=settings.realtime_top_k,
                     max_context_chars=settings.realtime_max_context_chars,
+                    db=self.db,
                 ),
                 timeout=settings.rag_timeout,
             )
@@ -1463,6 +1494,7 @@ class LiveSession:
                     or settings.realtime_max_context_chars,
                     qtype=qtype,
                     db=self.db,
+                    topic=topic,
                 ),
                 timeout=settings.realtime_rag_timeout,
             )
@@ -1805,6 +1837,12 @@ class LiveSession:
             tokens: list[str] = []
             partial = ""
             last_flush = time.monotonic()
+            # The very first chunk is flushed the moment it arrives. The
+            # 40-char / 0.1 s gate below exists to avoid a chatty event
+            # stream, but it also delayed the first *visible* text by a few
+            # hundred ms — dead air exactly when the candidate is waiting to
+            # start reading. Everything after the first chunk stays batched.
+            first_flush = True
             q: asyncio.Queue = asyncio.Queue()
             drain = asyncio.create_task(self._drain(stream, q, _ANSWER_END))
             token_deadline: Optional[float] = None
@@ -1848,7 +1886,8 @@ class LiveSession:
                     _trace["first_chunk"] = tok.strip()[:80]
                 if _trace is not None and ("```" in tok or "~~~" in tok):
                     _trace["fenced_so_far"] = True
-                if len(partial) >= 40 or (time.monotonic() - last_flush) > 0.1:
+                if (first_flush or len(partial) >= 40
+                        or (time.monotonic() - last_flush) > 0.1):
                     await self.send(EventType.ANSWER_STREAMED, {
                         "delta": partial,
                         "request_id": request_id,
@@ -1856,6 +1895,7 @@ class LiveSession:
                     perf.first_visible(llm_call_t)
                     partial = ""
                     last_flush = time.monotonic()
+                    first_flush = False
 
             if partial and self._current_request_id == request_id:
                 await self.send(EventType.ANSWER_STREAMED, {

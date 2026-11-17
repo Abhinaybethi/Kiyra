@@ -201,7 +201,8 @@ async def suggest_answer(data: AnswerSuggestionRequest, db: Session = Depends(ge
         # No session — still generate using profile context
         from knowledge.retrieval import retrieve_context
         from agents.answer_agent import AnswerAgent
-        context = await retrieve_context(profile.id, data.question, top_k=3)
+        context = await retrieve_context(profile.id, data.question, top_k=3,
+                                         db=db)
         provider = get_provider(db=db)
         agent = AnswerAgent(db, provider)
         result = await agent.run(
