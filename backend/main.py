@@ -136,16 +136,49 @@ async def lifespan(app: FastAPI):
                 print("[GPU] WARNING: %s (battery %s%%, power plan %r)"
                       % (state.get("note"), state.get("percent"),
                          state.get("scheme")))
-            elif state.get("scheme"):
+            elif state.get("note"):
+                print("[GPU] WARNING: %s (power plan %r)"
+                      % (state.get("note"), state.get("scheme")))
+            else:
                 print("[GPU] power=%s on_battery=%s"
                       % (state.get("scheme"), state.get("on_battery")))
         except Exception as e:
             print(f"[GPU] power state unavailable: {e}")
 
+    def _tune_gpu():
+        """Put the local model on the fast GPU.
+
+        On a hybrid-graphics laptop the dGPU runs at a reduced TGP unless
+        Windows is told to prefer it (measured: 30 W -> 60 W, which is worth
+        ~20-30% of the answer latency). The preference is written to the
+        per-user registry, so it survives restarts and shows up in
+        Windows Settings -> Display -> Graphics as "High performance".
+
+        Best-effort: a failure here must never stop the backend.
+        """
+        if os.environ.get("TESTING"):
+            return
+        try:
+            from ai.gpu_tuning import ensure_high_performance_gpu
+            result = ensure_high_performance_gpu()
+            if result.get("applied"):
+                print("[GPU] assigned to high-performance GPU: %s"
+                      % ", ".join(result["applied"]))
+            if result.get("failed"):
+                print("[GPU] could not set the GPU preference for: %s"
+                      % ", ".join(result["failed"]))
+            if result.get("plan") and not result.get("plan_is_fast"):
+                print("[GPU] NOTE: power plan is %r — a performance plan "
+                      "(Best performance) makes answers ~20%% faster"
+                      % result["plan"])
+        except Exception as e:
+            print(f"[GPU] tuning skipped: {e}")
+
     _threading.Thread(target=_warm_whisper, name="whisper-warmup", daemon=True).start()
     _threading.Thread(target=_warm_embeddings, name="embeddings-warmup", daemon=True).start()
     _threading.Thread(target=_warm_llm, name="llm-warmup", daemon=True).start()
     _threading.Thread(target=_warn_gpu_power, name="gpu-power-check", daemon=True).start()
+    _threading.Thread(target=_tune_gpu, name="gpu-tune", daemon=True).start()
 
     yield
     # Shutdown: nothing to clean up
@@ -214,10 +247,24 @@ async def health():
     # halves inference throughput — the single most common "answers got slow"
     # cause, and invisible from the API response alone.
     from ai.gpu_status import gpu_power_state
+    gpu = gpu_power_state()
+    # …plus whether the local model is actually assigned to the fast GPU.
+    # On a hybrid-graphics laptop the dGPU otherwise runs at a reduced TGP
+    # (30 W instead of 60 W here), which costs ~20-30% of the latency.
+    try:
+        from ai.gpu_tuning import ensure_high_performance_gpu
+        tuning = ensure_high_performance_gpu()
+        gpu["tuning"] = {
+            "fast_gpu_assigned": not tuning.get("failed"),
+            "plan_is_fast": tuning.get("plan_is_fast", False),
+            "plan": tuning.get("plan", ""),
+        }
+    except Exception:
+        pass
     return {
         "status": "ok",
         "version": "1.0.0",
-        "gpu": gpu_power_state(),
+        "gpu": gpu,
     }
 
 
