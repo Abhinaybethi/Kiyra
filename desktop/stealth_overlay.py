@@ -241,23 +241,19 @@ except Exception:
     np = None
 
 try:
-    import sounddevice as sd
-except Exception:
-    sd = None
-
-try:
     import websockets
     import asyncio
 except Exception:
     websockets = None
     asyncio = None
 
+# Interview audio has exactly one source: Windows WASAPI loopback.  There is
+# deliberately no sounddevice/microphone import in this module.
 from audio_loopback import (
+    MONITOR_INTERVAL_SECONDS,
     LoopbackCapture,
-    MicrophoneCapture,
-    _MixingChunkSink,
+    WASAPIDeviceMonitor,
     bounded_put_drop_oldest,
-    enumerate_microphones,
     find_wasapi_loopback_device,
     validate_wasapi_loopback,
 )
@@ -342,8 +338,7 @@ class StealthOverlayApp:
         # Bounded per-device ingestion queues (drop oldest, never block callback)
         self._device_queue_size = 64
 
-        # Device selection
-        self.mic_device = None
+        # Device selection — WASAPI loopback is the ONLY audio source.
         self.loopback_device = None
 
         # Internal state
@@ -393,9 +388,7 @@ class StealthOverlayApp:
         self._perf_first_chunk_recv = None   # ws recv time of first chunk
         self._perf_first_chunk_rendered = None  # Tk render time of first chunk
         self._perf_chunks = 0
-        self._mic_list = []
         self._loop_name = None
-        self._mic_choice = None
         self._loop_choice = None
         self._last_loop = None
         self._region_after = None
@@ -1716,24 +1709,13 @@ class StealthOverlayApp:
     # ─────────────────────────────────────────────────────────────────────────
 
     def _populate_devices(self):
-        """Populate device state. Loopback is discovered + validated through
-        pyaudiowpatch (WASAPI system-audio capture) rather than by poking known
-        driver names, so it works with headphones/speakers regardless of whether
-        a 'Stereo Mix' device exists."""
-        # Microphones via sounddevice.
-        try:
-            mics = enumerate_microphones()
-            self._mic_list = [f"{d['index']}: {d['name']}" for d in mics]
-        except Exception as e:
-            print(f"[AUDIO_DEVICE] mic enumeration failed: {e}")
-            self._mic_list = []
-        # Default the mic selection to the first device (unset => mic off).
-        self._mic_choice = self._mic_list[0] if self._mic_list else None
-        print(f"[AUDIO_DEVICE] microphones={len(self._mic_list)}")
+        """Discover the WASAPI loopback twin of the default playback endpoint.
 
-        # Loopback via pyaudiowpatch WASAPI loopback (single selectable source:
-        # the default playback endpoint, headphones or speakers).
+        There is no alternative audio source in Kiyra: if this endpoint is
+        unavailable, capture stays unavailable (no microphone fallback).
+        """
         self.loopback_device = None
+        self._last_loop = None
         self._loop_name = None
         self._loop_choice = None
         try:
@@ -1747,22 +1729,14 @@ class StealthOverlayApp:
                 self.loopback_device = info
                 self._last_loop = info
                 self._loop_name = f"WASAPI Loopback: {info['name']}"
-                # Default the selection to the detected loopback, otherwise
-                # start_capture() treats an unset choice as "disabled" and
-                # silently captures the mic only (no interviewer audio).
+                # An unset choice means "disabled"; default to the detected
+                # loopback so starting capture always uses system playback.
                 self._loop_choice = self._loop_name
                 print(f"[AUDIO_LOOPBACK] operational ({info['samplerate']}Hz)")
             else:
-                print("[AUDIO_CAPTURE] microphone_only_fallback (loopback unusable)")
+                print("[AUDIO_CAPTURE] loopback_stream_validation_failed")
         else:
-            print("[AUDIO_CAPTURE] microphone_only_fallback (no loopback endpoint)")
-
-        if not self._mic_list and info is None:
-            print("[AUDIO_CAPTURE] no_audio_sources_available")
-        elif not self._mic_list:
-            print("[AUDIO_CAPTURE] loopback_only")
-        elif info is None:
-            print("[AUDIO_CAPTURE] microphone_only")
+            print("[AUDIO_CAPTURE] no_loopback_endpoint (microphone capture is disabled)")
 
         self._sync_sys_audio_selector()
 
@@ -1778,21 +1752,23 @@ class StealthOverlayApp:
             self.start_capture()
 
     def start_capture(self):
-        """Start audio capture and WebSocket connection."""
-        if sd is None or np is None or websockets is None:
+        """Start WASAPI loopback capture and WebSocket connection."""
+        if np is None or websockets is None:
             messagebox.showerror(
                 "Missing Dependencies",
-                "Install: numpy, sounddevice, websockets"
+                "Install: numpy, pyaudiowpatch, websockets"
             )
             return
 
-        try:
-            mic_sel = getattr(self, "_mic_choice", None)
-            self.mic_device = int(mic_sel.split(":", 1)[0]) if mic_sel else None
-            if not (getattr(self, "_loop_choice", None)):
-                self.loopback_device = None
-        except Exception:
-            self.mic_device = getattr(self, "mic_device", None)
+        if not (getattr(self, "_loop_choice", None)):
+            self.loopback_device = None
+        if self.loopback_device is None:
+            print("[AUDIO_CAPTURE] no_loopback_endpoint (microphone capture is disabled)")
+            try:
+                self._ui_set_status("No WASAPI loopback endpoint", ok=False)
+            except Exception:
+                pass
+            return
 
         if self._capture_thread and self._capture_thread.is_alive():
             return
@@ -1831,8 +1807,8 @@ class StealthOverlayApp:
         print("[Capture] Stopped")
 
     def _push_audio_chunk(self, wav_bytes: bytes):
-        """Called from either capture source's audio callback. Never blocks:
-        bounded queue, drop-oldest on overflow, rate-limited counters."""
+        """Called by the WASAPI loopback capture. Never blocks: bounded queue,
+        drop-oldest on overflow, rate-limited counters."""
         dropped = bounded_put_drop_oldest(self._audio_queue, wav_bytes)
         if dropped:
             self._ws_audio_dropped += 1
@@ -1844,73 +1820,98 @@ class StealthOverlayApp:
             )
 
     def _capture_loop(self):
-        """Orchestrate LoopbackCapture + MicrophoneCapture through a shared
-        mixing sink.
+        """Run ONE WASAPI loopback stream and reinitialize it on endpoint changes.
 
-        Both sources emit continuous 16 kHz float32 streams; the
-        ``_MixingChunkSink`` pairs their 250 ms buffers and mixes them per
-        chunk (a solo-active source passes through at unity), pushing ONE
-        mixed 250ms/16k/mono PCM16 WAV stream into the bounded ``_audio_queue``
-        (drop-oldest). Without the mixer the two sources would interleave loud
-        speech with near-silence every 250 ms and Whisper would return empty
-        transcripts. A failure in either source never kills the other
-        (single-source degrades cleanly)."""
-        captures = []
-        # No fixed mic gate: this mic's noise floor (~0.007) sits below the
-        # old 0.015 gate, so gating zeroed the voice and fragmented utterances.
-        # The backend's adaptive EnergyVAD handles room noise instead, and the
-        # mixer keeps a solo-active source at unity so quiet speech stays above
-        # the VAD start threshold.
-        mixer = _MixingChunkSink(self._push_audio_chunk, n_sources=2,
-                                 source_names=("mic", "loopback"))
+        The default Windows playback endpoint can move between laptop speakers,
+        wired headphones and Bluetooth headsets.  :class:`WASAPIDeviceMonitor`
+        polls its loopback twin; when it changes we stop the old stream and open
+        a new one on the new render endpoint.  If the endpoint disappears we
+        report a loopback disconnection and wait for it to come back — there is
+        no microphone fallback in this pipeline.
+        """
+        capture = None
+        monitor = None
 
-        if self.mic_device is not None:
-            mic = MicrophoneCapture(
-                device_index=self.mic_device, on_chunk=self._push_audio_chunk,
-                sink=mixer.for_source(0),
-            )
-            if mic.start():
-                captures.append(mic)
-            else:
-                print("[AUDIO_CAPTURE] microphone unavailable")
-                self.mic_device = None
-
-        if self.loopback_device is not None:
-            loop = LoopbackCapture(
-                on_chunk=self._push_audio_chunk, device_info=self.loopback_device,
-                sink=mixer.for_source(1),
-            )
-            if loop.start():
-                captures.append(loop)
-                self._loopback_active = True
-                self._render_sys_audio_state()
-            else:
-                print("[AUDIO_CAPTURE] microphone_only_fallback")
-                self.loopback_device = None
-                self._loopback_active = False
-                self._render_sys_audio_state()
-
-        if not captures:
-            print("[AUDIO_CAPTURE] no_audio_sources_available")
+        def _status(message: str):
+            # Only actionable failures go to the status line.  "started",
+            # "idle" and "resumed" are normal loopback lifecycle messages and
+            # are already printed by the capture class.
+            if not any(k in message.lower() for k in
+                       ("disconnected", "unavailable", "invalid", "failed")):
+                return
             try:
-                self.root.after(0, lambda: self._ui_set_status(
-                    "No audio source available", ok=False))
+                self._ui_set_status(message, ok=False)
             except Exception:
                 pass
-            return
 
-        print(f"[AUDIO_QUEUE] sender queue max={self._audio_queue.maxsize} frames")
+        def _start_for(info: dict):
+            nonlocal capture
+            capture = LoopbackCapture(
+                on_chunk=self._push_audio_chunk, device_info=info,
+                on_status=_status,
+            )
+            if capture.start():
+                self._loopback_active = True
+                self._render_sys_audio_state()
+                return True
+            capture = None
+            self._loopback_active = False
+            self._render_sys_audio_state()
+            return False
+
         try:
-            while not self._stop_event.is_set():
-                time.sleep(0.5)
+            monitor = WASAPIDeviceMonitor()
+            monitor.changed(self.loopback_device)  # baseline (already validated)
+            if not _start_for(self.loopback_device):
+                print("[AUDIO_CAPTURE] loopback_start_failed")
+                _status("WASAPI loopback unavailable")
+                return
+
+            print(f"[AUDIO_QUEUE] sender queue max={self._audio_queue.maxsize} frames")
+            while not self._stop_event.wait(MONITOR_INTERVAL_SECONDS):
+                current = monitor.poll()
+                if not monitor.changed(current):
+                    continue
+                old_key = (capture.endpoint_key() if capture else None)
+                new_key = (int(current["index"]), str(current["name"])) if current else None
+                if current is None:
+                    print("[AUDIO_LOOPBACK] disconnected reason=default_render_endpoint_gone")
+                    _status("Loopback disconnected — no microphone fallback")
+                    if capture is not None:
+                        capture.stop()
+                        capture = None
+                    self._loopback_active = False
+                    self._render_sys_audio_state()
+                    continue
+                if new_key == old_key:
+                    continue
+                print("[AUDIO_LOOPBACK] endpoint changed %s -> %s; reinitializing"
+                      % (old_key, new_key))
+                if capture is not None:
+                    capture.stop()
+                    capture = None
+                if validate_wasapi_loopback(current):
+                    self.loopback_device = current
+                    self._last_loop = current
+                    self._loop_name = f"WASAPI Loopback: {current['name']}"
+                    self._loop_choice = self._loop_name
+                    self._sync_sys_audio_selector()
+                    if _start_for(current):
+                        print("[AUDIO_LOOPBACK] reinitialized endpoint=%r" % current["name"])
+                    else:
+                        _status("Loopback reinit failed")
+                else:
+                    self._loopback_active = False
+                    _status("Loopback endpoint invalid")
         except Exception as e:
             print(f"[Capture] Error: {e}")
         finally:
-            for c in captures:
-                try:
-                    c.stop()
-                except Exception:
-                    pass
+            if capture is not None:
+                capture.stop()
+            if monitor is not None:
+                monitor.close()
+            self._loopback_active = False
+            self._render_sys_audio_state()
             print("[Capture] Streams closed")
 
     # ─────────────────────────────────────────────────────────────────────────
@@ -3202,31 +3203,22 @@ class StealthOverlayApp:
         tk.Label(win, text="Audio Devices", bg=self.bg_color, fg=self.text_primary,
                  font=(self.font_family, _fs(10), "bold")).pack(anchor="w", padx=12, pady=(0, 6))
 
-        mic_list = getattr(self, "_mic_list", []) or ["<no microphones found>"]
         loop_vals = ([self._loop_name] if getattr(self, "_loop_name", None) else ["<unavailable>"])
 
         frm = tk.Frame(win, bg=self.bg_color)
         frm.pack(fill=tk.X, padx=12)
-        tk.Label(frm, text="Microphone:", bg=self.bg_color, fg=self.text_secondary,
+        tk.Label(frm, text="WASAPI Loopback:", bg=self.bg_color, fg=self.text_secondary,
                  font=(self.font_family, _fs(9))).grid(row=0, column=0, sticky="w", pady=4)
-        cmb_mic = ttk.Combobox(frm, values=mic_list, state="readonly", width=44)
-        cmb_mic.set(getattr(self, "_mic_choice", "") or (mic_list[0] if mic_list else ""))
-        cmb_mic.grid(row=0, column=1, padx=8, sticky="ew", pady=4)
-        tk.Label(frm, text="System Audio:", bg=self.bg_color, fg=self.text_secondary,
-                 font=(self.font_family, _fs(9))).grid(row=1, column=0, sticky="w", pady=4)
         cmb_loop = ttk.Combobox(frm, values=loop_vals, state="readonly", width=44)
         cmb_loop.set(getattr(self, "_loop_choice", "") or loop_vals[0])
-        cmb_loop.grid(row=1, column=1, padx=8, sticky="ew", pady=4)
+        cmb_loop.grid(row=0, column=1, padx=8, sticky="ew", pady=4)
+        tk.Label(frm, text="Microphone capture is disabled — system playback only.",
+                 bg=self.bg_color, fg=self.text_secondary,
+                 font=(self.font_family, _fs(8))).grid(
+                     row=1, column=0, columnspan=2, sticky="w", pady=(2, 6))
         frm.columnconfigure(1, weight=1)
 
         def apply():
-            try:
-                sel = cmb_mic.get()
-                self._mic_choice = sel if "no " not in sel else None
-                self.mic_device = int(sel.split(":", 1)[0]) if sel and "no " not in sel else None
-            except Exception:
-                self._mic_choice = None
-                self.mic_device = None
             try:
                 sel = cmb_loop.get()
                 self._loop_choice = sel if "unavailable" not in sel else None

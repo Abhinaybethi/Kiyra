@@ -1,38 +1,39 @@
 """
-Windows system-audio loopback + microphone capture for the Kiyra Stealth Overlay.
+Windows OS-level system playback capture for the Kiyra Stealth Overlay.
 
-Two fully independent capture sources:
+THE INTERVIEW AUDIO PIPELINE HAS EXACTLY ONE SOURCE: Windows WASAPI loopback.
 
-  * ``LoopbackCapture`` — WASAPI system-audio loopback via ``pyaudiowpatch``.
-    This captures whatever Windows is playing out through the default playback
-    device (speakers OR headphones).  This is the interviewer-voice path for the
-    "wearing headphones" scenario: meeting audio (Zoom/Teams/Meet) is played out
-    the headphones and we capture it at the OS level, so the microphone is not
-    needed for the interviewer's voice.
-  * ``MicrophoneCapture`` — classic microphone capture via ``sounddevice``.
+The capture endpoint is the ``[Loopback]`` analogue of the current default
+Windows *render* (playback) endpoint, discovered through ``pyaudiowpatch``.
+Opening that endpoint with ``input=True`` makes the patched PortAudio/WASAPI
+backend create the capture client with ``AUDCLNT_STREAMFLAGS_LOOPBACK`` in
+**shared mode**, so the samples come straight from the Windows Audio Engine's
+render path — never from a physical microphone, headphone mic, speaker mic or
+acoustic recording.  The device's ``isLoopbackDevice`` flag and the WASAPI host
+API are verified before any stream is opened; a non-loopback device is refused.
 
-Both sources emit identical chunks: **16000 Hz, mono, PCM16, 250 ms** WAV bytes
-(4000 samples), i.e. exactly the WAV contract the Kiyra backend expects on the
-``/api/interviews/{id}/ws`` binary stream.
+Chunks emitted by :class:`LoopbackCapture` are exactly what the backend expects
+on the WebSocket: **16000 Hz, mono, PCM16, 250 ms** WAV bytes (4000 samples).
+Native-rate stereo float data is down-mixed and linearly resampled on the way.
 
-Design rules:
-  * The PortAudio/WASAPI audio callback NEVER blocks: per-source numpy
-    accumulation + chunking only, plus a drop-oldest ``put_nowait`` into a
-    bounded queue.
-  * Loopback is captured at the device's native sample rate (typically 48 kHz)
-    and resampled to 16 kHz with the repository's existing lightweight linear
-    resampler.  Stereo is down-mixed to mono.
-  * A failure in one source never affects the other; the overlay orchestrates
-    fallback (``microphone_only_fallback`` / ``loopback_only`` /
-    ``no_audio_sources_available``).
-  * sounddevice / pyaudiowpatch / numpy are imported lazily so the module can be
-    unit-tested on machines without audio hardware.
+Additional guarantees:
+  * Callback timestamps (``input_buffer_adc_time``) are tracked; render-path
+    buffer discontinuities are detected and reported, with bounded silence
+    inserted so the 16 kHz timeline stays continuous.
+  * When Windows has no active render stream, WASAPI loopback delivers no
+    callbacks at all.  A watchdog feeds digital silence (never microphone
+    audio) so the VAD/Whisper pipeline keeps receiving a steady 250 ms stream.
+  * Default playback endpoint changes (wired/Bluetooth headsets, speakers) are
+    detected by :class:`WASAPIDeviceMonitor`; the stream is reinitialized on the
+    new loopback endpoint.  If the endpoint disappears, capture reports the
+    disconnection and waits for it to return — it NEVER switches to a mic.
 """
 from __future__ import annotations
 
+import math
 import threading
 import time
-from typing import Callable, List, Optional
+from typing import Callable, Optional
 
 import numpy as np
 
@@ -42,6 +43,15 @@ TARGET_SR = 16000
 CHUNK_SECONDS = 0.25
 CHUNK_SAMPLES = int(TARGET_SR * CHUNK_SECONDS)  # 4000 samples
 
+# pyaudiowpatch's patched PortAudio sets AUDCLNT_STREAMFLAGS_LOOPBACK (0x20000)
+# internally when an endpoint with isLoopbackDevice=True is opened for input.
+# We assert that flag via the device metadata instead of guessing by name.
+WASAPI_HOST_API_TYPE = 13  # paWASAPI
+PA_INPUT_OVERFLOW = 0x00000002  # paInputOverflow (status bit in callbacks)
+MAX_GAP_SECONDS = 0.5  # cap for inserted silence after a discontinuity
+IDLE_AFTER_SECONDS = 0.15  # no callbacks for this long => feed digital silence
+MONITOR_INTERVAL_SECONDS = 0.5
+
 
 def _load_pyaudiowpatch():
     """Import pyaudiowpatch lazily (may not be installed on every machine)."""
@@ -49,16 +59,6 @@ def _load_pyaudiowpatch():
         import pyaudiowpatch as pyaudio
 
         return pyaudio
-    except Exception:
-        return None
-
-
-def _load_sounddevice():
-    """Import sounddevice lazily (may not be installed on every machine)."""
-    try:
-        import sounddevice as sd
-
-        return sd
     except Exception:
         return None
 
@@ -87,25 +87,68 @@ def bounded_put_drop_oldest(q, item) -> bool:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Device discovery
+# Loopback endpoint discovery / verification
 # ─────────────────────────────────────────────────────────────────────────────
 
-def find_wasapi_loopback_device() -> Optional[dict]:
-    """Discover the WASAPI loopback endpoint for the *current default* playback
-    device (headphones OR speakers — whatever Windows is using right now).
+def _wasapi_host_api_indices(pa) -> set:
+    """Indices of every WASAPI host API exposed by this PortAudio build."""
+    out = set()
+    try:
+        for ha in pa.get_host_api_info_generator():
+            if int(ha.get("type", -1)) == WASAPI_HOST_API_TYPE or \
+                    "wasapi" in str(ha.get("name", "")).lower():
+                out.add(int(ha["index"]))
+    except Exception:
+        pass
+    return out
 
-    This does NOT rely on a device named "loopback"/"stereo mix": pyaudiowpatch
-    exposes a []-Loopback input endpoint for every active WASAPI playback
-    endpoint, and we prefer the default one.
 
-    Returns ``dict(index, name, samplerate, channels)`` or ``None``.
+def _normalise_loopback_info(pa, dev: Optional[dict]) -> Optional[dict]:
+    """Accept ONLY a verified WASAPI loopback endpoint, or return None.
+
+    This is the guard that stops a ordinary microphone device (or a MME "Stereo
+    Mix") from ever entering the pipeline: ``isLoopbackDevice`` must be True and
+    the endpoint must belong to a WASAPI host API.
+    """
+    if not dev:
+        return None
+    if dev.get("isLoopbackDevice") is not True:
+        print("[AUDIO_LOOPBACK] rejected non-loopback endpoint (no capture)")
+        return None
+    wasapi = _wasapi_host_api_indices(pa)
+    if wasapi and int(dev.get("hostApi", -1)) not in wasapi:
+        print("[AUDIO_LOOPBACK] rejected non-WASAPI endpoint (no capture)")
+        return None
+    name = str(dev.get("name") or "")
+    if not dev.get("maxInputChannels"):
+        print("[AUDIO_LOOPBACK] rejected endpoint with no capture channels")
+        return None
+    info = {
+        "index": int(dev["index"]),
+        "name": name,
+        "samplerate": int(dev.get("defaultSampleRate") or 48000),
+        "channels": max(1, int(dev.get("maxInputChannels") or 2)),
+        "host_api": int(dev.get("hostApi", -1)),
+        "is_loopback": True,
+        "render_endpoint": name[:-len(" [Loopback]")] if name.endswith(" [Loopback]") else name,
+    }
+    return info
+
+
+def find_wasapi_loopback_device(pa=None, verbose: bool = True) -> Optional[dict]:
+    """Discover the WASAPI loopback endpoint for the current default playback
+    device (speakers / wired headphones / Bluetooth headphones).
+
+    Never enumerates or returns a microphone device.  ``pa`` may be supplied by
+    :class:`WASAPIDeviceMonitor` to avoid creating a PortAudio instance per poll.
     """
     pyaudio = _load_pyaudiowpatch()
     if pyaudio is None:
         print("[AUDIO_LOOPBACK] unavailable reason=pyaudiowpatch not installed")
         return None
 
-    pa = pyaudio.PyAudio()
+    own_pa = pa is None
+    pa = pa or pyaudio.PyAudio()
     try:
         dev = None
         reason = "no WASAPI loopback endpoint exposed by the system"
@@ -115,7 +158,7 @@ def find_wasapi_loopback_device() -> Optional[dict]:
             reason = f"get_default_wasapi_loopback failed: {e}"
 
         if dev is None:
-            try:  # Fallback: first loopback endpoint the OS reports.
+            try:  # still loopback-only: first loopback endpoint the OS reports
                 dev = next(pa.get_loopback_device_info_generator(), None)
             except Exception as e:  # pragma: no cover - platform dependent
                 reason = f"loopback enumeration failed: {e}"
@@ -124,30 +167,36 @@ def find_wasapi_loopback_device() -> Optional[dict]:
             print(f"[AUDIO_LOOPBACK] unavailable reason={reason}")
             return None
 
-        info = {
-            "index": int(dev["index"]),
-            "name": str(dev["name"]),
-            "samplerate": int(dev.get("defaultSampleRate") or 48000),
-            "channels": int(dev.get("maxInputChannels") or 2) or 2,
-        }
-        print(
-            "[AUDIO_DEVICE] loopback output=%r index=%d native_rate=%d channels=%d"
-            % (info["name"], info["index"], info["samplerate"], info["channels"])
-        )
+        info = _normalise_loopback_info(pa, dev)
+        if info is None:
+            if verbose:
+                print("[AUDIO_LOOPBACK] unavailable reason=endpoint failed loopback verification")
+            return None
+        if verbose:
+            print(
+                "[AUDIO_DEVICE] loopback output=%r index=%d native_rate=%d channels=%d "
+                "render=%r wasapi_flag=on"
+                % (info["name"], info["index"], info["samplerate"],
+                   info["channels"], info["render_endpoint"])
+            )
         return info
     finally:
-        try:
-            pa.terminate()
-        except Exception:
-            pass
+        if own_pa:
+            try:
+                pa.terminate()
+            except Exception:
+                pass
 
 
 def validate_wasapi_loopback(info: dict) -> bool:
-    """Attempt to actually OPEN + START the given WASAPI loopback stream.
+    """Actually OPEN + START the loopback stream and read one buffer.
 
-    A device listing that "looks loopback-ish" is not proof it can be opened —
-    this does a real open so ``[AUDIO_LOOPBACK] started`` is always honest.
+    A device listing that merely "looks loopback-ish" is not proof that the
+    WASAPI capture client can be created with AUDCLNT_STREAMFLAGS_LOOPBACK.
     """
+    if not info or not info.get("is_loopback"):
+        print("[AUDIO_LOOPBACK] unavailable reason=endpoint is not a verified loopback")
+        return False
     pyaudio = _load_pyaudiowpatch()
     if pyaudio is None:
         return False
@@ -161,8 +210,10 @@ def validate_wasapi_loopback(info: dict) -> bool:
             input=True,
             input_device_index=int(info["index"]),
         )
+        # Use a callback here: a blocking read() can wait forever on an idle
+        # render endpoint (WASAPI loopback emits no buffers without playback).
         stream.start_stream()
-        time.sleep(0.25)
+        time.sleep(0.1)
         stream.stop_stream()
         stream.close()
         return True
@@ -176,179 +227,33 @@ def validate_wasapi_loopback(info: dict) -> bool:
             pass
 
 
-def enumerate_microphones() -> List[dict]:
-    """List capture-capable microphone devices via sounddevice."""
-    sd = _load_sounddevice()
-    if sd is None:
-        return []
-    mics: List[dict] = []
-    try:
-        for i, d in enumerate(sd.query_devices()):
-            if d["max_input_channels"] > 0:
-                mics.append({
-                    "index": i,
-                    "name": d["name"],
-                    "channels": d["max_input_channels"],
-                    "samplerate": d["default_samplerate"],
-                })
-    except Exception as e:  # pragma: no cover - platform dependent
-        print(f"[AUDIO_DEVICE] mic enumeration failed: {e}")
-    return mics
-
-
 # ─────────────────────────────────────────────────────────────────────────────
-# Chunk assembly (shared by both sources) — callback-safe numpy only.
+# 16 kHz mono chunk assembly
 # ─────────────────────────────────────────────────────────────────────────────
 
 class _ChunkSink:
     """Accumulate mono float32 @16 kHz and emit 250 ms PCM16 WAV chunks."""
 
-    def __init__(self, on_chunk: Optional[Callable[[bytes, ], None]], chunk_samples: int = CHUNK_SAMPLES):
+    def __init__(self, on_chunk: Optional[Callable[[bytes], None]],
+                 chunk_samples: int = CHUNK_SAMPLES):
         self.on_chunk = on_chunk
         self.chunk_samples = chunk_samples
         self._acc = np.zeros(0, dtype=np.float32)
+        self._lock = threading.Lock()
         self.chunks_made = 0
 
     def feed(self, mono: np.ndarray):
         if mono is None or mono.size == 0:
             return
-        self._acc = np.concatenate([self._acc, mono])
-        while self._acc.size >= self.chunk_samples:
-            chunk = self._acc[: self.chunk_samples]
-            self._acc = self._acc[self.chunk_samples:]
-            wav = encode_wav_bytes(pcm16_from_float32(chunk), TARGET_SR)
-            self.chunks_made += 1
-            if self.on_chunk is not None:
-                try:
-                    self.on_chunk(wav)
-                except Exception:
-                    pass
-
-
-class _MixingChunkSink:
-    """Pair per-source 250 ms float32 buffers and emit sample-mixed WAV chunks.
-
-    Two independent captures (mic + loopback) each produce a continuous
-    16 kHz stream.  Emitting each source's chunks straight into one queue
-    INTERLEAVES them (loud speech / near-silence / loud speech / ...) which
-    Whisper's VAD rejects as non-speech — proven to yield empty transcripts.
-    This sink instead keeps one buffer per source, pairs them positionally
-    (both advance at the same 16 kHz rate, so pairing preserves each source's
-    timeline with a fixed start offset) and mixes them per chunk, emitting a
-    single stream.
-
-    A source that stops feeding for > ``stale_after`` seconds is dropped from
-    pairing (others keep streaming); its backlog is trimmed so memory stays
-    bounded.  With only one source ever active, this degrades to that source
-    alone.
-
-    Mixing is SIGNAL-SELECTIVE per chunk: a source whose chunk RMS is at or
-    above ``signal_floor`` "carries signal".  When exactly one source does, it
-    is passed through at UNITY — never averaged with a near-silent peer.
-    Averaging a solo-active mic with a near-silent loopback halves its level,
-    pushing quiet speech below the backend EnergyVAD start threshold (~0.015),
-    so utterances fragment into one-frame blips that Whisper's VAD rejects as
-    non-speech (empty transcripts).  Multiple carriers are averaged; when none
-    carry signal the active sources are averaged (near-silent either way).
-    """
-
-    def __init__(
-        self,
-        on_chunk: Optional[Callable[[bytes], None]],
-        n_sources: int = 2,
-        chunk_samples: int = CHUNK_SAMPLES,
-        stale_after: float = 0.5,
-        signal_floor: float = 0.012,
-        source_names: Optional[tuple] = None,
-    ):
-        self.on_chunk = on_chunk
-        self.n_sources = n_sources
-        self.chunk_samples = chunk_samples
-        self.stale_after = stale_after
-        self.signal_floor = signal_floor
-        self.source_names = tuple(source_names) if source_names else \
-            tuple(f"src{i}" for i in range(n_sources))
-        self._bufs = [np.zeros(0, dtype=np.float32) for _ in range(n_sources)]
-        self._started = [False] * n_sources
-        self._last_feed = [0.0] * n_sources
-        self._lock = threading.Lock()
-        self.chunks_made = 0
-        # Diagnostics: per-source + mixed RMS (rate-limited, no raw audio).
-        self._feed_counts = [0] * n_sources
-        self._last_src_diag = [0.0] * n_sources
-        self._last_mixed_diag = 0.0
-
-    def for_source(self, src: int):
-        """Adapter exposing ``feed(mono)`` bound to one source index."""
-        sink = self
-
-        class _Adapter:
-            def feed(self, mono: np.ndarray):
-                sink.feed(src, mono)
-
-        return _Adapter()
-
-    def feed(self, src: int, mono: np.ndarray):
-        if mono is None or mono.size == 0:
-            return
-        rms = float(np.sqrt(np.mean(np.square(mono.astype(np.float64)))))
-        self._feed_counts[src] += 1
-        now = time.monotonic()
-        if now - self._last_src_diag[src] >= 2.0:
-            self._last_src_diag[src] = now
-            print(
-                f"[AUDIO_CAPTURE] src={self.source_names[src]} "
-                f"frame={self._feed_counts[src]} samples={mono.size} "
-                f"rms={rms:.4f}"
-            )
         with self._lock:
-            buf = self._bufs[src]
-            self._bufs[src] = np.concatenate([buf, mono]) if buf.size else mono.astype(np.float32, copy=False)
-            self._started[src] = True
-            self._last_feed[src] = time.monotonic()
-            self._flush()
-
-    def _flush(self):
-        now = time.monotonic()
-        active = [
-            i for i in range(self.n_sources)
-            if self._started[i] and (now - self._last_feed[i]) <= self.stale_after
-        ]
-        if not active:
-            return
-        # Bound memory for stalled sources: keep only their newest chunk.
-        for i in range(self.n_sources):
-            if i not in active and self._bufs[i].size > self.chunk_samples * 4:
-                self._bufs[i] = self._bufs[i][-self.chunk_samples:]
-        while min(self._bufs[i].size for i in active) >= self.chunk_samples:
-            segs = {}
-            for i in active:
-                segs[i] = self._bufs[i][: self.chunk_samples]
-                self._bufs[i] = self._bufs[i][self.chunk_samples:]
-            loud = [
-                s for s in segs.values()
-                if float(np.sqrt(np.mean(np.square(s.astype(np.float64)))))
-                >= self.signal_floor
-            ]
-            if len(loud) == 1:
-                mixed = loud[0]  # solo carrier passes through at unity
-            else:
-                carriers = loud if loud else list(segs.values())
-                mixed = carriers[0].copy()
-                for s in carriers[1:]:
-                    mixed += s
-                mixed = mixed / float(len(carriers))
-            wav = encode_wav_bytes(pcm16_from_float32(mixed), TARGET_SR)
-            self.chunks_made += 1
-            now_m = time.monotonic()
-            if now_m - self._last_mixed_diag >= 3.0:
-                self._last_mixed_diag = now_m
-                mrms = float(np.sqrt(np.mean(np.square(mixed.astype(np.float64)))))
-                via = "+".join(self.source_names[i] for i in active)
-                print(
-                    f"[AUDIO_CAPTURE] src=mixed frame={self.chunks_made} "
-                    f"samples={mixed.size} rms={mrms:.4f} via={via}"
-                )
+            self._acc = np.concatenate([self._acc, mono])
+            out = []
+            while self._acc.size >= self.chunk_samples:
+                chunk = self._acc[: self.chunk_samples]
+                self._acc = self._acc[self.chunk_samples:]
+                out.append(encode_wav_bytes(pcm16_from_float32(chunk), TARGET_SR))
+                self.chunks_made += 1
+        for wav in out:
             if self.on_chunk is not None:
                 try:
                     self.on_chunk(wav)
@@ -357,30 +262,152 @@ class _MixingChunkSink:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Loopback capture
+# Native WASAPI loopback capture (one source, no microphone)
 # ─────────────────────────────────────────────────────────────────────────────
 
 class LoopbackCapture:
-    """WASAPI system-audio loopback capture (native rate → 16 kHz mono chunks).
+    """WASAPI shared-mode render-endpoint loopback capture.
 
     ``device_info`` is the dict from :func:`find_wasapi_loopback_device`.
+    ``on_status`` receives short diagnostic strings (endpoint changes, gaps).
     """
 
-    def __init__(
-        self,
-        on_chunk: Optional[Callable[[bytes], None]] = None,
-        device_info: Optional[dict] = None,
-        sink: Optional[object] = None,
-    ):
+    def __init__(self, on_chunk: Optional[Callable[[bytes], None]] = None,
+                 device_info: Optional[dict] = None,
+                 sink: Optional[object] = None,
+                 on_status: Optional[Callable[[str], None]] = None):
         self.on_chunk = on_chunk
         self.device = device_info
         self._sink = sink if sink is not None else _ChunkSink(on_chunk)
+        self._on_status = on_status
         self._pa = None
         self._stream = None
         self._running = False
+        self._lock = threading.Lock()
+        self._watchdog = None
+        self._stop_watchdog = threading.Event()
+        # Timestamp / continuity state (all protected by self._lock).
+        self._prev_ts = None
+        self._last_cb_wall = 0.0
+        self._silence_since_cb = 0.0
+        self._last_feed_wall = 0.0
+        self._using_portaudio_clock = False
+        self._idle = True
+        self.discontinuities = 0
+        self.overflows = 0
+        self.silence_seconds = 0.0
+        self._pa_continue = 0
 
+    # -- diagnostics ---------------------------------------------------------
+    def _status(self, message: str):
+        print(message)
+        if self._on_status is not None:
+            try:
+                self._on_status(message)
+            except Exception:
+                pass
+
+    def endpoint_key(self):
+        if not self.device:
+            return None
+        return (int(self.device["index"]), str(self.device["name"]))
+
+    # -- callback ------------------------------------------------------------
+    def _cb(self, in_data, frame_count, time_info, status):
+        try:
+            now = time.monotonic()
+            native = int(self.device["samplerate"])
+            dur = float(frame_count) / float(native)
+            ts = None
+            if isinstance(time_info, dict):
+                ts = time_info.get("input_buffer_adc_time") or \
+                     time_info.get("input_buffer_adc_time", None)
+                if not ts:
+                    ts = time_info.get("current_time")
+            if ts is not None and not math.isfinite(float(ts)):
+                ts = None
+            if status:
+                self.overflows += 1 if (int(status) & PA_INPUT_OVERFLOW) else 0
+
+            with self._lock:
+                if self._prev_ts is None:
+                    self._using_portaudio_clock = ts is not None
+
+                # Timestamp-based discontinuity detection.  Only meaningful
+                # while the render stream is continuously active; after an idle
+                # period the watchdog has already filled the timeline with
+                # digital silence, so do not insert it twice.
+                gap = 0.0
+                prev_ts = self._prev_ts
+                if self._using_portaudio_clock and ts is not None and prev_ts is not None:
+                    gap = float(ts) - (float(prev_ts) + dur)
+                self._prev_ts = ts
+
+                was_idle = self._idle
+                idle_for = now - self._last_cb_wall if self._last_cb_wall else 0.0
+                self._last_cb_wall = now
+                self._last_feed_wall = now
+                if was_idle:
+                    self._idle = False
+                    self._status(
+                        "[AUDIO_LOOPBACK] stream resumed (render active) "
+                        "idle_gap_ms=%.0f" % (idle_for * 1000))
+
+                extra = max(0.0, gap - self._silence_since_cb)
+                self._silence_since_cb = 0.0
+                if gap > max(0.02, dur * 1.5) and not was_idle:
+                    self.discontinuities += 1
+                    self._status(
+                        "[AUDIO_LOOPBACK] buffer discontinuity "
+                        "gap_ms=%.0f expected_ms=%.0f" % (gap * 1000, dur * 1000))
+                if extra > 0.0 and extra <= MAX_GAP_SECONDS:
+                    self._feed_silence_locked(min(extra, MAX_GAP_SECONDS), native)
+
+            arr = np.frombuffer(in_data, dtype=np.int16).astype(np.float32) / 32768.0
+            native_channels = max(1, int(self.device["channels"]))
+            if native_channels > 1:
+                arr = arr.reshape(-1, native_channels).mean(axis=1)
+            if native != TARGET_SR:
+                arr = resample_linear(arr, native, TARGET_SR)
+            self._sink.feed(arr.astype(np.float32, copy=False))
+        except Exception as e:  # keep the audio callback non-blocking
+            self._status(f"[AUDIO_LOOPBACK] callback error={e}")
+        return (None, self._pa_continue)
+
+    # -- silence watchdog ----------------------------------------------------
+    def _feed_silence_locked(self, seconds: float, native: int):
+        samples = int(min(seconds, MAX_GAP_SECONDS) * TARGET_SR)
+        if samples <= 0:
+            return
+        self._sink.feed(np.zeros(samples, dtype=np.float32))
+        self.silence_seconds += samples / float(TARGET_SR)
+
+    def _watchdog_loop(self):
+        """WASAPI loopback emits NO callbacks while nothing is rendering.
+
+        Keep the 250 ms chunk stream alive with digital silence only.  This is
+        not an audio *source*: it is timeline filler for an idle render endpoint.
+        """
+        native = int(self.device["samplerate"])
+        while not self._stop_watchdog.wait(0.05):
+            with self._lock:
+                if not self._running:
+                    continue
+                now = time.monotonic()
+                since = now - (self._last_feed_wall or now)
+                if since < IDLE_AFTER_SECONDS:
+                    continue
+                if not self._idle:
+                    self._idle = True
+                    self._status("[AUDIO_LOOPBACK] idle (no render activity; silence only)")
+                fill = min(since, 0.25)
+                self._last_feed_wall = now
+                self._silence_since_cb += fill
+                self._feed_silence_locked(fill, native)
+
+    # -- lifecycle -----------------------------------------------------------
     def start(self) -> bool:
-        """Open + start loopback. Returns True iff actually capturing."""
+        """Open + start shared-mode WASAPI loopback. True iff actually running."""
         pyaudio = _load_pyaudiowpatch()
         if pyaudio is None:
             print("[AUDIO_LOOPBACK] unavailable reason=pyaudiowpatch not installed")
@@ -390,44 +417,44 @@ class LoopbackCapture:
             self.device = find_wasapi_loopback_device()
         if self.device is None:
             return False
+        if not self.device.get("is_loopback"):
+            print("[AUDIO_LOOPBACK] refused non-loopback device")
+            return False
         if not validate_wasapi_loopback(self.device):
             return False
 
         pa = pyaudio.PyAudio()
         self._pa = pa
+        self._pa_continue = int(pyaudio.paContinue)
         native = int(self.device["samplerate"])
         channels = max(1, int(self.device["channels"]))
-        native_channels = channels
-
-        print(f"[AUDIO_RESAMPLE] {native}Hz -> {TARGET_SR}Hz (loopback)")
+        print(f"[AUDIO_RESAMPLE] {native}Hz -> {TARGET_SR}Hz (wasapi-loopback)")
         if channels > 1:
-            print(f"[AUDIO_RESAMPLE] downmix {channels}ch -> mono (loopback)")
-
-        def _cb(in_data, frame_count, time_info, status):
-            try:
-                arr = np.frombuffer(in_data, dtype=np.int16).astype(np.float32) / 32768.0
-                if native_channels > 1:
-                    arr = arr.reshape(-1, native_channels).mean(axis=1)
-                if native != TARGET_SR:
-                    arr = resample_linear(arr, native, TARGET_SR)
-                self._sink.feed(arr.astype(np.float32, copy=False))
-            except Exception:
-                pass
-            return (None, pyaudio.paContinue)
+            print(f"[AUDIO_RESAMPLE] downmix {channels}ch -> mono (wasapi-loopback)")
 
         try:
             self._stream = pa.open(
                 format=pyaudio.paInt16,
-                channels=native_channels,
+                channels=channels,
                 rate=native,
                 frames_per_buffer=int(native * 0.1),
-                input=True,
+                input=True,                       # loopback endpoint is an input
                 input_device_index=int(self.device["index"]),
-                stream_callback=_cb,
+                stream_callback=self._cb,
             )
             self._stream.start_stream()
             self._running = True
-            print("[AUDIO_LOOPBACK] started")
+            self._last_cb_wall = time.monotonic()
+            self._last_feed_wall = self._last_cb_wall
+            self._stop_watchdog.clear()
+            self._watchdog = threading.Thread(
+                target=self._watchdog_loop, name="kiyra-loopback-watchdog",
+                daemon=True)
+            self._watchdog.start()
+            self._status(
+                "[AUDIO_LOOPBACK] started source=wasapi-loopback shared_mode=on "
+                "flags=AUDCLNT_STREAMFLAGS_LOOPBACK endpoint=%r"
+                % self.device["name"])
             return True
         except Exception as e:
             print(f"[AUDIO_LOOPBACK] unavailable reason={e}")
@@ -436,6 +463,10 @@ class LoopbackCapture:
 
     def stop(self):
         self._running = False
+        self._stop_watchdog.set()
+        if self._watchdog is not None:
+            self._watchdog.join(timeout=0.3)
+            self._watchdog = None
         self._close()
 
     def _close(self):
@@ -452,70 +483,35 @@ class LoopbackCapture:
         except Exception:
             pass
         self._pa = None
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Microphone capture
-# ─────────────────────────────────────────────────────────────────────────────
-
-class MicrophoneCapture:
-    """Microphone capture via sounddevice. Already captured at 16 kHz mono.
-
-    Fully independent from ``LoopbackCapture``: a mic failure never affects
-    loopback and vice versa.
-    """
-
-    def __init__(
-        self,
-        device_index: Optional[int] = None,
-        on_chunk: Optional[Callable[[bytes], None]] = None,
-        samplerate: int = TARGET_SR,
-        sink: Optional[object] = None,
-    ):
-        self.device_index = device_index
-        self.on_chunk = on_chunk
-        self.samplerate = samplerate
-        self._sink = sink if sink is not None else _ChunkSink(on_chunk)
-        self._stream = None
         self._running = False
 
-    def start(self) -> bool:
-        sd = _load_sounddevice()
-        if sd is None:
-            print("[AUDIO_MIC] unavailable reason=sounddevice not installed")
-            return False
 
-        blocksize = int(0.1 * self.samplerate)  # 100 ms callbacks
+class WASAPIDeviceMonitor:
+    """Poll the default render endpoint and expose its verified loopback twin."""
 
-        def _cb(indata, frames, time_info, status):
-            try:
-                self._sink.feed(indata.reshape(-1).astype(np.float32, copy=False))
-            except Exception:
-                pass
+    def __init__(self):
+        pyaudio = _load_pyaudiowpatch()
+        self._pa = pyaudio.PyAudio() if pyaudio is not None else None
+        self._last_key = None
+        self._last_info = None
 
+    def poll(self) -> Optional[dict]:
+        """Return the current verified loopback info (or None if absent)."""
+        if self._pa is None:
+            return None
+        return find_wasapi_loopback_device(pa=self._pa, verbose=False)
+
+    def changed(self, info: Optional[dict]) -> bool:
+        key = (int(info["index"]), str(info["name"])) if info else None
+        changed = key != self._last_key
+        self._last_key = key
+        self._last_info = info
+        return changed
+
+    def close(self):
         try:
-            self._stream = sd.InputStream(
-                device=self.device_index,
-                channels=1,
-                samplerate=self.samplerate,
-                blocksize=blocksize,
-                dtype="float32",
-                callback=_cb,
-            )
-            self._stream.start()
-            self._running = True
-            print(f"[AUDIO_MIC] started (device {self.device_index})")
-            return True
-        except Exception as e:
-            print(f"[AUDIO_MIC] unavailable reason={e}")
-            return False
-
-    def stop(self):
-        self._running = False
-        try:
-            if self._stream is not None:
-                self._stream.stop()
-                self._stream.close()
+            if self._pa is not None:
+                self._pa.terminate()
         except Exception:
             pass
-        self._stream = None
+        self._pa = None
