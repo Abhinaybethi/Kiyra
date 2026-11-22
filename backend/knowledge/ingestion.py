@@ -41,8 +41,16 @@ async def ingest_document(
     db.add(doc)
     db.flush()
 
-    # Chunk
-    chunks = chunk_document(content, metadata={"source_type": source_type, "title": title})
+    # Chunk. Sentence-aligned, ~256 words per chunk with a 40-word overlap:
+    # a chunk large enough to keep a fact in context, small enough that its
+    # embedding is not diluted by half a resume. The passage layer narrows a
+    # long document further at retrieval time.
+    chunks = chunk_document(
+        content,
+        metadata={"source_type": source_type, "title": title},
+        chunk_size=256,
+        overlap=40,
+    )
     if not chunks:
         db.commit()
         return doc

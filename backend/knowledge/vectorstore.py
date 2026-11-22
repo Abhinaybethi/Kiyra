@@ -2,6 +2,10 @@
 from __future__ import annotations
 
 import os
+import shutil
+import sqlite3
+import threading
+import time
 import uuid
 from typing import Optional
 
@@ -12,14 +16,59 @@ from config import settings as app_settings
 
 
 _client: Optional[chromadb.PersistentClient] = None
+_client_lock = threading.Lock()
+
+
+def _store_readable(path: str) -> bool:
+    """Cheap pre-flight check on the on-disk store.
+
+    A ``chroma.sqlite3`` written by an incompatible Chroma build (or truncated
+    by an interrupted write) makes the Rust backend raise ``unsupported file
+    format`` while constructing its bindings — and once that happens the
+    shared-system singleton is poisoned for the rest of the process. Probing
+    the file with the stdlib sqlite3 *before* Chroma touches it lets us move a
+    broken store aside cleanly. A missing file just means "fresh store".
+    """
+    db = os.path.join(path, "chroma.sqlite3")
+    if not os.path.exists(db):
+        return True
+    try:
+        con = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
+        try:
+            con.execute("SELECT count(*) FROM sqlite_master").fetchone()
+            return True
+        finally:
+            con.close()
+    except Exception:
+        return False
+
+
+def _reset_store(path: str) -> None:
+    """Move an unreadable store aside (never delete — it may be recoverable)."""
+    backup = f"{path}.corrupt-{int(time.time())}"
+    try:
+        if os.path.exists(path):
+            shutil.move(path, backup)
+        os.makedirs(path, exist_ok=True)
+        print(f"[RAG] vector store unreadable — moved to {backup} and recreated "
+              f"empty (knowledge can be re-indexed from the SQL chunks).")
+    except Exception as e:
+        print(f"[RAG] vector store reset failed: {e}")
 
 
 def get_chroma_client() -> chromadb.PersistentClient:
     global _client
-    if _client is None:
-        os.makedirs(app_settings.chroma_dir, exist_ok=True)
+    if _client is not None:
+        return _client
+    with _client_lock:
+        if _client is not None:
+            return _client
+        path = app_settings.chroma_dir
+        os.makedirs(path, exist_ok=True)
+        if not _store_readable(path):
+            _reset_store(path)
         _client = chromadb.PersistentClient(
-            path=app_settings.chroma_dir,
+            path=path,
             settings=ChromaSettings(anonymized_telemetry=False),
         )
     return _client

@@ -11,7 +11,7 @@ StealthOverlayApp with capture/OCR/pipeline stubbed and assert:
   * button states cycle READY → Capturing... → Analyzing... → READY
   * errors restore the overlay + button and never send an answer request
   * repeated clicks while busy are ignored
-  * SOURCE: SCREENSHOT is shown with the detected question
+  * the OCR'd question is shown in the live-transcript field
 """
 from __future__ import annotations
 
@@ -99,9 +99,10 @@ def overlay(tk_root):
 
 def test_overlay_window_is_fixed_size_and_not_resizable(overlay):
     app, root = overlay, overlay.root
+    import stealth_overlay as so
     assert root.resizable() == (0, 0), "window must not be user-resizable"
     scale = app._ui_scale
-    w, h = int(560 * scale), int(640 * scale)
+    w, h = int(so.DESIGN_WIDTH * scale), int(so.DESIGN_HEIGHT * scale)
     _pump(root)
     assert abs(root.winfo_width() - w) <= 4, (
         f"window width {root.winfo_width()} != target {w}")
@@ -177,11 +178,10 @@ def test_screenshot_flow_submits_question_via_shared_pipeline(overlay, monkeypat
     assert source == "screenshot"
     assert "fenced code block" in note, "code screenshots must carry a format hint"
 
-    # button returns to READY, question box shows DETECTED + SOURCE
+    # button returns to READY; the OCR'd question shows in the live transcript
     assert app.btn_screenshot.cget("text") == "📸 Screenshot"
     assert app.btn_screenshot.cget("state") == tk.NORMAL
-    assert "reverse a string" in app.txt_question.get("1.0", "end")
-    assert "SOURCE: SCREENSHOT" in app.lbl_q_meta.cget("text")
+    assert "reverse a string" in app.txt_live.get("1.0", "end")
 
 
 def test_screenshot_non_code_question_has_no_format_note(overlay, monkeypatch):

@@ -32,7 +32,45 @@ class Settings(BaseSettings):
     # Legacy: Ollama (only used when explicitly configured via provider="ollama")
     ollama_base_url: str = "http://localhost:11434"
     ollama_timeout: int = 120
-    ollama_keep_alive: str = "5m"  # Keep model in memory for fast inference
+    # Keep the model resident between turns. Ollama's default is 5 minutes; an
+    # interview easily has longer pauses, and a cold reload is ~20s (longer than
+    # the first-token deadline), which silently produced empty answers.
+    ollama_keep_alive: str = "30m"
+    # Pin the context window. Ollama otherwise allocates the model's full
+    # context (16k+ KV cells) and can reload the model whenever the requested
+    # context changes. Live prompts are ~1-2k tokens, so 4096 is ample and keeps
+    # VRAM low (the overlay may share a 6 GB laptop GPU).
+    ollama_num_ctx: int = 4096
+    # Prefill batch sizes. Ollama's default (512) processes the prompt in
+    # small batches, which costs ~1.1-2.1 s for a live prompt on this
+    # laptop GPU.
+    #
+    # Measured on the RTX 3050 / qwen3.5:4b (time to the FIRST streamed token
+    # on the real production prompt, 1192 tokens):
+    #
+    #     no batch     3979-4038 ms   prefill 1067-1092 ms
+    #     num_batch 1024  4430-4614 ms  prefill 1787-1840 ms  (SLOWER — the
+    #                         prompt no longer fits in one batch)
+    #     num_batch 2048  2917-3013 ms  prefill  156- 263 ms  (best)
+    #
+    # CAUTION when re-measuring: Ollama caches the KV state of a prompt, so
+    # replaying the SAME prompt twice reports a tiny prefill that has
+    # nothing to do with the setting (measured: 154 ms cached vs 2380 ms
+    # for the same prompt with one changed token). Always measure with a
+    # UNIQUE prompt — that is what the live path sends on every turn.
+    #
+    # On the live path (800-1900 token prompts) the prefill settles at
+    # ~1.7-2.0 ms/token and the batch size moves the total TTFT by less
+    # than the run-to-run noise, so 2048 is kept: it keeps the whole live
+    # prompt in ONE batch (the 1858-token coding prompt measured 2348 ms
+    # prefill at 2048 vs 2996 ms at 512) and costs ~300 MiB more VRAM
+    # (4.05 of 6.1 GB).
+    #
+    # These MUST stay identical on every request (including the startup
+    # warmup): Ollama reloads the runner when they change, and a reload costs
+    # ~20 s. Set them back to 1024 (or 512) on a GPU with less than ~5 GB.
+    ollama_num_batch: int = 2048
+    ollama_num_ubatch: int = 2048
 
     # ─── App ──────────────────────────────────────────────────────────────────
     app_name: str = "Kiyra — Interview Copilot"
@@ -52,13 +90,47 @@ class Settings(BaseSettings):
 
     # VAD / utterance segmentation
     speech_start_threshold: float = 0.015  # RMS energy to consider speech active
-    speech_end_silence_ms: int = 300  # Trailing silence before finalizing an utterance (150–250 target zone)
+    # Adaptive VAD: track the mic's noise floor so a room noisier than the
+    # absolute threshold doesn't read as perpetual speech (never-ending
+    # utterances, empty transcripts). Seed sits above typical room noise; the
+    # detector adapts down to the real floor and requires speech to exceed it.
+    vad_adaptive: bool = True
+    vad_noise_floor_seed: float = 0.05  # initial floor estimate (RMS)
+    vad_noise_floor_ratio: float = 2.2  # speech must exceed floor * this
+    speech_end_silence_ms: int = 150  # Trailing silence before finalizing an utterance (150–250 target zone)
     minimum_speech_duration: float = 0.25  # Utterances shorter than this are noise
     maximum_utterance_duration: float = 12.0  # Hard cap — force-finalize long speech
-    stt_timeout: float = 8.0  # Max allowed STT wall time before we give up
+    stt_timeout: float = 3.0  # Max allowed STT wall time before we give up
     # One bounded retry after stt_timeout. Absorbs a cold Whisper load without
     # ever discarding the candidate's audio (losing speech is unrecoverable).
     stt_retry_timeout: float = 25.0
+
+    # Whisper model size: tiny (fastest, ~40MB), base (default, ~140MB),
+    # small (~500MB), medium (~1.5GB). Override with KIYRA_TRANSCRIPTION_MODEL.
+    # Smaller = faster TTFT, lower accuracy; larger = slower, more accurate.
+    transcription_model: str = "base"  # faster-whisper base model (~140MB)
+    # Whisper vocabulary hint. faster-whisper's `initial_prompt` biases the
+    # decoder toward these spellings. Without it the `base` model hears the
+    # product name "Kiyra" as "CURE", and the answer then confidently describes
+    # a caching layer that was never built. Deliberately short: a long hint
+    # biases short clips (and can be echoed back on near-silent audio).
+    # Override with TRANSCRIPTION_INITIAL_PROMPT (no KIYRA_ prefix — this
+    # Settings class sets no env_prefix).
+    transcription_initial_prompt: str = (
+        "Kiyra, an interview copilot. FastAPI, Next.js, TypeScript, Python, "
+        "WebSocket, Whisper, Ollama, PostgreSQL, SQLAlchemy, Alembic, "
+        "Tkinter, RAG, embeddings, asyncio, uvicorn, pytest, Docker, "
+        "Kubernetes, Redis, Celery, machine learning"
+    )
+    # Append the candidate's own project and skill names from the database so
+    # the hint matches the vocabulary of the interview actually being taken.
+    transcription_vocab_from_profile: bool = True
+
+    # Partial / speculative STT interval — how often to run speculative
+    # transcription on accumulated speech. Lower = faster feedback but more
+    # CPU load. Override with KIYRA_REALTIME_PARTIAL_INTERVAL_S.
+    realtime_partial_interval_s: float = 1.0  # was 1.2 — faster partial loop
+    realtime_partial_speech_s: float = 1.0  # fire first partial after 1s of speech
 
     # ── Interview Listening Mode (Phase 5.4) ─────────────────────────────
     # The user, not VAD, decides where the question ends. A turn is only
@@ -83,16 +155,114 @@ class Settings(BaseSettings):
 
     # Answer generation (real-time mode)
     answer_generation_timeout: int = 15  # Max 15s between tokens once streaming
-    realtime_first_token_timeout: int = 90  # First-token deadline: CPU-only llama can need ~75s for a cold prompt eval
-    answer_mode: str = "short"  # short | medium | detailed (real-time default: short)
-    answer_max_tokens: int = 320  # Cap answer length to keep TTFT low (legacy / detailed path)
-    realtime_max_output_tokens: int = 140  # Realtime cap — short first-answer, low prompt cost
-    rag_top_k: int = 3  # Context chunks retrieved per question (non-realtime)
-    rag_max_context_chars: int = 2000  # Cap RAG context so prompts stay lean (non-realtime)
+    # First-token deadline. A *warm* Ollama answers in ~2-3s, but a cold model
+    # load (disk -> VRAM) can take ~20s. The old 10s cap aborted the load, which
+    # unloaded the model again, so every turn paid the cold cost and produced
+    # zero tokens. Keep this above a worst-case cold load; warm turns are still
+    # fast because the first token arrives as soon as it is ready.
+    realtime_first_token_timeout: int = 60
+    answer_mode: str = "detailed"  # short | medium | detailed (real-time default: detailed)
+    answer_max_tokens: int = 300  # Default cap (legacy / detailed path)
+
+    # Per-question-type output caps, in TOKENS (the word targets live in
+    # `realtime/prompts.py::_LENGTH_TARGETS`).
+    #
+    # These must be sized FROM the word target, not equal to it: prose runs
+    # ~1.2 tokens/word and code ~1.6, so a cap below the band's top truncates
+    # the answer mid-sentence — the candidate read aloud "...which required
+    # dedicated engineering resources to maintain stability" with no ending.
+    # Caps sit ~15% above the token cost of the word band's upper end so an
+    # on-target answer always finishes, and only a runaway answer is clipped.
+    answer_max_tokens_by_type: dict = {
+        "conceptual": 270,   # 150-190 words -> ~230 tokens
+        "coding": 520,       # 220-300 words -> ~490 tokens (code is denser)
+        "behavioral": 270,   # 150-190 words -> ~230 tokens
+        "debugging": 360,    # 180-230 words -> ~320 tokens
+        "sql": 340,          # 160-210 words -> ~315 tokens
+        "default": 270,
+    }
+    realtime_max_output_tokens: int = 300  # Realtime default cap
+
+    # Standalone RAG defaults (kept for backward compatibility with callers
+    # that don't pass per-type values). Per-type overrides live in the
+    # _by_type dicts below.
+    rag_top_k: int = 6  # Context chunks retrieved per question (default)
+    rag_max_context_chars: int = 2500  # Cap RAG context (default)
+
+    # Per-question-type RAG depth. Coding pulls more chunks (code examples,
+    # multiple approaches); conceptual stays lean for speed.
+    rag_top_k_by_type: dict = {
+        "conceptual": 4,
+        "coding": 8,
+        "behavioral": 4,
+        "debugging": 6,
+        "sql": 5,
+        "default": 6,
+    }
+    rag_max_context_chars: int = 2000  # Default cap
+    rag_max_context_chars_by_type: dict = {
+        "conceptual": 1600,
+        "coding": 3200,   # more code snippets fit
+        "behavioral": 1800,
+        "debugging": 2400,
+        "sql": 2200,
+        "default": 2000,
+    }
     rag_timeout: float = 3.0  # Hard ceiling for non-realtime RAG
-    realtime_rag_timeout: float = 0.8  # Real-time ceiling — slow RAG must never block first answer
-    realtime_top_k: int = 2  # Realtime retrieval depth (small = fast = lean prompt)
-    realtime_max_context_chars: int = 900  # Realtime RAG context budget
+    realtime_rag_timeout: float = 0.5  # Real-time ceiling — slow RAG must never block first answer
+
+    # ── Hybrid retrieval / passage selection ────────────────────────────────
+    # A document shorter than this is returned WHOLE (there is nothing to
+    # select, and the complete answer is what the model needs). Longer
+    # documents are cut into sentence-aligned passages and the relevant ones
+    # are re-assembled verbatim.
+    rag_short_doc_chars: int = 1200
+    rag_passage_max_chars: int = 320   # Max size of one selected passage
+    rag_passage_min_chars: int = 40    # Merge a smaller trailing passage back
+    rag_passages_per_doc: int = 3      # Passages kept per selected document
+    # MMR: 1.0 = pure relevance, 0.0 = pure diversity. 0.7 keeps the best
+    # passage while still dropping near-duplicates.
+    rag_mmr_lambda: float = 0.7
+    realtime_top_k: int = 6  # Realtime retrieval depth (default)
+    realtime_top_k_by_type: dict = {
+        "conceptual": 4,
+        "coding": 8,
+        "behavioral": 4,
+        "debugging": 6,
+        "sql": 5,
+        "default": 6,
+    }
+    realtime_max_context_chars: int = 2500  # Realtime RAG context budget (default)
+    realtime_max_context_chars_by_type: dict = {
+        "conceptual": 1600,
+        "coding": 2800,
+        "behavioral": 1800,
+        "debugging": 2400,
+        "sql": 2200,
+        "default": 2200,
+    }
+
+    # Per-question-type temperature. Coding needs determinism (low), conceptual
+    # can be a touch more expressive (higher).
+    temperature_by_type: dict = {
+        "conceptual": 0.5,
+        "coding": 0.2,
+        "behavioral": 0.6,
+        "debugging": 0.3,
+        "sql": 0.2,
+        "default": 0.5,
+    }
+
+    # Keywords that signal a coding question — routes to the coding answer
+    # pipeline (code blocks, complexity, edge cases).
+    coding_keywords: list = [
+        "implement", "write code", "function", "algorithm", "complexity",
+        "big o", "time complexity", "space complexity", "code example",
+        "code block", "snippet", "execute", "runtime", "compile", "debug",
+        "stack overflow", "segmentation fault", "pointer", "recursion",
+        "data structure", "array", "linked list", "tree", "graph", "heap",
+        "sorting", "searching", "dynamic programming", "greedy", "backtracking",
+    ]
 
     # Session memory + retrieval cache (Phase 3)
     realtime_memory_turns: int = 6  # Turns kept in the live context window
@@ -109,6 +279,30 @@ class Settings(BaseSettings):
     realtime_rag_budget_ms: int = 500
     realtime_ttft_budget_ms: int = 800
     realtime_first_answer_budget_ms: int = 1500
+
+    # ─── Authentication (desktop sign-in) ────────────────────────────────────
+    # Real-world email-OTP auth for the desktop overlay. Accounts are created
+    # with full name + phone + email; every sign-in is email + a 6-digit OTP.
+    auth_enabled: bool = True                # False blocks new sign-ins (existing sessions still work)
+    auth_otp_ttl_seconds: int = 600          # OTP lifetime (10 minutes)
+    auth_otp_length: int = 6                 # digits in the OTP
+    auth_otp_max_attempts: int = 5           # wrong guesses before the code dies
+    auth_otp_resend_cooldown_seconds: int = 30
+    auth_otp_max_per_hour: int = 6           # abuse ceiling per email
+    auth_session_days: int = 30              # desktop session lifetime
+    auth_otp_secret: str = ""                # HMAC key; random per process if unset
+    auth_dev_otp: bool = False               # force OTP into the API response (dev only)
+
+    # SMTP transport. When unset, the OTP is printed to the backend console and
+    # returned as ``dev_code`` so a local install works with zero config.
+    smtp_host: str = ""
+    smtp_port: int = 587
+    smtp_username: str = ""
+    smtp_password: str = ""
+    smtp_from: str = ""
+    smtp_use_tls: bool = True
+    smtp_use_ssl: bool = False
+    smtp_timeout: float = 15.0
 
     # ─── Stealth Mode (Desktop App) ───────────────────────────────────────────
     stealth_window_alpha: float = 0.92  # 92% opacity (balances visibility + stealth)

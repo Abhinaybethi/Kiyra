@@ -25,6 +25,11 @@ import tkinter as tk
 DESKTOP_DIR = Path(__file__).resolve().parents[2] / "desktop"
 sys.path.insert(0, str(DESKTOP_DIR))
 
+# Windows are resized at a position far off the visible desktop so running the
+# suite never covers the developer's screen; they stay mapped so real geometry
+# is still computed and asserted.
+_OFF = "+20000+20000"
+
 LONG_ANSWER = (
     "The SOLID principles are five design guidelines: Single Responsibility, "
     "Open-Closed, Liskov Substitution, Interface Segregation, and Dependency "
@@ -102,12 +107,12 @@ def test_answer_width_follows_overlay_both_directions(overlay):
 
     base = root.winfo_width()
     mw = _min_width(root)
-    narrow, wide = max(base - 80, mw), base + 120
+    narrow, wide = max(base - 300, mw), base + 300
 
     samples = []
     # includes the exact minimum width (compact state) plus both directions
     for w in (narrow, wide, mw, narrow, wide):
-        root.geometry(f"{w}x640+60+60")
+        root.geometry(f"{w}x640{_OFF}")
         _pump(root)
         canvas_w = app.ans_canvas.winfo_width()
         win_w = int(app.ans_canvas.itemcget(app.answer_win, "width"))
@@ -133,8 +138,8 @@ def test_answer_width_follows_overlay_both_directions(overlay):
             assert t1 > t0, (
                 f"widening {w0}->{w1} did not widen text ({t0}->{t1})")
 
-    # question widget stays responsive too
-    assert app.txt_question.winfo_width() <= root.winfo_width()
+    # live-transcript field stays responsive too
+    assert app.txt_live.winfo_width() <= root.winfo_width()
 
 
 def test_reflow_height_covers_wrapped_lines(overlay):
@@ -144,15 +149,15 @@ def test_reflow_height_covers_wrapped_lines(overlay):
     _pump(root)
     base = root.winfo_width()
     mw = _min_width(root)
-    narrow, wide = max(base - 80, mw), base + 120
+    narrow, wide = max(base - 300, mw), base + 300
 
-    root.geometry(f"{wide}x640+60+60")
+    root.geometry(f"{wide}x640{_OFF}")
     _pump(root)
     wide_texts = _answer_texts(app)
     assert wide_texts
     wide_lines = sum(_displaylines(t) for t in wide_texts)
 
-    root.geometry(f"{narrow}x640+60+60")
+    root.geometry(f"{narrow}x640{_OFF}")
     _pump(root)
     narrow_texts = _answer_texts(app)
     assert narrow_texts
@@ -184,7 +189,7 @@ def test_streaming_answer_reflows_without_content_loss(overlay):
         _pump(root)
         if i == 2:  # resize MID-stream
             target = max(root.winfo_width() - 80, mw)
-            root.geometry(f"{target}x640+60+60")
+            root.geometry(f"{target}x640{_OFF}")
             _pump(root)
 
     # lifecycle untouched: buffer is exactly the concatenation of chunks
@@ -227,12 +232,12 @@ def test_configure_handler_is_idempotent_no_feedback_loop(overlay, monkeypatch):
     current = root.winfo_width()
     target = current - 60 if current - 60 >= mw else current + 60
     assert target != current
-    root.geometry(f"{target}x640+60+60")
+    root.geometry(f"{target}x640{_OFF}")
     _pump(root)
     assert len(calls) == 1, (
         f"expected exactly 1 forced width per resize, got {len(calls)}")
 
     # same width again -> zero further work (cached-width guard)
-    root.geometry(f"{target}x640+60+60")
+    root.geometry(f"{target}x640{_OFF}")
     _pump(root)
     assert len(calls) == 1, "repeat Configure re-forced the same width"

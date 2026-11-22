@@ -127,11 +127,33 @@ class LlamaCppServerManager:
     @staticmethod
     def gpu_binary_ready() -> bool:
         """A CUDA build needs llama-server.exe + a cudart64_1xx.dll beside it.
-        Returning False means "do not even attempt GPU mode"."""
-        if not (os.path.isfile(GPU_BIN) and os.path.isfile(CPU_BIN)):
+        Returning False means "do not even attempt GPU mode".
+
+        NOTE: the dedicated CPU build is only the *fallback*, so its absence
+        must NOT disable the GPU path. Tying the two together meant a missing
+        CPU binary silently forced CPU mode even on a machine with a working
+        NVIDIA GPU — and then CPU mode itself failed (WinError 2) because the
+        CPU binary it fell back to was the very thing that was missing.
+        """
+        if not os.path.isfile(GPU_BIN):
             return False
         dlls = os.listdir(os.path.dirname(GPU_BIN))
         return any(re.fullmatch(r"cudart64_\d+\.dll", d) for d in dlls)
+
+    def _effective_cpu_bin(self) -> str:
+        """Binary to use for CPU-only inference.
+
+        Prefer the dedicated CPU build; when it is missing (e.g. its temp dir
+        was cleaned) fall back to the CUDA build, which bundles the same ggml
+        CPU backends — CPU-only inference works there too via ``-n-gpu-layers
+        0``. Falls back to the configured CPU path only so ``Popen`` can raise
+        its original, informative error when nothing is available.
+        """
+        if os.path.isfile(self.cpu_bin):
+            return self.cpu_bin
+        if os.path.isfile(self.gpu_bin):
+            return self.gpu_bin
+        return self.cpu_bin
 
     def build_command(self, kind: str = "cpu", gpu_layers: int | None = None) -> list[str]:
         """Exact argv for llama-server. CPU preserves the proven Phase-3
@@ -141,8 +163,13 @@ class LlamaCppServerManager:
             cmd = self._gpu_command(self.port, gpu_layers or self.gpu_layers)
             self.command = list(cmd)
             return cmd
-        cmd = [self.cpu_bin, "-m", self.model, "--port", str(self.port),
+        cpu_bin = self._effective_cpu_bin()
+        cmd = [cpu_bin, "-m", self.model, "--port", str(self.port),
                "--host", self.host]
+        if cpu_bin == self.gpu_bin:
+            # CUDA build running CPU-only: pin zero GPU offload explicitly so a
+            # stray default can never try to touch a (possibly absent) GPU.
+            cmd += ["-n-gpu-layers", "0"]
         self.command = list(cmd)
         return cmd
 

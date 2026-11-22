@@ -125,6 +125,8 @@ def make_session(provider=None, listening: bool = True):
     sess._dropped_frames = 0
     sess._start_time = 0.0
     sess._audio_worker_task = None
+    sess._utterance_task = None
+    sess._utterance_lock = asyncio.Lock()
     sess._last_queue_log = 0.0
     sess._last_queue_delay_ms = 0.0
     sess._budget_warns = {}
@@ -997,3 +999,63 @@ async def test_legacy_auto_detect_never_auto_rearms(monkeypatch):
     assert payloads(sess.ws, EventType.ANSWER_GENERATED.value), "legacy path still answers"
     assert payloads(sess.ws, EventType.LISTENING_STARTED.value) == [], \
         "no interview loop outside Interview Listening Mode"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Drain-loop decoupling: final STT must not block audio intake
+# ─────────────────────────────────────────────────────────────────────────────
+@pytest.mark.asyncio
+async def test_utterance_runs_off_the_drain_loop(monkeypatch):
+    """_spawn_utterance_task must return immediately; STT runs on its own task."""
+    sess = make_session()
+    started = asyncio.Event()
+    release = asyncio.Event()
+    order = []
+
+    async def slow_handler(utt, recv_ts, *, finalize_only=False, turn_id=None):
+        order.append(("start", turn_id))
+        started.set()
+        await release.wait()
+        order.append(("done", turn_id))
+
+    monkeypatch.setattr(sess, "_handle_utterance", slow_handler)
+
+    t = sess._spawn_utterance_task(make_utterance(), 0.0, "t1")
+    assert sess._utterance_task is t
+    # The caller is NOT awaiting STT: the handler only starts once we yield.
+    assert order == []
+    await asyncio.wait_for(started.wait(), timeout=1.0)
+    assert not t.done()  # still inside simulated STT
+
+    release.set()
+    await asyncio.wait_for(t, timeout=1.0)
+    assert order == [("start", "t1"), ("done", "t1")]
+
+
+@pytest.mark.asyncio
+async def test_utterance_tasks_serialize_on_lock(monkeypatch):
+    """Two finalized utterances transcribe one-at-a-time, in order."""
+    sess = make_session()
+    gate = asyncio.Event()
+    active = []
+    seen = []
+
+    async def gated(utt, recv_ts, *, finalize_only=False, turn_id=None):
+        seen.append(("start", turn_id))
+        active.append(turn_id)
+        assert len(active) == 1, "utterances must not overlap"
+        await gate.wait()
+        active.remove(turn_id)
+        seen.append(("done", turn_id))
+
+    monkeypatch.setattr(sess, "_handle_utterance", gated)
+
+    t1 = sess._spawn_utterance_task(make_utterance(), 0.0, "t1")
+    t2 = sess._spawn_utterance_task(make_utterance(), 0.0, "t2")
+    await asyncio.sleep(0.05)
+    assert seen == [("start", "t1")], "second utterance must wait for the lock"
+
+    gate.set()
+    await asyncio.wait_for(asyncio.gather(t1, t2), timeout=2.0)
+    assert seen == [
+        ("start", "t1"), ("done", "t1"), ("start", "t2"), ("done", "t2")]

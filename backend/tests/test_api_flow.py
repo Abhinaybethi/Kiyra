@@ -55,6 +55,35 @@ def test_job_description_crud(client):
         assert len(list_res.json()) >= 1
 
 
+def test_activate_job_description_switches_the_active_one(client, db_session):
+    from api.profile import get_profile
+    from db.models import JobDescription
+
+    profile = get_profile(db_session)
+    first = JobDescription(profile_id=profile.id, title="First",
+                           raw_text="first role", is_active=True)
+    second = JobDescription(profile_id=profile.id, title="Second",
+                            raw_text="second role", is_active=False)
+    db_session.add_all([first, second])
+    db_session.commit()
+    db_session.refresh(first)
+    db_session.refresh(second)
+
+    res = client.post(f"/api/jobs/{second.id}/activate")
+    assert res.status_code == 200
+    assert res.json()["id"] == second.id
+    assert res.json()["is_active"] is True
+
+    db_session.expire_all()
+    assert db_session.get(JobDescription, first.id).is_active is False
+    assert db_session.get(JobDescription, second.id).is_active is True
+
+
+def test_activate_missing_job_description_is_404(client):
+    res = client.post("/api/jobs/999999/activate")
+    assert res.status_code == 404
+
+
 def test_interview_session_creation(client):
     payload = {
         "interview_type": "technical",

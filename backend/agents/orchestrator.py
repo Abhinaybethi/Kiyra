@@ -115,6 +115,7 @@ class InterviewOrchestrator:
             profile_id=profile.id if profile else None,
             query=question_text,
             top_k=3,
+            db=self.db,
         )
 
         answer_agent = AnswerAgent(self.db, self.provider, session.id)

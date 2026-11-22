@@ -34,6 +34,16 @@ class ProviderUnavailableError(AIProviderError):
     """Raised when the inference backend cannot be reached/used."""
 
 
+def _ns_to_ms(value) -> Optional[int]:
+    """Ollama reports durations in nanoseconds; perf wants milliseconds."""
+    try:
+        if value is None:
+            return None
+        return int(round(int(value) / 1_000_000))
+    except (TypeError, ValueError):
+        return None
+
+
 # Model capability registry
 MODEL_CAPABILITIES: Dict[str, dict] = {
     "bonsai-8b": {
@@ -373,6 +383,27 @@ class OllamaProvider(AIProvider):
         self._model = model or settings.model_name
         self._timeout = timeout or settings.ollama_timeout
         self._max_retries = max_retries
+        # Token counts from the last stream's `done` chunk (Ollama reports
+        # them there). Used for [KIYRA-PERF] prompt/completion accounting.
+        self.last_prompt_tokens: Optional[int] = None
+        self.last_completion_tokens: Optional[int] = None
+        # Ollama's `done_reason`: "stop" (model finished) or "length" (the
+        # num_predict cap cut it off — the answer is truncated mid-sentence).
+        self.last_done_reason: Optional[str] = None
+        # Ollama's own timing breakdown from the `done` chunk (nanoseconds).
+        # `load_duration` is the per-request runner setup (a resident model
+        # still pays ~1s); `prompt_eval_duration` is the prefill cost. Seeing
+        # them separately is what makes a slow first token explainable.
+        self.last_load_ms: Optional[int] = None
+        self.last_prompt_eval_ms: Optional[int] = None
+        self.last_eval_ms: Optional[int] = None
+        # Client-side view of the wait: time to the response HEADERS (the
+        # request was accepted) and to the FIRST streamed token.
+        self.last_http_ms: Optional[int] = None
+        self.last_first_chunk_ms: Optional[int] = None
+        # The options actually sent with the last request. Surfaced in the
+        # perf record so a slow prefill can be traced to the exact payload.
+        self.last_options: dict = {}
 
     @property
     def model_name(self) -> str:
@@ -394,11 +425,38 @@ class OllamaProvider(AIProvider):
             "messages": messages,
             "stream": stream,
             "options": {"temperature": temperature},
+            # Keep the model resident across interview pauses. A cold reload is
+            # far slower than any first-token deadline and is the single biggest
+            # cause of "the answer never comes" in live use.
+            "keep_alive": getattr(settings, "ollama_keep_alive", "30m"),
         }
+        # qwen3 models have a "thinking" mode that produces reasoning traces
+        # instead of direct answers. Disable it at the top level for direct
+        # speakable output.
+        if "qwen3" in (self._model or "").lower():
+            payload["think"] = False
         if max_tokens:
             payload["options"]["num_predict"] = max_tokens
+        num_ctx = getattr(settings, "ollama_num_ctx", 0)
+        if num_ctx:
+            payload["options"]["num_ctx"] = int(num_ctx)
+        # Prefill batch sizes. Bigger batches make the prompt evaluation
+        # (the "prefill" phase before the first token) dramatically faster on
+        # a local GPU: measured 1034 ms -> 143 ms for a 699-token prompt.
+        #
+        # These are sent on EVERY request — including the startup warmup — on
+        # purpose. Ollama re-allocates the compute pool when they change and
+        # reloads the runner (~20 s), so the warmup has to pin exactly the
+        # same values the live requests use.
+        num_batch = getattr(settings, "ollama_num_batch", 0)
+        if num_batch:
+            payload["options"]["num_batch"] = int(num_batch)
+        num_ubatch = getattr(settings, "ollama_num_ubatch", 0)
+        if num_ubatch:
+            payload["options"]["num_ubatch"] = int(num_ubatch)
 
         if stream:
+            self.last_options = dict(payload["options"])
             client = httpx.AsyncClient(timeout=self._timeout)
             return self._stream_complete(client, payload)
 
@@ -425,21 +483,58 @@ class OllamaProvider(AIProvider):
         raise ProviderUnavailableError(f"Ollama request failed: {last_err}")
 
     async def _stream_complete(self, client: httpx.AsyncClient, payload: dict) -> AsyncIterator[str]:
+        self.last_prompt_tokens = None
+        self.last_completion_tokens = None
+        self.last_done_reason = None
+        self.last_http_ms = None
+        self.last_first_chunk_ms = None
+        t0 = time.monotonic()
         try:
             async with client.stream("POST", f"{self._base_url}/api/chat", json=payload) as resp:
                 resp.raise_for_status()
+                # Time to the response HEADERS: the request was accepted and
+                # the server started working. Everything after this is the
+                # server actually producing the first token.
+                self.last_http_ms = int((time.monotonic() - t0) * 1000)
                 async for line in resp.aiter_lines():
                     if line:
                         try:
                             chunk = json.loads(line)
                             if content := chunk.get("message", {}).get("content"):
+                                if self.last_first_chunk_ms is None:
+                                    self.last_first_chunk_ms = int(
+                                        (time.monotonic() - t0) * 1000)
                                 yield content
                             if chunk.get("done"):
+                                self.last_prompt_tokens = chunk.get("prompt_eval_count")
+                                self.last_completion_tokens = chunk.get("eval_count")
+                                self.last_done_reason = chunk.get("done_reason")
+                                self.last_load_ms = _ns_to_ms(chunk.get("load_duration"))
+                                self.last_prompt_eval_ms = _ns_to_ms(
+                                    chunk.get("prompt_eval_duration"))
+                                self.last_eval_ms = _ns_to_ms(chunk.get("eval_duration"))
                                 break
                         except json.JSONDecodeError:
                             continue
         finally:
             await client.aclose()
+
+    async def warmup(self) -> bool:
+        """Load the model into memory and pin it with ``keep_alive``.
+
+        Best-effort: returns False instead of raising so a missing Ollama never
+        blocks backend startup. Called from the lifespan warmup thread.
+        """
+        if not self._base_url:
+            return False
+        try:
+            await self.complete(
+                [{"role": "user", "content": "ping"}],
+                stream=False, temperature=0.0, max_tokens=1,
+            )
+            return True
+        except Exception:
+            return False
 
     async def embed(self, text: str) -> list[float]:
         if not self._base_url:

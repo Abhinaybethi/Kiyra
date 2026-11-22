@@ -241,7 +241,7 @@ def test_stop_preserves_transcript_and_keeps_send_available(app):
 
 
 # ── memory / previous questions / topic ──────────────────────────────────────
-def test_memory_updated_renders_points_and_topic(app):
+def test_memory_updated_stores_points_and_topic(app):
     _activate(app)
     app._ui_memory_updated({
         "memory_points": ["Uses FastAPI", "Postgres for persistence"],
@@ -249,10 +249,10 @@ def test_memory_updated_renders_points_and_topic(app):
         "topic": "authentication",
     })
     _pump(app.root)
-    text = app.lbl_memory.cget("text")
-    assert "FastAPI" in text and "Postgres" in text
-    assert app.lbl_topic.cget("text") == "authentication"
-    assert "Explain JWT" in app.lbl_prev.cget("text")
+    assert any("FastAPI" in p for p in app._memory_points)
+    assert any("Postgres" in p for p in app._memory_points)
+    assert app._active_topic == "authentication"
+    assert app._previous_questions[-1]["question"] == "Explain JWT"
 
 
 def test_memory_panel_is_bounded(app):
@@ -272,8 +272,8 @@ def test_empty_memory_renders_cleanly(app):
     _activate(app)
     app._ui_memory_updated({})
     _pump(app.root)
-    assert app.lbl_memory.cget("text") == ""
-    assert app.lbl_prev.cget("text") == ""
+    assert app._memory_points == []
+    assert app._previous_questions == []
 
 
 # ── partial vs final transcript ──────────────────────────────────────────────
@@ -314,7 +314,8 @@ def test_render_live_survives_missing_panel(app):
 def test_panel_keeps_fixed_window_size(app):
     _activate(app)
     _pump(app.root, rounds=4)
-    expected = (int(560 * app._ui_scale), int(640 * app._ui_scale))
+    expected = (int(so.DESIGN_WIDTH * app._ui_scale),
+                int(so.DESIGN_HEIGHT * app._ui_scale))
     assert (app.root.winfo_width(), app.root.winfo_height()) == expected
     assert app.root.resizable() == (False, False)
 
@@ -462,8 +463,8 @@ def test_history_up_down_changes_the_selected_entry(app):
     app._history_prev()
     _pump(app.root)
     assert app._history_index == 0
-    assert app.lbl_hist.cget("text") == "1/3"
-    assert "question number 1" in app.lbl_history_view.cget("text")
+    assert "question number 1" in _answer_text(app)
+    assert "answer number 1" in _answer_text(app)
 
 
 def test_history_navigation_does_not_wrap_at_the_boundaries(app):
@@ -521,17 +522,22 @@ def test_history_navigation_does_not_disturb_listening(app):
     assert app.sent_commands == []
 
 
-def test_history_latest_entry_hides_the_duplicate_viewer(app):
-    """The live panel already shows the latest answer, so the viewer clears."""
+def test_history_entry_renders_into_the_main_answer_box(app):
+    """Selecting an earlier entry paints it into the MAIN answer box; the
+    latest entry keeps the live answer (the inline viewer was removed)."""
     _activate(app)
+    _show_answer(app, "LIVE ANSWER")
+    _pump(app.root)
     app._ui_memory_updated(_history(app, 3))
     _pump(app.root)
-    assert app.lbl_history_view.cget("text") == ""
+    assert app._history_index == 2
+    # latest entry: the live answer box is untouched
+    assert "LIVE ANSWER" in _answer_text(app)
 
     app._history_prev()
     _pump(app.root)
-    assert "question number 2" in app.lbl_history_view.cget("text")
-    assert "answer number 2" in app.lbl_history_view.cget("text")
+    assert "question number 2" in _answer_text(app)
+    assert "answer number 2" in _answer_text(app)
 
 
 def test_history_buttons_are_disabled_at_the_boundaries(app):
@@ -539,17 +545,17 @@ def test_history_buttons_are_disabled_at_the_boundaries(app):
     app._ui_memory_updated(_history(app, 2))
     _pump(app.root)
     assert app._history_index == 1
-    assert str(app.btn_hist_up.cget("state")) == "normal"
-    assert str(app.btn_hist_down.cget("state")) == "disabled"
+    assert str(app.btn_mhist_up.cget("state")) == "normal"
+    assert str(app.btn_mhist_down.cget("state")) == "disabled"
 
     app._history_prev()
     _pump(app.root)
-    assert str(app.btn_hist_up.cget("state")) == "disabled"
-    assert str(app.btn_hist_down.cget("state")) == "normal"
+    assert str(app.btn_mhist_up.cget("state")) == "disabled"
+    assert str(app.btn_mhist_down.cget("state")) == "normal"
 
     app._history_next()
     _pump(app.root)
-    assert str(app.btn_hist_down.cget("state")) == "disabled"
+    assert str(app.btn_mhist_down.cget("state")) == "disabled"
 
 
 def test_history_navigation_with_no_history_is_a_noop(app):
@@ -577,7 +583,7 @@ def test_stop_shows_idle_and_start_keeps_history(app):
     app._ui_listening_stopped({"listening": False, "state": "IDLE",
                                "current": "half said", "can_send": True})
     _pump(app.root)
-    assert "IDLE" in app.lbl_listen_state.cget("text")
+    assert app._server_state == "IDLE"
     assert len(app._question_history) == 2
     assert "Kept answer." in _answer_text(app)
 

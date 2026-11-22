@@ -25,6 +25,53 @@ def silent_frame(sample_rate=16000, duration=0.3):
     return np.zeros(int(sample_rate * duration), dtype=np.float32)
 
 
+def noise_frame(sample_rate=16000, duration=0.3, level=0.02):
+    """Deterministic white noise with RMS ≈ level — models a live room floor."""
+    rng = np.random.default_rng(1234)
+    n = int(sample_rate * duration)
+    return rng.normal(0.0, level, n).astype(np.float32)
+
+
+def test_fixed_vad_treats_noisy_room_as_speech():
+    # Documents the failure mode adaptive mode exists to fix: room noise above
+    # the absolute threshold reads as speech forever.
+    vad = EnergyVAD(speech_start_threshold=0.015)
+    assert vad.is_speech(noise_frame(level=0.02), currently_voiced=False) is True
+
+
+def test_adaptive_vad_rejects_noisy_room_as_speech():
+    vad = EnergyVAD(adaptive=True, noise_floor_seed=0.05)
+    for _ in range(20):  # sustained room noise must never read as speech
+        assert vad.is_speech(noise_frame(level=0.02), currently_voiced=False) is False
+    # ...but voiced audio well above the floor must be detected.
+    assert vad.is_speech(make_frame(amplitude=0.2), currently_voiced=False) is True
+
+
+def test_adaptive_receiver_finalizes_after_speech_in_noise():
+    rx = UtteranceReceiver(
+        speech_end_silence_ms=600,
+        minimum_speech_duration=0.1,
+        sample_rate=16000,
+    )
+    floor = noise_frame(level=0.02)
+    t = 100.0
+    for _ in range(4):  # prime the noise floor
+        assert rx.push_frame(floor, t) is None
+        t += 0.3
+    voiced = make_frame(amplitude=0.25)
+    utt = None
+    for _ in range(5):  # 1.5s of speech over the noise
+        utt = rx.push_frame(voiced, t)
+        t += 0.3
+    for _ in range(4):  # trailing noise must finalize, not extend
+        r = rx.push_frame(floor, t)
+        t += 0.3
+        if r is not None:
+            utt = r
+    assert utt is not None
+    assert rx.is_voiced is False
+
+
 def test_energy_vad_speech_detection():
     vad = EnergyVAD()
     assert vad.is_speech(make_frame(), False) is True

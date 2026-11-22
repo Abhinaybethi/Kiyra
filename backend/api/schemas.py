@@ -11,6 +11,62 @@ class OKResponse(BaseModel):
     message: str = "Success"
 
 
+# ── Authentication ─────────────────────────────────────────────────────────
+
+class RegisterRequest(BaseModel):
+    full_name: str
+    phone: str
+    email: str
+
+
+class LoginRequest(BaseModel):
+    email: str
+
+
+class VerifyOtpRequest(BaseModel):
+    email: str
+    code: str
+
+
+class ResendOtpRequest(BaseModel):
+    email: str
+    purpose: str = "login"
+
+
+class AccountUpdateRequest(BaseModel):
+    full_name: Optional[str] = None
+    phone: Optional[str] = None
+
+
+class AuthAccountResponse(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+    id: int
+    full_name: str
+    phone: str
+    email: str
+    is_verified: bool
+    created_at: datetime
+    last_login_at: Optional[datetime] = None
+
+
+class AuthChallengeResponse(BaseModel):
+    ok: bool = True
+    purpose: str
+    email: str
+    delivery: str  # "email" | "console"
+    expires_in: int
+    resend_in: int
+    dev_code: Optional[str] = None
+    message: str
+
+
+class AuthSessionResponse(BaseModel):
+    token: str
+    token_type: str = "bearer"
+    expires_at: datetime
+    account: AuthAccountResponse
+
+
 # ── Profile ────────────────────────────────────────────────────────────────
 
 class ProfileCreate(BaseModel):

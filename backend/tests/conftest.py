@@ -2,13 +2,30 @@
 from __future__ import annotations
 
 import os
+import shutil
 import sys
+import tempfile
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 # Must be set before importing app modules
 os.environ["DATABASE_URL"] = "sqlite:///:memory:"
 os.environ["TESTING"] = "true"
 os.environ["DEBUG"] = "true"
+
+# Keep the Tkinter overlay windows off the visible desktop during tests. The
+# app still maps/deiconifies them (needed for real geometry assertions), but
+# positions them far off-screen so running the suite never covers the
+# developer's display. See StealthOverlayApp._init_window.
+os.environ.setdefault("KIYRA_OVERLAY_OFFSCREEN", "1")
+
+# Point the vector store at a throwaway dir. Without this, tests share the real
+# ./data/chroma: an in-memory DB whose document ids collide with production, so
+# `delete_document_chunks()` in a test wipes the candidate's real embeddings.
+import atexit
+
+_TEST_CHROMA_DIR = tempfile.mkdtemp(prefix="kiyra_test_chroma_")
+os.environ["CHROMA_DIR"] = _TEST_CHROMA_DIR
+atexit.register(shutil.rmtree, _TEST_CHROMA_DIR, ignore_errors=True)
 
 import pytest
 from fastapi.testclient import TestClient

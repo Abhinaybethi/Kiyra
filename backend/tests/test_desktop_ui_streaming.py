@@ -25,6 +25,10 @@ import tkinter as tk
 DESKTOP_DIR = Path(__file__).resolve().parents[2] / "desktop"
 sys.path.insert(0, str(DESKTOP_DIR))
 
+# Resize at a point far off the visible desktop so the suite never covers the
+# developer's screen; the window stays mapped so geometry still computes.
+_OFF = "+20000+20000"
+
 LONG_ANSWER = (
     "Streaming answers must stay visually stable: the container is created "
     "once and only its content grows. No blinking, no reset, no reflow per "
@@ -165,9 +169,9 @@ def test_width_resize_during_streaming_preserves_stable_widget(overlay):
         app._ui_stream_answer(delta, append=True)
     _pump(root)
 
-    root.geometry(f"{root.winfo_width() - 90}x640+60+60")
+    root.geometry(f"{root.winfo_width() - 90}x640{_OFF}")
     _pump(root)
-    root.geometry(f"{root.winfo_width() + 140}x640+60+60")
+    root.geometry(f"{root.winfo_width() + 140}x640{_OFF}")
     _pump(root)
 
     assert app._stable_answer_txt is txt0, "width change recreated the widget"
@@ -289,7 +293,7 @@ def test_long_answer_remains_vertically_scrollable(overlay):
 
     # Shrink to a narrow height so content MUST exceed the visible area.
     target_w = 300
-    root.geometry(f"{target_w}x380+60+60")
+    root.geometry(f"{target_w}x380{_OFF}")
     for _ in range(60):  # wait until the window manager applies the size
         _pump(root, rounds=1)
         if root.winfo_width() <= target_w + 10 and root.winfo_height() <= 410:
@@ -306,6 +310,81 @@ def test_long_answer_remains_vertically_scrollable(overlay):
     app.ans_canvas.yview_moveto(1.0)
     app.root.update()
     assert app.ans_canvas.yview()[1] >= 1.0
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# TEST 14 — mouse wheel scrolls the answer panel
+# ─────────────────────────────────────────────────────────────────────────────
+def test_mouse_wheel_scrolls_the_answer_panel(overlay):
+    """The wheel must scroll the ANSWER, not the Text's empty scrollregion.
+
+    The answer is drawn inside a Canvas and the Text widgets inside it carry
+    Tk's native wheel binding, which scrolls nothing — so before this the
+    wheel was dead over the answer and only the scrollbar drag worked.
+    """
+    app, root = overlay, overlay.root
+    app._assistant_state = "ready"
+    app._render_answer({"answer": LONG_ANSWER})
+    _pump(root)
+
+    # Shrink to a narrow height so content MUST exceed the visible area.
+    target_w = 300
+    root.geometry(f"{target_w}x380{_OFF}")
+    for _ in range(60):
+        _pump(root, rounds=1)
+        if root.winfo_width() <= target_w + 10 and root.winfo_height() <= 410:
+            break
+    _pump(root)
+
+    bbox = app.ans_canvas.bbox("all")
+    assert bbox is not None and bbox[3] > app.ans_canvas.winfo_height(), (
+        "test needs content taller than the viewport")
+
+    txt = app._stable_answer_txt
+    assert txt is not None
+
+    # Park at the bottom, then scroll up with the wheel.
+    app.ans_canvas.yview_moveto(1.0)
+    _pump(root)
+    top_before = app.ans_canvas.yview()[0]
+
+    txt.event_generate("<MouseWheel>", delta=120)  # wheel up on Windows
+    _pump(root)
+    top_after = app.ans_canvas.yview()[0]
+    assert top_after < top_before, (
+        f"wheel up must scroll the answer up ({top_before} -> {top_after})")
+
+    # A manual scroll up clears the auto-scroll pin, so the still-streaming
+    # answer does not yank the view back to the bottom.
+    assert app._answer_scroll_pinned is False, (
+        "scrolling up by hand must unpin auto-scroll")
+
+    # Wheel down scrolls back towards the bottom.
+    txt.event_generate("<MouseWheel>", delta=-120)  # wheel down
+    _pump(root)
+    assert app.ans_canvas.yview()[0] > top_after, (
+        "wheel down must scroll the answer down")
+
+    # Back at the bottom -> auto-scroll is pinned again.
+    app.ans_canvas.yview_moveto(1.0)
+    app._update_answer_scroll_pin()
+    assert app._answer_scroll_pinned is True
+
+
+def test_wheel_step_matches_the_keyboard_scroll_step(overlay):
+    """One wheel notch must feel like the Shift+Alt+W keyboard step."""
+    import stealth_overlay as so
+
+    assert so._wheel_units(type("E", (), {"delta": 120})()) == -1
+    assert so._wheel_units(type("E", (), {"delta": -120})()) == 1
+    assert so._wheel_units(type("E", (), {"delta": 1})()) == -1, (
+        "high-resolution wheels must not round a notch away to zero")
+    assert so._wheel_units(type("E", (), {"delta": -1})()) == 1
+    assert so._wheel_units(type("E", (), {"num": 4})()) == -1   # X11 up
+    assert so._wheel_units(type("E", (), {"num": 5})()) == 1    # X11 down
+    assert so._wheel_units(type("E", (), {"delta": 0})()) == 0
+    # The wheel step matches the Shift+Alt+W / Shift+Alt+X keyboard steps.
+    assert so._WHEEL_SCROLL_STEP == 3
 
 
 # ─────────────────────────────────────────────────────────────────────────────

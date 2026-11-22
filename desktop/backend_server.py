@@ -165,12 +165,21 @@ class BackendLauncher:
         cmd = self.build_command()
         try:
             os.makedirs(os.path.dirname(self.log_path) or ".", exist_ok=True)
+            # Force UTF-8 on the child's stdio. Its stdout is a redirected log
+            # file, which on Windows defaults to a legacy code page (cp1252);
+            # printing a transcript with any non-ASCII char (CJK, accents,
+            # emoji) would raise UnicodeEncodeError and tear the live session
+            # down mid-conversation.
+            env = dict(os.environ)
+            env["PYTHONIOENCODING"] = "utf-8"
+            env["PYTHONUTF8"] = "1"
             with open(self.log_path, "ab") as logf:
                 logf.write(b"\n===== backend start =====\n")
                 logf.flush()
                 self.proc = subprocess.Popen(
                     cmd, cwd=self.backend_dir, stdout=logf,
                     stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL,
+                    env=env,
                     creationflags=_hidden_flags())
         except FileNotFoundError:
             self.proc = None
