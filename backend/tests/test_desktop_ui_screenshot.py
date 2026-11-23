@@ -102,7 +102,11 @@ def test_overlay_window_is_fixed_size_and_not_resizable(overlay):
     import stealth_overlay as so
     assert root.resizable() == (0, 0), "window must not be user-resizable"
     scale = app._ui_scale
-    w, h = int(so.DESIGN_WIDTH * scale), int(so.DESIGN_HEIGHT * scale)
+    factor = so.StealthOverlayApp._SIZE_FACTORS[so.DEFAULT_SIZE_PRESET]
+    w = max(int(so.PANEL_MIN_WIDTH * scale),
+            int(so.DESIGN_WIDTH * factor * scale))
+    h = max(int(so.PANEL_MIN_HEIGHT * scale),
+            int(so.DESIGN_HEIGHT * factor * scale))
     _pump(root)
     assert abs(root.winfo_width() - w) <= 4, (
         f"window width {root.winfo_width()} != target {w}")

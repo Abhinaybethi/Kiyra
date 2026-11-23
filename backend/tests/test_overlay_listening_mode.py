@@ -314,8 +314,10 @@ def test_render_live_survives_missing_panel(app):
 def test_panel_keeps_fixed_window_size(app):
     _activate(app)
     _pump(app.root, rounds=4)
-    expected = (int(so.DESIGN_WIDTH * app._ui_scale),
-                int(so.DESIGN_HEIGHT * app._ui_scale))
+    s = app._ui_scale
+    f = so.StealthOverlayApp._SIZE_FACTORS[so.DEFAULT_SIZE_PRESET]
+    expected = (max(int(so.PANEL_MIN_WIDTH * s), int(so.DESIGN_WIDTH * f * s)),
+                max(int(so.PANEL_MIN_HEIGHT * s), int(so.DESIGN_HEIGHT * f * s)))
     assert (app.root.winfo_width(), app.root.winfo_height()) == expected
     assert app.root.resizable() == (False, False)
 

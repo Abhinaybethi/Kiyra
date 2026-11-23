@@ -245,8 +245,10 @@ def test_fixed_design_size_logical_preserved(overlay):
     DPI. Tk's geometry() sizes the CLIENT area, so the shell window is that
     plus frame decorations."""
     overlay.root.update_idletasks()
-    expected = (int(so.DESIGN_WIDTH * overlay._ui_scale),
-                int(so.DESIGN_HEIGHT * overlay._ui_scale))
+    s = overlay._ui_scale
+    f = so.StealthOverlayApp._SIZE_FACTORS[so.DEFAULT_SIZE_PRESET]
+    expected = (max(int(so.PANEL_MIN_WIDTH * s), int(so.DESIGN_WIDTH * f * s)),
+                max(int(so.PANEL_MIN_HEIGHT * s), int(so.DESIGN_HEIGHT * f * s)))
     assert (overlay.root.winfo_width(), overlay.root.winfo_height()) == expected
 
     overlay._apply_stealth_window_styles(reason="test-size")

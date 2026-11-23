@@ -51,6 +51,21 @@ def app(tk_root):
             pass
 
 
+def test_overlay_opens_in_compact_preset(app):
+    """Every launch starts compact; Settings can still change the live preset."""
+    _pump(app.root)
+    s = app._ui_scale
+    f = so.StealthOverlayApp._SIZE_FACTORS[so.DEFAULT_SIZE_PRESET]
+    expected = (
+        max(int(so.PANEL_MIN_WIDTH * s), int(so.DESIGN_WIDTH * f * s)),
+        max(int(so.PANEL_MIN_HEIGHT * s), int(so.DESIGN_HEIGHT * f * s)),
+    )
+    assert app._size_preset == so.DEFAULT_SIZE_PRESET == "compact"
+    assert (app.root.winfo_width(), app.root.winfo_height()) == expected
+    assert str(app.cmb_sys_audio.cget("width")) == str(
+        so.AUDIO_COMBO_CHARS["compact"])
+
+
 def test_timer_ticks_and_paints_over_elapsed(app):
     app._start_timer()
     try:

@@ -63,6 +63,12 @@ LONG_PTR = ctypes.c_ssize_t
 DESIGN_WIDTH = 960
 DESIGN_HEIGHT = 760
 
+# Startup preset. The overlay opens compact on every launch; the Settings
+# dialog can still switch to Normal/Large for the current session.
+DEFAULT_SIZE_PRESET = "compact"
+PANEL_MIN_WIDTH = 640
+PANEL_MIN_HEIGHT = 420
+
 # Placeholder shown in the manual "Ask" field when empty (reference wording).
 ASK_PLACEHOLDER = "Ask any question manually …"
 
@@ -421,7 +427,7 @@ class StealthOverlayApp:
         self._features_panel = None
         self._recording = False
         self._large_panel = False
-        self._size_preset = "normal"
+        self._size_preset = DEFAULT_SIZE_PRESET
         self._size_btns = {}
         self._mini_win = None
         self._mini_pos = None
@@ -436,6 +442,7 @@ class StealthOverlayApp:
         self._init_styles()
         self.root.withdraw()
         self._build_ui()
+        self._fit_bars()  # compact preset needs the narrower audio selector
         self._realize_window()
         self._bind_shortcuts()
         self._populate_devices()
@@ -466,7 +473,11 @@ class StealthOverlayApp:
         except Exception:
             dpi = 96
         self._ui_scale = dpi / 96.0
-        w, h = int(DESIGN_WIDTH * self._ui_scale), int(DESIGN_HEIGHT * self._ui_scale)
+        factor = self._SIZE_FACTORS[self._size_preset]
+        w = max(int(PANEL_MIN_WIDTH * self._ui_scale),
+                int(DESIGN_WIDTH * factor * self._ui_scale))
+        h = max(int(PANEL_MIN_HEIGHT * self._ui_scale),
+                int(DESIGN_HEIGHT * factor * self._ui_scale))
         try:
             sw = self.root.winfo_screenwidth()
         except Exception:
@@ -484,7 +495,8 @@ class StealthOverlayApp:
         # only the answer CONTENT inside it scrolls — long answers cannot
         # resize the window because the pinned geometry wins over children.
         self.root.resizable(False, False)
-        self.root.minsize(int(640 * self._ui_scale), int(420 * self._ui_scale))
+        self.root.minsize(int(PANEL_MIN_WIDTH * self._ui_scale),
+                          int(PANEL_MIN_HEIGHT * self._ui_scale))
         self.root.attributes("-topmost", True)
         self.root.configure(bg="#0c1114")
         # Tool-window style FIRST, before the window is ever deiconified: this
@@ -2629,8 +2641,8 @@ class StealthOverlayApp:
         if not origin:
             return
         x0, y0, w0, h0 = origin
-        w = max(int(640 * self._ui_scale), w0 + (e.x_root - x0))
-        h = max(int(420 * self._ui_scale), h0 + (e.y_root - y0))
+        w = max(int(PANEL_MIN_WIDTH * self._ui_scale), w0 + (e.x_root - x0))
+        h = max(int(PANEL_MIN_HEIGHT * self._ui_scale), h0 + (e.y_root - y0))
         try:
             self.root.geometry(f"{w}x{h}")
         except Exception:
@@ -2653,8 +2665,10 @@ class StealthOverlayApp:
         if preset not in self._SIZE_FACTORS:
             preset = "normal"
         f = self._SIZE_FACTORS[preset]
-        w = max(int(640 * self._ui_scale), int(DESIGN_WIDTH * f * self._ui_scale))
-        h = max(int(420 * self._ui_scale), int(DESIGN_HEIGHT * f * self._ui_scale))
+        w = max(int(PANEL_MIN_WIDTH * self._ui_scale),
+                int(DESIGN_WIDTH * f * self._ui_scale))
+        h = max(int(PANEL_MIN_HEIGHT * self._ui_scale),
+                int(DESIGN_HEIGHT * f * self._ui_scale))
         try:
             self.root.geometry(f"{w}x{h}")
             self._size_preset = preset
