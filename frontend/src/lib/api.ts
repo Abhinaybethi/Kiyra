@@ -1,6 +1,10 @@
 /**
  * Centralized API Client for AI Interview Assistance Platform
+ *
+ * Every protected endpoint carries the bearer token from the email-OTP
+ * sign-in. A 401 clears it and the AuthGate sends the user back to /login.
  */
+import { authHeaders, clearAuthToken } from './auth';
 
 const API_BASE = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8000';
 export const WS_BASE = process.env.NEXT_PUBLIC_WS_URL || 'ws://localhost:8000';
@@ -199,11 +203,12 @@ async function request<T>(path: string, options: RequestInit = {}): Promise<T> {
     ...options,
     headers: {
       'Content-Type': 'application/json',
-      ...options.headers,
+      ...authHeaders(options.headers),
     },
   });
 
   if (!res.ok) {
+    if (res.status === 401) clearAuthToken('unauthorized');
     let errorDetail = `Request failed: ${res.statusText}`;
     try {
       const errJson = await res.json();
@@ -231,9 +236,11 @@ export const api = {
     formData.append('file', file);
     const res = await fetch(`${API_BASE}/api/resume`, {
       method: 'POST',
+      headers: authHeaders(),
       body: formData,
     });
     if (!res.ok) {
+      if (res.status === 401) clearAuthToken('unauthorized');
       const err = await res.json();
       throw new Error(err.detail || 'Upload failed');
     }
@@ -307,6 +314,7 @@ export const api = {
       if (sessionId) formData.append('session_id', String(sessionId));
       const res = await fetch(`${API_BASE}/api/vision/analyze`, {
         method: 'POST',
+        headers: authHeaders(),
         body: formData,
       });
       let errDetail: string | undefined;
@@ -314,7 +322,10 @@ export const api = {
         const err = await res.json();
         errDetail = err.detail;
       } catch { /* fallback */ }
-      if (!res.ok) throw new Error(errDetail || 'Image analysis failed');
+      if (!res.ok) {
+        if (res.status === 401) clearAuthToken('unauthorized');
+        throw new Error(errDetail || 'Image analysis failed');
+      }
       return res.json() as Promise<VisualAnalysis>;
     },
 

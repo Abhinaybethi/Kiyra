@@ -11,12 +11,11 @@ the app is alive. Network calls use ``urllib`` and are best-effort: if the
 backend is unreachable the user can still add/skip a job description and
 continue.
 
-Hide mode
----------
-The wizard never opens when the overlay is launched hidden (``--hidden`` /
-``KIYRA_OVERLAY_HIDDEN``) or when ``KIYRA_SKIP_SETUP=1`` is set, so automated
-and background runs never cover the desktop. It also honours
-``KIYRA_OVERLAY_OFFSCREEN`` by placing itself far off-screen (used by tests).
+Sign-in is mandatory
+--------------------
+There is no skip flag and no stored-session auto-login: every launch requires
+a fresh email code. ``KIYRA_OVERLAY_OFFSCREEN`` only moves the window far
+off-screen (used by tests); it does not bypass authentication.
 """
 from __future__ import annotations
 
@@ -70,13 +69,9 @@ def _env_flag(name: str, default: bool) -> bool:
     return raw.strip().lower() in ("1", "true", "yes", "on")
 
 
-def should_skip_setup() -> bool:
-    """True when the wizard must not open (automation / hide mode)."""
-    return (_env_flag("KIYRA_SKIP_SETUP", False)
-            or _env_flag("KIYRA_OVERLAY_HIDDEN", False))
-
-
 # ── Local session store ─────────────────────────────────────────────────────
+# The token is intentionally NOT persisted. Every launch requires a fresh email
+# OTP. These helpers only remove a token left behind by an older build.
 
 def auth_store_path() -> Path:
     """Where the desktop keeps its bearer token between launches."""
@@ -89,46 +84,6 @@ def auth_store_path() -> Path:
     return Path.home() / ".kiyra" / "auth.json"
 
 
-def load_auth_session() -> Optional[dict]:
-    """Return ``{"token": ..., "account": {...}}`` or None if unreadable."""
-    try:
-        raw = auth_store_path().read_text(encoding="utf-8")
-        data = json.loads(raw)
-    except Exception:
-        return None
-    if not isinstance(data, dict):
-        return None
-    token = data.get("token")
-    account = data.get("account")
-    if not isinstance(token, str) or not token.strip():
-        return None
-    if not isinstance(account, dict):
-        account = {}
-    return {"token": token.strip(), "account": account}
-
-
-def save_auth_session(token: str, account: dict) -> None:
-    """Persist the session atomically. Never raises (best-effort)."""
-    path = auth_store_path()
-    try:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        payload = {
-            "token": token,
-            "account": account,
-            "saved_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-        }
-        tmp = path.with_suffix(path.suffix + ".tmp")
-        tmp.write_text(json.dumps(payload, indent=2), encoding="utf-8")
-        os.replace(tmp, path)
-        if os.name == "posix":
-            try:
-                os.chmod(path, 0o600)
-            except OSError:
-                pass
-    except Exception:
-        pass
-
-
 def clear_auth_session() -> None:
     try:
         auth_store_path().unlink(missing_ok=True)
@@ -138,9 +93,13 @@ def clear_auth_session() -> None:
 
 # ── Tiny JSON HTTP helpers (stdlib only) ────────────────────────────────────
 
-def _api_get(api_url: str, path: str, timeout: float = 5.0):
+def _api_get(api_url: str, path: str, timeout: float = 5.0,
+             token: Optional[str] = None):
     import urllib.request
-    req = urllib.request.Request(f"{api_url}{path}", method="GET")
+    headers = {}
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    req = urllib.request.Request(f"{api_url}{path}", headers=headers, method="GET")
     with urllib.request.urlopen(req, timeout=timeout) as resp:
         return json.loads(resp.read() or b"null")
 
@@ -154,15 +113,6 @@ def _api_post(api_url: str, path: str, payload: dict, timeout: float = 10.0,
         headers["Authorization"] = f"Bearer {token}"
     req = urllib.request.Request(
         f"{api_url}{path}", data=body, headers=headers, method="POST")
-    with urllib.request.urlopen(req, timeout=timeout) as resp:
-        return json.loads(resp.read() or b"null")
-
-
-def _api_get_auth(api_url: str, path: str, token: str, timeout: float = 5.0):
-    import urllib.request
-    req = urllib.request.Request(
-        f"{api_url}{path}", method="GET",
-        headers={"Authorization": f"Bearer {token}"})
     with urllib.request.urlopen(req, timeout=timeout) as resp:
         return json.loads(resp.read() or b"null")
 
@@ -208,14 +158,13 @@ class SetupWizard:
         self.username = "local"
         self.job_description_id: Optional[int] = None
 
-        # Authentication state. `account` is only set after a verified OTP or
-        # a valid stored session; the footer's Continue stays disabled until
-        # then.
+        # Authentication state. `account` is only set after a verified email
+        # OTP; the footer's Continue stays disabled until then.
         self.account: Optional[dict] = None
         self.auth_token: Optional[str] = None
         self._pending_email: str = ""
         self._pending_purpose: str = "login"
-        self._dev_code: Optional[str] = None
+        self._otp_length: int = 6
         self._smtp_configured = False
         self._auth_busy = False
         self._resend_until = 0.0
@@ -242,8 +191,10 @@ class SetupWizard:
             self.win.lift()
         except Exception:
             pass
-        self._bootstrap_auth_async()
-        self._load_jobs_async()
+        # No stored-session auto-login: purge any token from an older build and
+        # require a fresh email code for this launch.
+        clear_auth_session()
+        # Jobs are loaded after sign-in, when the bearer token exists.
 
     # ── layout ──────────────────────────────────────────────────────────────
 
@@ -364,7 +315,8 @@ class SetupWizard:
             justify="left", wraplength=620)
         self.login_subtitle.grid(row=1, column=0, sticky="ew", pady=(4, 14))
 
-        # A restored session turns this into a confirmation panel.
+        # After a verified OTP this becomes a confirmation panel; there is no
+        # restored-session path.
         self.login_signed = tk.Label(
             inner, text="", bg=CARD, fg=ACCENT, font=(FONT, _fs(10)),
             anchor="w", justify="left", padx=12, pady=10)
@@ -711,8 +663,11 @@ class SetupWizard:
         self.account = dict(account or {})
         self.auth_token = token
         self.username = self.account.get("full_name") or self.account.get("email") or "local"
-        save_auth_session(token, self.account)
         self._update_signed_in_state()
+        # /api/jobs is protected. Loading before this point returned 401 and
+        # left the saved job descriptions invisible for the rest of the wizard.
+        self._reset_jobs()
+        self._load_jobs_async()
 
     def _sign_out(self):
         token = self.auth_token
@@ -724,9 +679,9 @@ class SetupWizard:
         clear_auth_session()
         self.account = None
         self.auth_token = None
+        self._reset_jobs()
         self.username = "local"
         self._pending_email = ""
-        self._dev_code = None
         self.otp_hint.config(text="")
         self.otp_error.config(text="")
         self.login_error.config(text="")
@@ -734,7 +689,6 @@ class SetupWizard:
 
     def _use_different_email(self):
         self._pending_email = ""
-        self._dev_code = None
         self._cancel_resend_countdown()
         self._show_credentials_view()
         try:
@@ -862,12 +816,17 @@ class SetupWizard:
         if not code.isdigit():
             self.otp_error.config(text="The code is all digits.")
             return False
+        if len(code) != self._otp_length:
+            self.otp_error.config(
+                text=f"Enter the {self._otp_length}-digit code from your email.")
+            return False
 
         self.otp_error.config(text="")
 
         def work():
             return _api_post(self.api_url, "/api/auth/verify",
-                             {"email": self._pending_email, "code": code},
+                             {"email": self._pending_email, "code": code,
+                              "purpose": self._pending_purpose},
                              timeout=20.0)
 
         if not background:
@@ -887,21 +846,17 @@ class SetupWizard:
         data = data or {}
         self._pending_email = (data.get("email") or self.ent_email.get().strip()).lower()
         self._pending_purpose = data.get("purpose") or "login"
-        self._dev_code = data.get("dev_code")
+        self._otp_length = int(data.get("otp_length") or 6)
         self._smtp_configured = data.get("delivery") == "email"
 
         ttl = int(data.get("expires_in") or 600)
         minutes = max(1, round(ttl / 60))
         self.otp_subtitle.config(
-            text=f"We sent a {len(self._dev_code) if self._dev_code else 6}-digit "
-                 f"code to {self._pending_email}. It expires in {minutes} minutes.")
-        if self._dev_code:
-            self.otp_hint.config(
-                text=f"Email isn't configured on this machine — your code is "
-                     f"{self._dev_code}. It is also printed in the backend log.")
-        else:
-            self.otp_hint.config(
-                text="Didn't get it? Check your spam folder, then resend.")
+            text=data.get("message") or
+                 f"We emailed a {self._otp_length}-digit code to "
+                 f"{self._pending_email}. It expires in {minutes} minutes.")
+        self.otp_hint.config(
+            text="Didn't get it? Check your spam folder, then resend.")
         self._show_otp_view()
         self._start_resend_countdown(int(data.get("resend_in") or 30))
 
@@ -916,7 +871,6 @@ class SetupWizard:
         self._set_signed_in(account, token)
         self._cancel_resend_countdown()
         self._pending_email = ""
-        self._dev_code = None
         self.otp_hint.config(text="")
         self.otp_error.config(text="")
         self._show(1)
@@ -969,41 +923,30 @@ class SetupWizard:
         else:
             self._resend_job = None
 
-    # ── stored session ──────────────────────────────────────────────────────
-
-    def _bootstrap_auth_async(self):
-        stored = load_auth_session()
-        if not stored:
-            return
-
-        def work():
-            return _api_get_auth(self.api_url, "/api/auth/me", stored["token"])
-
-        def ok(account):
-            if not account:
-                clear_auth_session()
-                return
-            self._set_signed_in(account, stored["token"])
-
-        def err(_exc):
-            # A stored token that the backend rejects is simply stale.
-            clear_auth_session()
-
-        self._run_worker(work, ok, err)
-
     # ── job description ─────────────────────────────────────────────────────
+
+    def _reset_jobs(self):
+        self._jobs_loaded = False
+        while True:
+            try:
+                self._jobs_queue.get_nowait()
+            except queue.Empty:
+                break
 
     def _load_jobs_async(self):
         if self._jobs_loaded:
             return
         self._jobs_loaded = True
+        token = self.auth_token
 
         def work():
             try:
-                jobs = _api_get(self.api_url, "/api/jobs") or []
+                jobs = _api_get(self.api_url, "/api/jobs", token=token) or []
                 err = None
             except Exception as exc:  # noqa: BLE001 — surfaced in the UI
                 jobs, err = [], str(exc)
+            if self.auth_token != token:
+                return  # discarded: the user signed out or changed accounts
             self._jobs_queue.put((jobs, err))
 
         threading.Thread(target=work, name="setup-jobs", daemon=True).start()
@@ -1068,7 +1011,8 @@ class SetupWizard:
                 return False
             job = self._jobs[sel[0]]
             try:
-                _api_post(self.api_url, f"/api/jobs/{job['id']}/activate", {})
+                _api_post(self.api_url, f"/api/jobs/{job['id']}/activate", {},
+                          token=self.auth_token)
             except Exception as exc:  # noqa: BLE001
                 self.status.config(
                     text=f"Could not activate that description: {exc}")
@@ -1090,7 +1034,7 @@ class SetupWizard:
                 "title": title,
                 "company": self.ent_jd_company.get().strip() or None,
                 "raw_text": raw_text,
-            })
+            }, token=self.auth_token)
         except Exception as exc:  # noqa: BLE001
             self.status.config(text=f"Could not save the description: {exc}")
             return False
@@ -1133,20 +1077,13 @@ class SetupWizard:
 
 
 def run_setup_wizard(root: tk.Tk, api_url: str, *,
-                     offscreen: Optional[bool] = None,
-                     skip: bool = False,
-                     force: bool = False) -> Optional[dict]:
-    """Show the wizard modally and return the collected setup.
+                     offscreen: Optional[bool] = None) -> Optional[dict]:
+    """Show the sign-in wizard modally and return the collected setup.
 
     Returns ``{"username": ..., "job_description_id": ..., "account": ...,
-    "auth_token": ...}`` on finish, or ``None`` if the user cancelled. When
-    skipped (hide mode / automation) the defaults are returned without opening
-    a window. ``force`` overrides both the skip flag and the environment (used
-    by ``--setup``).
+    "auth_token": ...}`` on finish, or ``None`` if the user cancelled. There is
+    deliberately no skip path: the overlay cannot start without a fresh OTP.
     """
-    if not force and (skip or should_skip_setup()):
-        return {"username": "local", "job_description_id": None,
-                "account": None, "auth_token": None}
     wizard = SetupWizard(root, api_url, offscreen=offscreen)
     try:
         root.wait_window(wizard.win)

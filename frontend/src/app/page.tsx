@@ -196,7 +196,7 @@ export default function DashboardPage() {
                   4. Live Interview Assist
                 </h3>
                 <p className="text-xs text-slate-400 mt-1">
-                  Real-time microphone transcription with STAR and technical hint generation.
+                  Real-time Windows system-audio transcription with STAR and technical hint generation.
                 </p>
               </Link>
             </div>

@@ -27,6 +27,7 @@ import {
   Monitor,
 } from 'lucide-react';
 import { api, WS_BASE, InterviewSession, Profile } from '@/lib/api';
+import { clearAuthToken, getAuthToken, websocketTokenParam } from '@/lib/auth';
 
 interface TranscriptItem {
   id: string;
@@ -91,7 +92,14 @@ export default function LiveWorkspacePage({ params }: { params: Promise<{ id: st
 
     const connect = () => {
       if (disposed) return;
-      const wsUrl = `${WS_BASE}/api/interviews/${sessionId}/ws`;
+      if (!getAuthToken()) {
+        clearAuthToken('unauthorized');
+        setError('Sign in to start the live assistant.');
+        return;
+      }
+      // Browser WebSockets cannot set headers, so the bearer token is passed
+      // as a query parameter and validated by the same require_account guard.
+      const wsUrl = `${WS_BASE}/api/interviews/${sessionId}/ws${websocketTokenParam()}`;
       socket = new WebSocket(wsUrl);
       wsRef.current = socket;
 
@@ -157,12 +165,20 @@ export default function LiveWorkspacePage({ params }: { params: Promise<{ id: st
         }
       };
 
-      socket.onclose = () => {
+      socket.onclose = (event: CloseEvent) => {
         setWsConnected(false);
-        if (!disposed) {
-          retryTimer = setTimeout(connect, retryDelay);
-          retryDelay = Math.min(retryDelay * 2, 15000);
+        if (disposed) return;
+        if (event.code === 4401) {
+          // The session was revoked or expired. Do not reconnect forever with
+          // a stale token; AuthProvider reacts to this and shows /login.
+          disposed = true;
+          clearAuthToken('unauthorized');
+          setError('Your session ended. Sign in again to continue.');
+          router.replace('/login');
+          return;
         }
+        retryTimer = setTimeout(connect, retryDelay);
+        retryDelay = Math.min(retryDelay * 2, 15000);
       };
 
       socket.onerror = () => {
@@ -182,7 +198,7 @@ export default function LiveWorkspacePage({ params }: { params: Promise<{ id: st
         displayStreamRef.current.getTracks().forEach((t) => t.stop());
       }
     };
-  }, [sessionId]);
+  }, [sessionId, router]);
 
   useEffect(() => {
     transcriptEndRef.current?.scrollIntoView({ behavior: 'smooth' });

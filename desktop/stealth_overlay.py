@@ -318,10 +318,15 @@ class StealthOverlayApp:
                  backend_launcher: "BackendLauncher | None" = None,
                  model_launcher: "ModelServerLauncher | None" = None,
                  listening_mode: bool = True,
-                 auto_start_listening: bool = True):
+                 auto_start_listening: bool = True,
+                 auth_token: Optional[str] = None):
         self.root = root
         self.api_url = api_url.rstrip("/")
         self.session_id = session_id
+        # Opaque bearer token from the freshly verified email OTP. Every REST
+        # call and the live WebSocket attach it; without a valid session the
+        # backend rejects the request before it reaches the audio pipeline.
+        self.auth_token = auth_token
         # Interview Listening Mode switches (Phase 5.4).
         self._want_listening_mode = bool(listening_mode)
         self._want_auto_start = bool(auto_start_listening)
@@ -431,6 +436,17 @@ class StealthOverlayApp:
         self._populate_devices()
 
         print("[Stealth] Initialized. Press F9 to toggle visibility, F10 for click-through.")
+
+    def _auth_headers(self, extra: Optional[dict] = None) -> dict:
+        """Headers for a protected backend request.
+
+        The token comes from the completed OTP wizard — it is never read from
+        disk, so a previous launch cannot authenticate this one.
+        """
+        headers = dict(extra or {})
+        if self.auth_token:
+            headers["Authorization"] = f"Bearer {self.auth_token}"
+        return headers
 
     # ─────────────────────────────────────────────────────────────────────────
     # Window & UI
@@ -1351,7 +1367,8 @@ class StealthOverlayApp:
         ).encode("utf-8") + shot.image_bytes + f"\r\n--{boundary}--\r\n".encode("utf-8")
         req = urllib.request.Request(
             f"{self.api_url}/api/vision/extract", data=body,
-            headers={"Content-Type": f"multipart/form-data; boundary={boundary}"},
+            headers=self._auth_headers({
+                "Content-Type": f"multipart/form-data; boundary={boundary}"}),
             method="POST",
         )
         with urllib.request.urlopen(req, timeout=90) as resp:
@@ -1951,13 +1968,22 @@ class StealthOverlayApp:
 
     async def _ws_main(self):
         """Main WebSocket loop with reconnect."""
+        if not self.auth_token:
+            self._ui_set_status("Sign in required", ok=False)
+            return
         url = self.api_url.replace("http://", "ws://").replace("https://", "wss://")
         url += f"/api/interviews/{self.session_id}/ws"
+        # websockets >=14 renamed extra_headers → additional_headers. The
+        # bundled desktop runtime is 15.x; the bearer token is mandatory.
+        connect_kwargs = {
+            "max_size": None,
+            "additional_headers": {"Authorization": f"Bearer {self.auth_token}"},
+        }
 
         backoff = 1.0
         while not self._stop_event.is_set():
             try:
-                async with websockets.connect(url, max_size=None) as ws:
+                async with websockets.connect(url, **connect_kwargs) as ws:
                     self.websocket = ws
                     self.ws_connected = True
                     self._ui_set_status("Connected ✓", ok=True)
@@ -3310,7 +3336,8 @@ class StealthOverlayApp:
                               "session_id": self.session_id}).encode()
         req = _ur.Request(
             f"{self.api_url}/api/interviews/suggest-answer", data=payload,
-            headers={"Content-Type": "application/json"}, method="POST"
+            headers=self._auth_headers({"Content-Type": "application/json"}),
+            method="POST"
         )
         with _ur.urlopen(req, timeout=90) as resp:
             data = json.loads(resp.read())
@@ -3370,7 +3397,8 @@ class StealthOverlayApp:
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _create_live_session(api_url: str,
-                         job_description_id: Optional[int] = None) -> int:
+                         job_description_id: Optional[int] = None,
+                         auth_token: Optional[str] = None) -> int:
     """Create a live interview session via REST and return its id."""
     url = f"{api_url}/api/interviews"
     payload = {
@@ -3382,9 +3410,12 @@ def _create_live_session(api_url: str,
     }
     if job_description_id:
         payload["job_description_id"] = job_description_id
+    headers = {"Content-Type": "application/json"}
+    if auth_token:
+        headers["Authorization"] = f"Bearer {auth_token}"
     req = urllib.request.Request(
         url, data=json.dumps(payload).encode(),
-        headers={"Content-Type": "application/json"},
+        headers=headers,
         method="POST"
     )
     with urllib.request.urlopen(req, timeout=5) as resp:
@@ -3475,12 +3506,6 @@ def _parse_args(argv):
         # Start collapsed into the 56x56 bubble so the overlay can listen and
         # answer without covering the desktop (click the bubble to expand).
         "start_hidden": _env_flag("KIYRA_OVERLAY_HIDDEN", False),
-        # Skip the pre-flight setup wizard (sign in → job description →
-        # instructions). Hide mode always skips it so a background run never
-        # pops a window over the desktop.
-        "skip_setup": _env_flag("KIYRA_SKIP_SETUP", False),
-        # Force the wizard open even in hide mode (explicit --setup).
-        "force_setup": False,
     }
     # Drop the script path when argv came from sys.argv (argv[0] always ends
     # in .py; no real flag does).
@@ -3518,12 +3543,11 @@ def _parse_args(argv):
             opts["start_hidden"] = True
             i += 1
         elif flag in ("--skip-setup", "--no-setup"):
-            opts["skip_setup"] = True
-            opts["force_setup"] = False
+            print("[Args] Sign-in is mandatory — --skip-setup/--no-setup no "
+                  "longer bypass the email OTP wizard.")
             i += 1
         elif flag == "--setup":
-            opts["skip_setup"] = False
-            opts["force_setup"] = True
+            print("[Args] --setup is redundant: the sign-in wizard always runs.")
             i += 1
         elif flag in ("-h", "--help"):
             print("usage: python stealth_overlay.py [--api-url URL] "
@@ -3531,7 +3555,7 @@ def _parse_args(argv):
                   "[--startup-timeout SECONDS] "
                   "[--stop-backend-on-exit | --keep-backend] "
                   "[--auto-detect] [--no-auto-start-listening] "
-                  "[--hidden] [--skip-setup | --setup]")
+                  "[--hidden]  (email OTP sign-in is always required)")
             sys.exit(0)
         else:
             print(f"[Args] ignoring unknown argument: {args[i]}")
@@ -3593,19 +3617,24 @@ def main(argv=None):
               f"          Log: {launcher.log_path if launcher else ''}")
         return 1
 
-    # 2. Pre-flight setup: sign in → job description → instructions. Hide mode
-    #    and automation skip it so a background run never pops a window over
-    #    the desktop.
+    # 2. Pre-flight setup: sign in → job description → instructions. Always
+    #    runs — every launch needs a fresh email OTP. In hidden mode the wizard
+    #    is placed off-screen, but a real person still has to complete it.
     root = tk.Tk()
     root.withdraw()
     from setup_wizard import run_setup_wizard
     setup = run_setup_wizard(
-        root, api_url,
-        skip=opts["skip_setup"] or (opts["start_hidden"]
-                                    and not opts["force_setup"]),
-        force=opts["force_setup"])
+        root, api_url, offscreen=True if opts["start_hidden"] else None)
     if setup is None:
         print("[Setup] Cancelled — exiting.")
+        try:
+            root.destroy()
+        except Exception:
+            pass
+        return 1
+    auth_token = setup.get("auth_token")
+    if not auth_token:
+        print("[Setup] No session token — exiting. Finish email verification.")
         try:
             root.destroy()
         except Exception:
@@ -3623,7 +3652,8 @@ def main(argv=None):
     for attempt in range(5):
         try:
             session_id = _create_live_session(
-                api_url, job_description_id=setup.get("job_description_id"))
+                api_url, job_description_id=setup.get("job_description_id"),
+                auth_token=auth_token)
             print(f"[Session] Created session {session_id}")
             break
         except Exception as e:
@@ -3641,7 +3671,8 @@ def main(argv=None):
         backend_launcher=launcher if opts["stop_on_exit"] else None,
         model_launcher=model_launcher if opts["stop_on_exit"] else None,
         listening_mode=opts["listening_mode"],
-        auto_start_listening=opts["auto_start_listening"])
+        auto_start_listening=opts["auto_start_listening"],
+        auth_token=auth_token)
     if opts.get("start_hidden"):
         # Collapse into the 56x56 bubble right after the window paints, so the
         # overlay runs (listening + answering) without covering the desktop.
