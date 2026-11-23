@@ -290,11 +290,14 @@ class Settings(BaseSettings):
     auth_otp_resend_cooldown_seconds: int = 30
     auth_otp_max_per_hour: int = 6           # abuse ceiling per email
     auth_session_days: int = 30              # desktop session lifetime
-    auth_otp_secret: str = ""                # HMAC key; random per process if unset
-    auth_dev_otp: bool = False               # force OTP into the API response (dev only)
+    # HMAC key for OTP digests. REQUIRED: codes must remain valid across a
+    # backend restart, so an unset secret is a configuration error, not a
+    # "random per process" fallback.
+    auth_otp_secret: str = ""
 
-    # SMTP transport. When unset, the OTP is printed to the backend console and
-    # returned as ``dev_code`` so a local install works with zero config.
+    # SMTP transport is mandatory. There is no console fallback and no code in
+    # API responses — the only way to sign in is to receive and enter a real
+    # email. OTP requests fail with HTTP 503 until SMTP is configured.
     smtp_host: str = ""
     smtp_port: int = 587
     smtp_username: str = ""

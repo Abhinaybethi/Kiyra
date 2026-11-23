@@ -5,7 +5,7 @@ import os
 import sys
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI, Request
+from fastapi import Depends, FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
@@ -189,6 +189,10 @@ app = FastAPI(
     version="1.0.0",
     description="Local-first AI interview assistance platform",
     lifespan=lifespan,
+    # The route surface is internal. No unauthenticated schema or docs pages.
+    docs_url=None,
+    redoc_url=None,
+    openapi_url=None,
 )
 
 app.add_middleware(
@@ -220,25 +224,32 @@ async def provider_unavailable_handler(request: Request, exc: ProviderUnavailabl
 
 # ── Routes ─────────────────────────────────────────────────────────────────
 
+from api.deps import require_account
 from api.profile import router as profile_router
 from api.auth import router as auth_router
 from api.resume import router as resume_router
 from api.jobs import router as jobs_router
 from api.knowledge import router as knowledge_router
-from api.interviews import router as interviews_router
+from api.interviews import (
+    router as interviews_router,
+    websocket_router as interviews_ws_router,
+)
 from api.analytics import router as analytics_router
 from api.settings import router as settings_router
 from api.vision import router as vision_router
 
-app.include_router(profile_router)
+# Every application route requires a valid session. Only the auth router
+# (register/login/resend/verify/status) and /health stay public. The live
+# WebSocket is mounted separately with its own dependency so the HTTP-only
+# header guard never rejects a browser's ?token connection.
+_PROTECTED_ROUTERS = (
+    profile_router, resume_router, jobs_router, knowledge_router,
+    interviews_router, analytics_router, settings_router, vision_router,
+)
 app.include_router(auth_router)
-app.include_router(resume_router)
-app.include_router(jobs_router)
-app.include_router(knowledge_router)
-app.include_router(interviews_router)
-app.include_router(analytics_router)
-app.include_router(settings_router)
-app.include_router(vision_router)
+for _router in _PROTECTED_ROUTERS:
+    app.include_router(_router, dependencies=[Depends(require_account)])
+app.include_router(interviews_ws_router)
 
 
 @app.get("/health")
@@ -268,7 +279,7 @@ async def health():
     }
 
 
-@app.get("/api/transcription/health")
+@app.get("/api/transcription/health", dependencies=[Depends(require_account)])
 async def transcription_health():
     from realtime.transcription import is_available
     available = is_available()

@@ -32,10 +32,15 @@ _EMAIL_RE = re.compile(r"^[^@\s]{1,64}@[^@\s]{1,190}\.[A-Za-z]{2,}$")
 _NAME_RE = re.compile(r"[^\W\d_]", re.UNICODE)
 _PHONE_ALLOWED_RE = re.compile(r"^\+?[\d\s().-]+$")
 
-# HMAC key: configured value, otherwise a per-process random key. A random key
-# means a backend restart invalidates outstanding OTPs — acceptable, and much
-# safer than a hard-coded default.
-_SECRET = (settings.auth_otp_secret or "").encode() or secrets.token_bytes(32)
+def _otp_secret() -> bytes:
+    """The configured HMAC key. No random fallback: a restarted backend must
+    still be able to verify codes it issued before the restart."""
+    secret = (settings.auth_otp_secret or "").encode()
+    if not secret:
+        raise RuntimeError(
+            "AUTH_OTP_SECRET is not configured. Set it to a long random value "
+            "before accepting sign-ins.")
+    return secret
 
 
 # ── Errors ─────────────────────────────────────────────────────────────────
@@ -133,7 +138,7 @@ def _generate_code() -> str:
 
 def _hash_code(email: str, purpose: str, code: str) -> str:
     payload = f"{email}:{purpose}:{code}".encode()
-    return hmac.new(_SECRET, payload, hashlib.sha256).hexdigest()
+    return hmac.new(_otp_secret(), payload, hashlib.sha256).hexdigest()
 
 
 def _utcnow() -> datetime:
@@ -142,18 +147,18 @@ def _utcnow() -> datetime:
 
 @dataclass
 class IssuedOtp:
+    id: int
     code: str
     expires_at: datetime
     ttl_seconds: int
 
 
-def _latest_otp(db: Session, email: str, purpose: str) -> Optional[AuthOtp]:
-    return (
-        db.query(AuthOtp)
-        .filter(AuthOtp.email == email, AuthOtp.purpose == purpose)
-        .order_by(AuthOtp.created_at.desc(), AuthOtp.id.desc())
-        .first()
-    )
+def _latest_otp(db: Session, email: str,
+                purpose: Optional[str] = None) -> Optional[AuthOtp]:
+    query = db.query(AuthOtp).filter(AuthOtp.email == email)
+    if purpose is not None:
+        query = query.filter(AuthOtp.purpose == purpose)
+    return query.order_by(AuthOtp.created_at.desc(), AuthOtp.id.desc()).first()
 
 
 def _enforce_rate_limits(db: Session, email: str, purpose: str) -> None:
@@ -183,10 +188,15 @@ def issue_otp(db: Session, email: str, purpose: str) -> IssuedOtp:
     _enforce_rate_limits(db, email, purpose)
 
     now = _utcnow()
-    # Only the newest email may be redeemed.
+    # Only the newest code *for this purpose* may be redeemed. A login code
+    # must never be invalidated by an unrelated registration challenge.
     (
         db.query(AuthOtp)
-        .filter(AuthOtp.email == email, AuthOtp.consumed_at.is_(None))
+        .filter(
+            AuthOtp.email == email,
+            AuthOtp.purpose == purpose,
+            AuthOtp.consumed_at.is_(None),
+        )
         .update({"consumed_at": now}, synchronize_session=False)
     )
 
@@ -201,21 +211,33 @@ def issue_otp(db: Session, email: str, purpose: str) -> IssuedOtp:
     )
     db.add(row)
     db.commit()
-    return IssuedOtp(code=code, expires_at=row.expires_at, ttl_seconds=ttl)
+    return IssuedOtp(
+        id=row.id, code=code, expires_at=row.expires_at, ttl_seconds=ttl)
 
 
-def verify_otp(db: Session, email: str, code: str) -> AuthOtp:
-    """Redeem a code. Raises AuthError subclasses on every failure path."""
+def verify_otp(db: Session, email: str, code: str, purpose: str) -> AuthOtp:
+    """Redeem a code issued for a specific purpose.
+
+    The purpose is part of both the HMAC payload and the lookup: a code from a
+    registration challenge can never verify a login challenge (or vice versa).
+    Raises AuthError subclasses on every failure path.
+    """
     email = normalize_email(email)
     code = (code or "").strip()
     if not email or not code:
         raise ValidationError("Email and code are required.")
     if not code.isdigit():
-        raise OtpInvalid("Enter the 6-digit code from your email.")
+        raise OtpInvalid(f"Enter the {int(settings.auth_otp_length)}-digit code from your email.")
+    if purpose not in ("register", "login"):
+        raise ValidationError("Unknown verification purpose.")
 
     row = (
         db.query(AuthOtp)
-        .filter(AuthOtp.email == email, AuthOtp.consumed_at.is_(None))
+        .filter(
+            AuthOtp.email == email,
+            AuthOtp.purpose == purpose,
+            AuthOtp.consumed_at.is_(None),
+        )
         .order_by(AuthOtp.created_at.desc(), AuthOtp.id.desc())
         .first()
     )

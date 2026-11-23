@@ -1,10 +1,9 @@
 """SMTP delivery for Kiyra sign-in codes.
 
-The desktop overlay is local-first, so email is optional: when SMTP is not
-configured the caller falls back to printing the code to the backend console
-and surfacing it as ``dev_code`` in the API response. When SMTP *is*
-configured, delivery failures are reported honestly instead of silently
-pretending the mail went out.
+Email delivery is mandatory. There is no console fallback and no code in API
+responses: if SMTP is unconfigured the auth router fails closed with HTTP 503,
+and if a send fails the issued code is deleted so it cannot be redeemed by
+anyone who never received it.
 """
 from __future__ import annotations
 
@@ -17,8 +16,14 @@ from config import settings
 
 
 def smtp_configured() -> bool:
-    """True when enough SMTP settings exist to attempt a real send."""
-    return bool(settings.smtp_host and (settings.smtp_from or settings.smtp_username))
+    """True only when real authenticated SMTP delivery is possible.
+
+    A username without a password is a half-configured relay: it would issue
+    and persist an OTP before ``login()`` failed. Fail closed with 503 instead.
+    """
+    if not (settings.smtp_host and settings.smtp_username):
+        return False
+    return bool(settings.smtp_password)
 
 
 def _sender() -> str:

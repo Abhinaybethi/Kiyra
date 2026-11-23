@@ -26,6 +26,7 @@ class LoginRequest(BaseModel):
 class VerifyOtpRequest(BaseModel):
     email: str
     code: str
+    purpose: str  # "register" | "login" — must match the issued challenge
 
 
 class ResendOtpRequest(BaseModel):
@@ -53,10 +54,10 @@ class AuthChallengeResponse(BaseModel):
     ok: bool = True
     purpose: str
     email: str
-    delivery: str  # "email" | "console"
+    delivery: str = "email"
+    otp_length: int = 6
     expires_in: int
     resend_in: int
-    dev_code: Optional[str] = None
     message: str
 
 

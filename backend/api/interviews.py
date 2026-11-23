@@ -13,6 +13,7 @@ from api.schemas import (
     AnswerSubmit, AnswerResponse, FeedbackResponse, OKResponse,
     AnswerSuggestionRequest, AnswerSuggestionResponse,
 )
+from api.deps import require_account_ws
 from api.profile import get_profile
 from agents.orchestrator import InterviewOrchestrator
 from ai.provider import get_provider, ensure_provider_ready
@@ -229,8 +230,15 @@ async def suggest_answer(data: AnswerSuggestionRequest, db: Session = Depends(ge
 
 
 # ── WebSocket ──────────────────────────────────────────────────────────
+# Mounted separately in main.py so the HTTP-only bearer dependency is never
+# attached to a WebSocket route. Browsers authenticate this route with ?token.
+websocket_router = APIRouter(prefix="/api/interviews", tags=["interviews"])
 
-@router.websocket("/{session_id}/ws")
+
+@websocket_router.websocket(
+    "/{session_id}/ws",
+    dependencies=[Depends(require_account_ws)],
+)
 async def interview_websocket(session_id: int, websocket: WebSocket, db: Session = Depends(get_db)):
     """WebSocket endpoint for live interview assistance."""
     await websocket.accept()

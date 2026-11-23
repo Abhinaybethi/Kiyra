@@ -1,9 +1,9 @@
 """Desktop authentication routes: register → email OTP → session.
 
-Everything here is local-first: the overlay talks to the same backend it
-already uses, and email delivery is optional (console fallback). Endpoints are
-synchronous on purpose so FastAPI runs the blocking SMTP call in its threadpool
-instead of stalling the event loop.
+There is exactly one way to sign in: request a code, receive it by email, and
+redeem it here. No console fallback, no ``dev_code`` in responses, no
+auto-approval. Endpoints are synchronous on purpose so FastAPI runs the
+blocking SMTP call in its threadpool instead of stalling the event loop.
 """
 from __future__ import annotations
 
@@ -15,6 +15,7 @@ from sqlalchemy.orm import Session
 from config import settings
 from db.database import get_db
 from db.models import AuthOtp
+from api.deps import bearer_token as _bearer
 from api.schemas import (
     AccountUpdateRequest,
     AuthAccountResponse,
@@ -34,21 +35,17 @@ router = APIRouter(prefix="/api/auth", tags=["auth"])
 
 def _challenge(purpose: str, email: str,
                issued: auth.IssuedOtp) -> AuthChallengeResponse:
-    delivery = "email" if smtp_configured() else "console"
-    dev_code = issued.code if (delivery == "console" or settings.auth_dev_otp) else None
-    if delivery == "email":
-        message = f"We emailed a {issued.ttl_seconds // 60}-minute code to {email}."
-    else:
-        message = ("Email is not configured on this machine, so the code was "
-                   "printed to the backend console.")
+    # The code is NEVER part of this response — only the mailbox that received
+    # it can supply it to /verify.
     return AuthChallengeResponse(
         purpose=purpose,
         email=email,
-        delivery=delivery,
+        delivery="email",
+        otp_length=len(issued.code),
         expires_in=issued.ttl_seconds,
         resend_in=int(settings.auth_otp_resend_cooldown_seconds),
-        dev_code=dev_code,
-        message=message,
+        message=(f"We emailed a {len(issued.code)}-digit code to {email}. "
+                 f"It expires in {issued.ttl_seconds // 60} minutes."),
     )
 
 
@@ -59,41 +56,41 @@ def _require_signin_enabled() -> None:
             detail="New sign-ins are disabled on this server.")
 
 
+def _require_email_delivery() -> None:
+    """Fail closed: without SMTP there is no legitimate way to receive a code."""
+    if not smtp_configured():
+        raise HTTPException(
+            status_code=503,
+            detail=("Email verification is not configured on this server. "
+                    "Set SMTP_HOST, SMTP_USERNAME, SMTP_PASSWORD and SMTP_FROM "
+                    "in backend/.env, then restart the backend."))
+
+
 def _issue_and_send(db: Session, email: str, purpose: str,
                     full_name: str) -> AuthChallengeResponse:
     _require_signin_enabled()
+    _require_email_delivery()
     try:
         issued = auth.issue_otp(db, email, purpose)
     except auth.AuthError as exc:
         raise HTTPException(status_code=exc.status_code, detail=exc.message)
-    if smtp_configured():
-        delivery_error = send_otp_email(
-            email, full_name, issued.code, issued.ttl_seconds)
-        if delivery_error:
-            # Do not leave a code the user cannot possibly read.
-            (
-                db.query(AuthOtp)
-                .filter(AuthOtp.email == email, AuthOtp.consumed_at.is_(None))
-                .delete(synchronize_session=False)
-            )
-            db.commit()
-            raise HTTPException(
-                status_code=502,
-                detail=f"Could not send the verification email: {delivery_error}")
-    else:
-        # Console fallback — make the code impossible to miss in the log.
-        print(f"[AUTH] OTP for {email} ({purpose}): {issued.code} "
-              f"(expires in {issued.ttl_seconds // 60} min)")
+    except RuntimeError as exc:
+        raise HTTPException(status_code=503, detail=str(exc))
+
+    delivery_error = send_otp_email(
+        email, full_name, issued.code, issued.ttl_seconds)
+    if delivery_error:
+        # Do not leave a code the user cannot possibly read.
+        (
+            db.query(AuthOtp)
+            .filter(AuthOtp.id == issued.id)
+            .delete(synchronize_session=False)
+        )
+        db.commit()
+        raise HTTPException(
+            status_code=502,
+            detail=f"Could not send the verification email: {delivery_error}")
     return _challenge(purpose, email, issued)
-
-
-def _bearer(authorization: Optional[str]) -> str:
-    if not authorization:
-        raise HTTPException(status_code=401, detail="Sign in to continue.")
-    scheme, _, token = authorization.partition(" ")
-    if scheme.lower() != "bearer" or not token.strip():
-        raise HTTPException(status_code=401, detail="Sign in to continue.")
-    return token.strip()
 
 
 @router.get("/status")
@@ -101,6 +98,7 @@ def auth_status():
     """Capabilities for diagnostics and clients."""
     return {
         "enabled": bool(settings.auth_enabled),
+        "email_delivery_required": True,
         "smtp_configured": smtp_configured(),
         "otp_length": int(settings.auth_otp_length),
         "otp_ttl_seconds": int(settings.auth_otp_ttl_seconds),
@@ -126,6 +124,10 @@ def login(data: LoginRequest, db: Session = Depends(get_db)):
         if account is None:
             raise auth.AccountNotFound(
                 "No account found for this email. Create an account first.")
+        if not account.is_verified:
+            raise auth.Unauthorized(
+                "This account is not verified yet. Finish the code sent when "
+                "you registered, or create the account again.")
     except auth.AuthError as exc:
         raise HTTPException(status_code=exc.status_code, detail=exc.message)
     return _issue_and_send(db, account.email, "login", account.full_name)
@@ -139,26 +141,40 @@ def resend(data: ResendOtpRequest, db: Session = Depends(get_db)):
         if account is None:
             raise auth.AccountNotFound(
                 "No account found for this email. Create an account first.")
+        purpose = "register" if data.purpose == "register" else "login"
+        if purpose == "login" and not account.is_verified:
+            raise auth.Unauthorized("Verify your account before signing in.")
+        if purpose == "register" and account.is_verified:
+            # Verified accounts sign in with a login code. Allowing a fresh
+            # register challenge here lets anyone invalidate that login code.
+            raise auth.Unauthorized(
+                "This account is already verified. Sign in instead.")
     except auth.AuthError as exc:
         raise HTTPException(status_code=exc.status_code, detail=exc.message)
-    purpose = "register" if data.purpose == "register" else "login"
     return _issue_and_send(db, account.email, purpose, account.full_name)
 
 
 @router.post("/verify", response_model=AuthSessionResponse)
 def verify(data: VerifyOtpRequest, db: Session = Depends(get_db)):
     _require_signin_enabled()
+    _require_email_delivery()
     try:
         email = auth.validate_email(data.email)
         account = auth.get_account_by_email(db, email)
         if account is None:
             raise auth.AccountNotFound(
                 "No account found for this email. Create an account first.")
-        auth.verify_otp(db, email, data.code)
+        if data.purpose not in ("register", "login"):
+            raise auth.ValidationError("Unknown verification purpose.")
+        otp = auth.verify_otp(db, email, data.code, data.purpose)
+        if otp.purpose == "login" and not account.is_verified:
+            raise auth.Unauthorized("Verify your account before signing in.")
         account = auth.mark_verified(db, account)
         token, expires_at = auth.create_session(db, account)
     except auth.AuthError as exc:
         raise HTTPException(status_code=exc.status_code, detail=exc.message)
+    except RuntimeError as exc:
+        raise HTTPException(status_code=503, detail=str(exc))
     return AuthSessionResponse(
         token=token,
         expires_at=expires_at,
