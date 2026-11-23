@@ -359,6 +359,15 @@ def transcribe_with_lock(
             model=_get_model())
 
 
+def final_stt_busy() -> bool:
+    """True while the authoritative (final) Whisper lane owns the CPU.
+
+    Preview/partial STT is deliberately skippable: dropping a preview costs one
+    line of live text, while delaying the final transcript delays the answer.
+    """
+    return _model_lock.locked()
+
+
 def is_available() -> bool:
     """Check if Whisper model can be loaded."""
     try:

@@ -73,7 +73,7 @@ from realtime.formatting import plain_answer, trim_dangling_sentence
 from realtime.question_analyzer import analyze_question
 from realtime.perf import PerformanceTracker
 from realtime.prompts import realtime_system, qtype_for_question
-from realtime.transcription import transcribe_with_lock
+from realtime.transcription import final_stt_busy, transcribe_with_lock
 from realtime.transcript import (
     InterviewTranscriptBuffer,
     TranscriptBuffer,
@@ -608,6 +608,13 @@ class LiveSession:
         )
 
     async def _process_frame(self, recv_ts: float, frame_bytes: bytes):
+        # In listening mode, frames that arrive while the turn is stopped are
+        # discarded by the turn gate later anyway — skip VAD + partial STT now
+        # so they cannot compete with the authoritative final transcription.
+        if getattr(self, "_listening_mode", False) and \
+                not getattr(self, "_listening_active", False):
+            return
+
         frame = decode_wav_frame(frame_bytes)
         if frame.size == 0:
             if self._rx_count % 48 == 1:
@@ -1152,6 +1159,8 @@ class LiveSession:
             return
         if self._spec_task and not self._spec_task.done():
             return  # already speculating — leave CPU for the LLM
+        if final_stt_busy():
+            return  # never steal CPU from the authoritative final transcription
         if self._partial_task and not self._partial_task.done():
             return  # one partial in flight is enough
         speech = self._receiver.speech_seconds
@@ -2611,6 +2620,13 @@ class LiveSession:
           5. normalize + minimum-useful-length check
           6. exactly one generation
         """
+        # 0. A SEND meant for a turn that was already re-armed must never submit
+        #    the next turn's transcript (stale WS events are possible after a
+        #    slow generation/reconnect).
+        if turn_id and getattr(self, "_turn_id", None) and turn_id != self._turn_id:
+            print(f"[TURN] send ignored: stale turn_id={turn_id} current={self._turn_id}")
+            return
+
         # 1. Single-flight: a repeated click while GENERATING is ignored.
         if self._turn_submitting:
             print("[TURN] send ignored: generation already in flight")

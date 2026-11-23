@@ -222,6 +222,38 @@ async def test_repeated_segment_text_is_not_duplicated(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_frames_are_not_processed_while_listening_is_stopped(monkeypatch):
+    """Stopped turns must not spend VAD/Whisper CPU on buffered audio frames."""
+    sess = make_session()
+    sess._listening_mode = True
+    sess._listening_active = False
+    calls = []
+
+    def _forbidden(_bytes):
+        calls.append(1)
+        return np.zeros(4000, dtype=np.float32)
+
+    monkeypatch.setattr(session_mod, "decode_wav_frame", _forbidden)
+    await sess._process_frame(0.0, b"stale-frame")
+    assert calls == []
+
+
+@pytest.mark.asyncio
+async def test_partial_stt_yields_to_final_stt(monkeypatch):
+    """Preview transcription is skipped while the final lane owns the CPU."""
+    sess = make_session()
+    sess._receiver.speech_seconds = 5.0
+    sess._last_partial_speech = 0.0
+    sess._receiver.voiced = True
+    monkeypatch.setattr(session_mod, "final_stt_busy", lambda: True)
+    monkeypatch.setattr(session_mod, "transcribe_with_lock",
+                        lambda *a, **k: pytest.fail("partial STT must not run"))
+
+    sess._maybe_trigger_partial()
+    assert sess._partial_task is None
+
+
+@pytest.mark.asyncio
 async def test_partial_transcript_never_becomes_the_answer(monkeypatch):
     """A partial is UI-only: it must not reach the answer path (spec  5/ 6)."""
     sess = make_session()
@@ -265,6 +297,19 @@ async def test_send_submits_exactly_one_generation(monkeypatch):
     assert len(submitted) == 1
     assert submitted[0]["question"] == "Can you explain my Kiyra architecture"
     assert len(payloads(sess.ws, EventType.ANSWER_GENERATED.value)) == 1
+
+
+@pytest.mark.asyncio
+async def test_stale_turn_send_is_ignored(monkeypatch):
+    """A SEND carrying an old turn id must not submit the new turn."""
+    sess = make_session()
+    sess._turn_id = "t2"
+    monkeypatch.setattr(session_mod, "transcribe_with_lock",
+                        lambda *a, **k: stt_result("some question"))
+
+    await sess._submit_turn(text="some question", turn_id="t1")
+    assert payloads(sess.ws, EventType.TURN_SUBMITTED.value) == []
+    assert sess._answers_generated == 0
 
 
 @pytest.mark.asyncio
