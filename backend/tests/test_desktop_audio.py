@@ -72,6 +72,8 @@ class _FakePyAudio:
             "hostApi": 2,
             "isLoopbackDevice": True,
         }
+        self.extra_loopbacks = []
+        self.default_render_name = None
         self.last_closed = False
 
     def terminate(self):
@@ -81,13 +83,20 @@ class _FakePyAudio:
         return iter([{"index": 2, "type": 13, "name": "Windows WASAPI"},
                      {"index": 0, "type": 2, "name": "MME"}])
 
+    def get_host_api_info_by_type(self, _type):
+        return {"index": 2, "type": 13, "defaultOutputDevice": 99}
+
+    def get_device_info_by_index(self, index):
+        assert index == 99
+        return {"index": index, "name": self.default_render_name or ""}
+
     def get_default_wasapi_loopback(self):
         return self.default_loopback
 
     def get_loopback_device_info_generator(self):
-        if self.default_loopback is None:
-            return iter([])
-        return iter([self.default_loopback])
+        devices = ([self.default_loopback] if self.default_loopback else []) + \
+            list(self.extra_loopbacks)
+        return iter(devices)
 
     def open(self, **kwargs):
         assert kwargs.get("input") is True, "only loopback INPUT streams allowed"
@@ -102,6 +111,7 @@ def _install_stubs():
     mod.PyAudio = lambda: fake_pa  # shared singleton
     mod.paInt16 = _FakePyAudio.paInt16
     mod.paContinue = _FakePyAudio.paContinue
+    mod.paWASAPI = 13
     sys.modules["pyaudiowpatch"] = mod
     return {"pa": fake_pa}
 
@@ -172,6 +182,112 @@ def test_fallback_still_requires_loopback_flags():
     assert audio_loopback.find_wasapi_loopback_device() is None
     out = _info()
     _STUBS["pa"].default_loopback = out
+
+
+def test_loopback_is_matched_to_active_render_endpoint(monkeypatch):
+    """Two loopback twins exist; only the active render endpoint may be used."""
+    pa = _STUBS["pa"]
+    headphones = _info(index=17, name="Headphones (realme Buds T110) [Loopback]")
+    monkeypatch.setattr(pa, "default_render_name", "Headphones (realme Buds T110)")
+    # pyaudiowpatch nominates the WRONG twin (speakers); active render is headphones.
+    monkeypatch.setattr(pa, "default_loopback",
+                        _info(index=16, name="Speakers (Realtek(R) Audio) [Loopback]"))
+    monkeypatch.setattr(pa, "extra_loopbacks", [headphones])
+    info = audio_loopback.find_wasapi_loopback_device()
+    assert info["index"] == 17
+    assert info["render_endpoint"] == "Headphones (realme Buds T110)"
+
+
+def test_unmatched_render_endpoint_never_selects_arbitrary_loopback(monkeypatch):
+    pa = _STUBS["pa"]
+    monkeypatch.setattr(pa, "default_render_name", "Virtual Cable B")
+    monkeypatch.setattr(pa, "extra_loopbacks",
+                        [_info(index=17, name="Headphones (realme Buds T110) [Loopback]")])
+    assert audio_loopback.find_wasapi_loopback_device() is None
+
+
+def test_capture_loop_retries_failed_loopback_start(monkeypatch):
+    """A transient start failure is retried; no microphone path is introduced."""
+    import threading
+    import types
+
+    import stealth_overlay as so
+
+    dev = _normalised()
+    events = []
+
+    class FakeCapture:
+        attempts = 0
+
+        def __init__(self, on_chunk, device_info, on_status=None):
+            self.device = device_info
+
+        def start(self):
+            type(self).attempts += 1
+            events.append("start:%d" % type(self).attempts)
+            if type(self).attempts == 1:
+                return False
+            app._stop_event.set()
+            return True
+
+        def stop(self):
+            events.append("stop")
+
+        def endpoint_key(self):
+            return (self.device["index"], self.device["name"])
+
+    class FakeMonitor:
+        def __init__(self):
+            self._last = None
+
+        def changed(self, info):
+            key = (int(info["index"]), str(info["name"])) if info else None
+            changed = key != self._last
+            self._last = key
+            return changed
+
+        def forget(self):
+            self._last = None
+
+        def poll(self):
+            return dev
+
+        def close(self):
+            events.append("monitor_closed")
+
+    class FakeTime:
+        def __init__(self):
+            self.t = 0.0
+
+        def monotonic(self):
+            self.t += 1.0
+            return self.t
+
+    monkeypatch.setattr(so, "LoopbackCapture", FakeCapture)
+    monkeypatch.setattr(so, "WASAPIDeviceMonitor", FakeMonitor)
+    monkeypatch.setattr(so, "validate_wasapi_loopback", lambda _info: True)
+    monkeypatch.setattr(so, "MONITOR_INTERVAL_SECONDS", 0.01)
+    monkeypatch.setattr(so, "time", FakeTime())
+
+    app = types.SimpleNamespace(
+        _stop_event=threading.Event(),
+        loopback_device=dev,
+        _last_loop=dev,
+        _loop_name=None,
+        _loop_choice=None,
+        _loopback_active=False,
+        _audio_queue=types.SimpleNamespace(maxsize=50),
+        _push_audio_chunk=lambda _b: None,
+        _render_sys_audio_state=lambda: None,
+        _sync_sys_audio_selector=lambda: None,
+        _ui_set_status=lambda msg, ok=False: events.append("status:" + msg),
+    )
+    so.StealthOverlayApp._capture_loop(app)
+
+    assert events.count("start:1") == 1
+    assert events.count("start:2") == 1
+    assert any("retrying" in e for e in events)
+    assert "monitor_closed" in events
 
 
 def test_validate_rejects_unverified_device_without_opening_stream():

@@ -135,12 +135,47 @@ def _normalise_loopback_info(pa, dev: Optional[dict]) -> Optional[dict]:
     return info
 
 
-def find_wasapi_loopback_device(pa=None, verbose: bool = True) -> Optional[dict]:
-    """Discover the WASAPI loopback endpoint for the current default playback
-    device (speakers / wired headphones / Bluetooth headphones).
+def _default_wasapi_render_name(pa, pyaudio) -> Optional[str]:
+    """Name of the active WASAPI render endpoint, when the OS exposes it."""
+    try:
+        api = getattr(pyaudio, "paWASAPI", None)
+        if api is not None:
+            info = pa.get_host_api_info_by_type(api)
+        else:
+            info = next(
+                (a for a in pa.get_host_api_info_generator()
+                 if int(a.get("type", -1)) == 13), None)
+        if not info or info.get("defaultOutputDevice") is None:
+            return None
+        dev = pa.get_device_info_by_index(int(info["defaultOutputDevice"]))
+        return str(dev.get("name") or "")
+    except Exception:
+        return None
 
-    Never enumerates or returns a microphone device.  ``pa`` may be supplied by
-    :class:`WASAPIDeviceMonitor` to avoid creating a PortAudio instance per poll.
+
+def _endpoint_names_match(loopback_render: str, render: str) -> bool:
+    """True when a loopback endpoint is the twin of the active render endpoint."""
+    a = str(loopback_render or "").strip().casefold()
+    b = str(render or "").strip().casefold()
+    if not a or not b:
+        return False
+    if a == b:
+        return True
+    # Windows occasionally decorates one name with a suffix/prefix.
+    return len(a) >= 4 and len(b) >= 4 and (a in b or b in a)
+
+
+def find_wasapi_loopback_device(pa=None, verbose: bool = True) -> Optional[dict]:
+    """Discover the loopback twin of the CURRENT default playback endpoint.
+
+    Never enumerates or returns a microphone device.  When several loopback
+    endpoints exist (speakers + Bluetooth headphones is common), the endpoint is
+    selected by matching the active render endpoint name — never by taking an
+    arbitrary first entry.  If no matching twin exists, capture stays
+    unavailable rather than transcribing the wrong output device.
+
+    ``pa`` may be supplied by :class:`WASAPIDeviceMonitor` to avoid creating a
+    PortAudio instance per poll.
     """
     pyaudio = _load_pyaudiowpatch()
     if pyaudio is None:
@@ -150,36 +185,69 @@ def find_wasapi_loopback_device(pa=None, verbose: bool = True) -> Optional[dict]
     own_pa = pa is None
     pa = pa or pyaudio.PyAudio()
     try:
-        dev = None
         reason = "no WASAPI loopback endpoint exposed by the system"
+        candidates = []
+
+        def _consider(dev):
+            info = _normalise_loopback_info(pa, dev)
+            if info is None:
+                return
+            if any(c["index"] == info["index"] and c["name"] == info["name"]
+                   for c in candidates):
+                return
+            candidates.append(info)
+
         try:
-            dev = pa.get_default_wasapi_loopback()
+            _consider(pa.get_default_wasapi_loopback())
         except Exception as e:  # pragma: no cover - platform dependent
             reason = f"get_default_wasapi_loopback failed: {e}"
+        try:
+            for dev in pa.get_loopback_device_info_generator():
+                _consider(dev)
+        except Exception as e:  # pragma: no cover - platform dependent
+            reason = f"loopback enumeration failed: {e}"
 
-        if dev is None:
-            try:  # still loopback-only: first loopback endpoint the OS reports
-                dev = next(pa.get_loopback_device_info_generator(), None)
-            except Exception as e:  # pragma: no cover - platform dependent
-                reason = f"loopback enumeration failed: {e}"
-
-        if dev is None:
+        if not candidates:
             print(f"[AUDIO_LOOPBACK] unavailable reason={reason}")
             return None
 
-        info = _normalise_loopback_info(pa, dev)
-        if info is None:
-            if verbose:
-                print("[AUDIO_LOOPBACK] unavailable reason=endpoint failed loopback verification")
-            return None
+        render = _default_wasapi_render_name(pa, pyaudio)
+        chosen = None
+        if render:
+            chosen = next((c for c in candidates
+                           if _endpoint_names_match(c["render_endpoint"], render)), None)
+            if chosen is None:
+                print(
+                    "[AUDIO_LOOPBACK] unavailable reason=no loopback twin for "
+                    "active render endpoint render=%r candidates=%s"
+                    % (render, [c["name"] for c in candidates]))
+                return None
+        elif len(candidates) == 1:
+            chosen = candidates[0]
+        else:
+            # The OS did not expose the active render endpoint. Accept only the
+            # endpoint pyaudiowpatch itself nominates as the default; never
+            # guess among several loopback twins.
+            try:
+                preferred = pa.get_default_wasapi_loopback()
+            except Exception:
+                preferred = None
+            key = ((int(preferred["index"]), str(preferred["name"]))
+                   if preferred else None)
+            chosen = next((c for c in candidates
+                           if (int(c["index"]), str(c["name"])) == key), None)
+            if chosen is None:
+                print("[AUDIO_LOOPBACK] unavailable reason=ambiguous loopback endpoints")
+                return None
+
         if verbose:
             print(
                 "[AUDIO_DEVICE] loopback output=%r index=%d native_rate=%d channels=%d "
                 "render=%r wasapi_flag=on"
-                % (info["name"], info["index"], info["samplerate"],
-                   info["channels"], info["render_endpoint"])
+                % (chosen["name"], chosen["index"], chosen["samplerate"],
+                   chosen["channels"], chosen["render_endpoint"])
             )
-        return info
+        return chosen
     finally:
         if own_pa:
             try:
@@ -507,6 +575,15 @@ class WASAPIDeviceMonitor:
         self._last_key = key
         self._last_info = info
         return changed
+
+    def forget(self):
+        """Force the next ``changed()`` to report a change.
+
+        Used after a failed stream start/reinit: the endpoint key is still the
+        same, so without this the capture loop would wait forever for a device
+        change that already happened and never retry.
+        """
+        self._last_key = None
 
     def close(self):
         try:
