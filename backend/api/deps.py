@@ -16,6 +16,7 @@ from typing import Optional
 from fastapi import Depends, Header, HTTPException, WebSocket, WebSocketException
 from sqlalchemy.orm import Session
 
+from config import settings
 from db.database import get_db
 from db.models import AuthAccount
 from services import auth
@@ -45,6 +46,8 @@ def require_account(
     db: Session = Depends(get_db),
 ) -> AuthAccount:
     """Validate the bearer header and return the signed-in account (HTTP)."""
+    if settings.dev_auth_bypass:
+        return auth.get_or_create_dev_account(db)
     try:
         return auth.account_from_token(db, bearer_token(authorization))
     except auth.AuthError as exc:
@@ -56,6 +59,8 @@ def require_account_ws(
     db: Session = Depends(get_db),
 ) -> AuthAccount:
     """Validate a live-session token from the header or WS query string."""
+    if settings.dev_auth_bypass:
+        return auth.get_or_create_dev_account(db)
     authorization = websocket.headers.get("authorization")
     token = websocket.query_params.get("token")
     try:

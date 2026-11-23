@@ -33,10 +33,20 @@ export default function LoginPage() {
   const [error, setError] = useState<string | null>(null);
 
   useEffect(() => {
-    authApi.status().then(setStatus).catch((e) => setError(messageOf(e)));
-    if (getAuthToken()) {
-      authApi.me().then(() => router.replace('/')).catch(() => clearAuthToken('unauthorized'));
-    }
+    authApi.status()
+      .then((value) => {
+        setStatus(value);
+        if (value.dev_bypass) {
+          router.replace('/');
+          return;
+        }
+        if (getAuthToken()) {
+          authApi.me()
+            .then(() => router.replace('/'))
+            .catch(() => clearAuthToken('unauthorized'));
+        }
+      })
+      .catch((e) => setError(messageOf(e)));
   }, [router]);
 
   useEffect(() => {

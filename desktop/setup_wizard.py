@@ -162,6 +162,7 @@ class SetupWizard:
         # OTP; the footer's Continue stays disabled until then.
         self.account: Optional[dict] = None
         self.auth_token: Optional[str] = None
+        self.dev_bypass = False  # set only when the backend opts in locally
         self._pending_email: str = ""
         self._pending_purpose: str = "login"
         self._otp_length: int = 6
@@ -195,6 +196,8 @@ class SetupWizard:
         # require a fresh email code for this launch.
         clear_auth_session()
         # Jobs are loaded after sign-in, when the bearer token exists.
+        # Local development can opt out of sign-in entirely via the backend.
+        self._maybe_dev_bypass()
 
     # ── layout ──────────────────────────────────────────────────────────────
 
@@ -659,6 +662,27 @@ class SetupWizard:
         except Exception:
             pass
 
+    def _maybe_dev_bypass(self):
+        """Local-only opt-out: honour KIYRA_DEV_AUTH_BYPASS on the backend."""
+        try:
+            status = _api_get(self.api_url, "/api/auth/status", timeout=2.0)
+        except Exception:
+            return  # backend starting or unreachable — keep strict sign-in
+        if isinstance(status, dict) and status.get("dev_bypass"):
+            self._enable_dev_bypass()
+
+    def _enable_dev_bypass(self):
+        self.dev_bypass = True
+        self._set_signed_in({
+            "full_name": "Local Developer",
+            "email": "dev@localhost",
+            "phone": "",
+            "is_verified": True,
+        }, "")
+        self.login_subtitle.config(
+            text="Local dev mode — sign-in is disabled on this backend.")
+        self._show(1)
+
     def _set_signed_in(self, account: dict, token: str):
         self.account = dict(account or {})
         self.auth_token = token
@@ -670,6 +694,9 @@ class SetupWizard:
         self._load_jobs_async()
 
     def _sign_out(self):
+        if self.dev_bypass:
+            self._enable_dev_bypass()
+            return
         token = self.auth_token
         if token:
             try:
@@ -1061,6 +1088,7 @@ class SetupWizard:
             "job_description_id": self.job_description_id,
             "account": self.account,
             "auth_token": self.auth_token,
+            "dev_bypass": self.dev_bypass,
         }
         self._close()
 
@@ -1081,8 +1109,9 @@ def run_setup_wizard(root: tk.Tk, api_url: str, *,
     """Show the sign-in wizard modally and return the collected setup.
 
     Returns ``{"username": ..., "job_description_id": ..., "account": ...,
-    "auth_token": ...}`` on finish, or ``None`` if the user cancelled. There is
-    deliberately no skip path: the overlay cannot start without a fresh OTP.
+    "auth_token": ..., "dev_bypass": ...}`` on finish, or ``None`` if cancelled.
+    Sign-in can only be skipped when the backend explicitly enables the local
+    ``KIYRA_DEV_AUTH_BYPASS`` flag.
     """
     wizard = SetupWizard(root, api_url, offscreen=offscreen)
     try:

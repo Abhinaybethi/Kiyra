@@ -284,6 +284,13 @@ class Settings(BaseSettings):
     # Real-world email-OTP auth for the desktop overlay. Accounts are created
     # with full name + phone + email; every sign-in is email + a 6-digit OTP.
     auth_enabled: bool = True                # False blocks new sign-ins (existing sessions still work)
+    # LOCAL DEVELOPMENT ONLY. When true, API/WebSocket routes accept requests
+    # without a token and the clients skip email sign-in. Never enable on a
+    # network-exposed backend: it removes all authentication.
+    dev_auth_bypass: bool = Field(
+        default=False,
+        validation_alias=AliasChoices("kiyra_dev_auth_bypass", "dev_auth_bypass"),
+    )
     auth_otp_ttl_seconds: int = 600          # OTP lifetime (10 minutes)
     auth_otp_length: int = 6                 # digits in the OTP
     auth_otp_max_attempts: int = 5           # wrong guesses before the code dies

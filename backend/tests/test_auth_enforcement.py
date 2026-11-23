@@ -9,6 +9,7 @@ from fastapi.testclient import TestClient
 from starlette.websockets import WebSocketDisconnect
 
 from api.deps import require_account, require_account_ws
+from config import settings
 from db.models import AuthAccount, AuthSession
 from main import app
 
@@ -120,3 +121,53 @@ def test_live_websocket_accepts_query_token(raw_client, signed_in):
         with pytest.raises(WebSocketDisconnect) as exc:
             websocket.receive_text()
     assert exc.value.code == 4004
+
+
+# ── local development bypass (opt-in, never the default) ───────────────────
+
+@pytest.fixture
+def dev_bypass(monkeypatch):
+    monkeypatch.setattr(settings, "dev_auth_bypass", True)
+
+
+def test_dev_bypass_defaults_off():
+    assert settings.dev_auth_bypass is False
+
+
+def test_dev_bypass_reads_kiyra_prefixed_env(monkeypatch):
+    """The documented env var must actually reach Settings."""
+    from config import Settings
+    monkeypatch.setenv("KIYRA_DEV_AUTH_BYPASS", "true")
+    monkeypatch.delenv("DEV_AUTH_BYPASS", raising=False)
+    assert Settings(_env_file=None).dev_auth_bypass is True
+
+
+def test_dev_bypass_allows_anonymous_http(raw_client, dev_bypass):
+    assert raw_client.get("/api/profile").status_code == 200
+    assert raw_client.get("/api/transcription/health").status_code == 200
+
+
+def test_dev_bypass_me_and_logout_without_a_token(raw_client, dev_bypass):
+    me = raw_client.get("/api/auth/me")
+    assert me.status_code == 200
+    assert me.json()["email"] == "dev@localhost"
+    assert raw_client.post("/api/auth/logout").status_code == 200
+
+
+def test_dev_bypass_allows_anonymous_websocket(raw_client, dev_bypass):
+    with raw_client.websocket_connect("/api/interviews/999999/ws") as websocket:
+        with pytest.raises(WebSocketDisconnect) as exc:
+            websocket.receive_text()
+    assert exc.value.code == 4004  # auth passed; session simply does not exist
+
+
+def test_dev_bypass_is_reported_by_status(raw_client, dev_bypass):
+    assert raw_client.get("/api/auth/status").json()["dev_bypass"] is True
+
+
+def test_dev_bypass_does_not_enable_email_signin(
+        raw_client, dev_bypass, signed_in):
+    # The bypass skips sign-in; it never becomes a code-delivery fallback.
+    resp = raw_client.post(
+        "/api/auth/login", json={"email": "enforce@example.com"})
+    assert resp.status_code == 503

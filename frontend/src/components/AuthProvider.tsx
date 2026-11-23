@@ -34,30 +34,45 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
   const onLoginPage = pathname === '/login';
 
   useEffect(() => {
-    if (onLoginPage) {
-      setReady(true);
-      return;
-    }
-
-    const token = getAuthToken();
-    if (!token) {
-      setAccount(null);
-      setReady(true);
-      router.replace('/login');
-      return;
-    }
-
     let cancelled = false;
     setReady(false);
-    authApi.me()
-      .then((value) => { if (!cancelled) setAccount(value); })
-      .catch(() => {
-        if (cancelled) return;
-        clearAuthToken('unauthorized');
-        setAccount(null);
-        router.replace('/login');
-      })
-      .finally(() => { if (!cancelled) setReady(true); });
+
+    (async () => {
+      let bypass = false;
+      try {
+        bypass = Boolean((await authApi.status()).dev_bypass);
+      } catch {
+        // Backend may still be starting; fall back to the normal token rules.
+      }
+      if (cancelled) return;
+
+      if (bypass) {
+        // Local development only: no sign-in required. A token is harmless if
+        // one happens to be stored, but it is not needed.
+        try {
+          const dev = await authApi.me();
+          if (!cancelled) setAccount(dev);
+        } catch {
+          // Account details are cosmetic in bypass mode; pages still render.
+        }
+      } else if (!onLoginPage) {
+        if (!getAuthToken()) {
+          setAccount(null);
+          router.replace('/login');
+        } else {
+          try {
+            const value = await authApi.me();
+            if (!cancelled) setAccount(value);
+          } catch {
+            if (cancelled) return;
+            clearAuthToken('unauthorized');
+            setAccount(null);
+            router.replace('/login');
+          }
+        }
+      }
+      if (!cancelled) setReady(true);
+    })();
 
     return () => { cancelled = true; };
   }, [onLoginPage, router]);

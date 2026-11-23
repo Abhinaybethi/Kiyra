@@ -34,6 +34,11 @@ async def lifespan(app: FastAPI):
 
     Base.metadata.create_all(bind=engine)
 
+    if settings.dev_auth_bypass:
+        print("[AUTH] WARNING: KIYRA_DEV_AUTH_BYPASS is enabled — every API "
+              "and WebSocket route accepts unauthenticated requests. "
+              "Local development only; never expose this backend publicly.")
+
     # Ensure default user exists
     from db.database import SessionLocal
     from db.models import User, ModelConfiguration

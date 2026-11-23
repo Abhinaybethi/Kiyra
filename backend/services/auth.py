@@ -278,6 +278,30 @@ def get_account_by_email(db: Session, email: str) -> Optional[AuthAccount]:
     return db.query(AuthAccount).filter(AuthAccount.email == normalize_email(email)).first()
 
 
+_DEV_EMAIL = "dev@localhost"
+
+
+def get_or_create_dev_account(db: Session) -> AuthAccount:
+    """Local account used only when KIYRA_DEV_AUTH_BYPASS is enabled.
+
+    It exists so endpoints that expect an ``AuthAccount`` (profile updates,
+    ``/api/auth/me``) keep working without a session token. This is never used
+    in the normal email-OTP path.
+    """
+    account = get_account_by_email(db, _DEV_EMAIL)
+    if account is None:
+        account = AuthAccount(
+            full_name="Local Developer", phone="", email=_DEV_EMAIL,
+            is_verified=True,
+        )
+        db.add(account)
+    else:
+        account.is_verified = True
+    db.commit()
+    db.refresh(account)
+    return account
+
+
 def register_account(db: Session, full_name: str, phone: str, email: str) -> AuthAccount:
     full_name = validate_full_name(full_name)
     phone = normalize_phone(phone)

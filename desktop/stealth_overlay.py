@@ -3618,8 +3618,9 @@ def main(argv=None):
         return 1
 
     # 2. Pre-flight setup: sign in → job description → instructions. Always
-    #    runs — every launch needs a fresh email OTP. In hidden mode the wizard
-    #    is placed off-screen, but a real person still has to complete it.
+    #    runs — every launch needs a fresh email OTP unless the backend has
+    #    explicitly enabled the local KIYRA_DEV_AUTH_BYPASS flag. In hidden
+    #    mode the wizard is placed off-screen.
     root = tk.Tk()
     root.withdraw()
     from setup_wizard import run_setup_wizard
@@ -3633,13 +3634,15 @@ def main(argv=None):
             pass
         return 1
     auth_token = setup.get("auth_token")
-    if not auth_token:
+    if not auth_token and not setup.get("dev_bypass"):
         print("[Setup] No session token — exiting. Finish email verification.")
         try:
             root.destroy()
         except Exception:
             pass
         return 1
+    if not auth_token:
+        print("[Setup] Local dev auth bypass is on — running without a token.")
     account = setup.get("account") or {}
     print(f"[Setup] user={setup.get('username')} "
           f"email={account.get('email') or '—'} "

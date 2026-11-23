@@ -166,6 +166,10 @@ for a fresh email code on every launch; the web app sends you to `/login` when
 its bearer token expires. Every API and WebSocket route except the sign-in
 challenges and `/health` requires that token.
 
+For offline local development only, set `KIYRA_DEV_AUTH_BYPASS=true` in
+`backend/.env` to skip sign-in entirely. This removes **all** authentication —
+never enable it on a backend reachable by anyone else.
+
 Visit **http://localhost:3000** to sign in and start practicing!
 
 ---

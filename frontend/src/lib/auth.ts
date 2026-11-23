@@ -42,6 +42,8 @@ export interface AuthChallenge {
 
 export interface AuthStatus {
   enabled: boolean;
+  /** Local-only opt-in: the backend accepts requests without a token. */
+  dev_bypass: boolean;
   email_delivery_required: boolean;
   smtp_configured: boolean;
   otp_length: number;

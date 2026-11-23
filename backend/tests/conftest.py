@@ -14,6 +14,10 @@ os.environ["DEBUG"] = "true"
 # OTP digests use a configured HMAC key in production; tests get a deterministic
 # one so a missing backend/.env never silently changes auth behaviour.
 os.environ.setdefault("AUTH_OTP_SECRET", "kiyra-test-secret-not-for-production")
+# A developer's local KIYRA_DEV_AUTH_BYPASS=true must never weaken the auth
+# tests. Env vars take precedence over backend/.env, so pin this before the
+# config module is imported. Bypass-specific tests opt in via monkeypatch.
+os.environ["KIYRA_DEV_AUTH_BYPASS"] = "false"
 
 # Keep the Tkinter overlay windows off the visible desktop during tests. The
 # app still maps/deiconifies them (needed for real geometry assertions), but

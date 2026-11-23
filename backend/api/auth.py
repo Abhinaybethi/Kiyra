@@ -49,6 +49,13 @@ def _challenge(purpose: str, email: str,
     )
 
 
+def _current_account(db: Session, authorization: Optional[str]):
+    """Return the account for a request, honouring the local dev bypass."""
+    if settings.dev_auth_bypass:
+        return auth.get_or_create_dev_account(db)
+    return auth.account_from_token(db, _bearer(authorization))
+
+
 def _require_signin_enabled() -> None:
     if not settings.auth_enabled:
         raise HTTPException(
@@ -98,6 +105,7 @@ def auth_status():
     """Capabilities for diagnostics and clients."""
     return {
         "enabled": bool(settings.auth_enabled),
+        "dev_bypass": bool(settings.dev_auth_bypass),
         "email_delivery_required": True,
         "smtp_configured": smtp_configured(),
         "otp_length": int(settings.auth_otp_length),
@@ -186,7 +194,7 @@ def verify(data: VerifyOtpRequest, db: Session = Depends(get_db)):
 def me(authorization: Optional[str] = Header(default=None),
        db: Session = Depends(get_db)):
     try:
-        account = auth.account_from_token(db, _bearer(authorization))
+        account = _current_account(db, authorization)
     except auth.AuthError as exc:
         raise HTTPException(status_code=exc.status_code, detail=exc.message)
     return AuthAccountResponse.model_validate(account)
@@ -195,6 +203,8 @@ def me(authorization: Optional[str] = Header(default=None),
 @router.post("/logout", response_model=OKResponse)
 def logout(authorization: Optional[str] = Header(default=None),
            db: Session = Depends(get_db)):
+    if settings.dev_auth_bypass and not authorization:
+        return OKResponse(message="Signed out")
     try:
         auth.revoke_session(db, _bearer(authorization))
     except auth.AuthError as exc:
@@ -209,7 +219,7 @@ def update_account(
     db: Session = Depends(get_db),
 ):
     try:
-        account = auth.account_from_token(db, _bearer(authorization))
+        account = _current_account(db, authorization)
         account = auth.update_account(
             db, account,
             full_name=data.full_name,

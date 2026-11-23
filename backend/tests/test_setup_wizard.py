@@ -98,6 +98,34 @@ def test_jobs_are_loaded_after_sign_in(wizard):
     assert calls == [True, True]
 
 
+def test_dev_bypass_skips_sign_in(wizard, monkeypatch):
+    monkeypatch.setattr(
+        sw, "_api_get", lambda *a, **k: {"dev_bypass": True})
+
+    wizard._maybe_dev_bypass()
+
+    assert wizard.dev_bypass is True
+    assert wizard.account["email"] == "dev@localhost"
+    assert wizard.auth_token == ""
+    assert wizard._page == 1
+
+    # Signing out in local dev mode just re-enters it — no OTP wall.
+    wizard._sign_out()
+    assert wizard.dev_bypass is True
+    assert wizard._page == 1
+
+
+def test_dev_bypass_stays_off_when_backend_reports_no_bypass(
+        wizard, monkeypatch):
+    monkeypatch.setattr(
+        sw, "_api_get", lambda *a, **k: {"dev_bypass": False})
+
+    wizard._maybe_dev_bypass()
+
+    assert wizard.dev_bypass is False
+    assert wizard.account is None
+
+
 # ── mode toggle ─────────────────────────────────────────────────────────────
 
 def test_signin_mode_hides_name_and_phone(wizard):
