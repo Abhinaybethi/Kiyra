@@ -319,7 +319,8 @@ class StealthOverlayApp:
                  model_launcher: "ModelServerLauncher | None" = None,
                  listening_mode: bool = True,
                  auto_start_listening: bool = True,
-                 auth_token: Optional[str] = None):
+                 auth_token: Optional[str] = None,
+                dev_bypass: bool = False):
         self.root = root
         self.api_url = api_url.rstrip("/")
         self.session_id = session_id
@@ -327,6 +328,10 @@ class StealthOverlayApp:
         # call and the live WebSocket attach it; without a valid session the
         # backend rejects the request before it reaches the audio pipeline.
         self.auth_token = auth_token
+        # Local dev bypass: REST and WS accept unauthenticated requests. Without
+        # this flag an empty token used to skip WS entirely, so no loopback audio
+        # ever reached the backend and SEND fell back to a slow HTTP answer.
+        self.dev_bypass = bool(dev_bypass)
         # Interview Listening Mode switches (Phase 5.4).
         self._want_listening_mode = bool(listening_mode)
         self._want_auto_start = bool(auto_start_listening)
@@ -1876,19 +1881,27 @@ class StealthOverlayApp:
             self._render_sys_audio_state()
             return False
 
+        retry_delay = 2.0  # seconds between attempts while capture is down
+
         try:
             monitor = WASAPIDeviceMonitor()
+            forget = getattr(monitor, "forget", lambda: None)
             monitor.changed(self.loopback_device)  # baseline (already validated)
+            retry_at = 0.0
             if not _start_for(self.loopback_device):
-                print("[AUDIO_CAPTURE] loopback_start_failed")
-                _status("WASAPI loopback unavailable")
-                return
+                print("[AUDIO_CAPTURE] loopback_start_failed (will retry)")
+                _status("WASAPI loopback unavailable — retrying")
+                forget()
+                retry_at = time.monotonic() + retry_delay
 
             print(f"[AUDIO_QUEUE] sender queue max={self._audio_queue.maxsize} frames")
             while not self._stop_event.wait(MONITOR_INTERVAL_SECONDS):
                 current = monitor.poll()
+                if capture is None and time.monotonic() < retry_at:
+                    continue
                 if not monitor.changed(current):
                     continue
+                retry_at = 0.0
                 old_key = (capture.endpoint_key() if capture else None)
                 new_key = (int(current["index"]), str(current["name"])) if current else None
                 if current is None:
@@ -1912,14 +1925,24 @@ class StealthOverlayApp:
                     self._last_loop = current
                     self._loop_name = f"WASAPI Loopback: {current['name']}"
                     self._loop_choice = self._loop_name
-                    self._sync_sys_audio_selector()
+                    # Endpoint changes are detected on the capture thread: Tk
+                    # widgets may only be touched on the main thread.
+                    safe_after = getattr(self, "_safe_after", None)
+                    if safe_after is not None:
+                        safe_after(self._sync_sys_audio_selector)
+                    else:
+                        self._sync_sys_audio_selector()
                     if _start_for(current):
                         print("[AUDIO_LOOPBACK] reinitialized endpoint=%r" % current["name"])
                     else:
                         _status("Loopback reinit failed")
+                        forget()
+                        retry_at = time.monotonic() + retry_delay
                 else:
                     self._loopback_active = False
                     _status("Loopback endpoint invalid")
+                    forget()
+                    retry_at = time.monotonic() + retry_delay
         except Exception as e:
             print(f"[Capture] Error: {e}")
         finally:
@@ -1968,17 +1991,17 @@ class StealthOverlayApp:
 
     async def _ws_main(self):
         """Main WebSocket loop with reconnect."""
-        if not self.auth_token:
+        if not self.auth_token and not getattr(self, "dev_bypass", False):
             self._ui_set_status("Sign in required", ok=False)
             return
         url = self.api_url.replace("http://", "ws://").replace("https://", "wss://")
         url += f"/api/interviews/{self.session_id}/ws"
         # websockets >=14 renamed extra_headers → additional_headers. The
-        # bundled desktop runtime is 15.x; the bearer token is mandatory.
-        connect_kwargs = {
-            "max_size": None,
-            "additional_headers": {"Authorization": f"Bearer {self.auth_token}"},
-        }
+        # bearer token is mandatory unless the backend reports dev_bypass.
+        connect_kwargs = {"max_size": None}
+        if self.auth_token:
+            connect_kwargs["additional_headers"] = {
+                "Authorization": f"Bearer {self.auth_token}"}
 
         backoff = 1.0
         while not self._stop_event.is_set():
@@ -3506,6 +3529,10 @@ def _parse_args(argv):
         # Start collapsed into the 56x56 bubble so the overlay can listen and
         # answer without covering the desktop (click the bubble to expand).
         "start_hidden": _env_flag("KIYRA_OVERLAY_HIDDEN", False),
+        # Local automation convenience. Honoured ONLY when the live backend
+        # reports KIYRA_DEV_AUTH_BYPASS; strict SMTP sign-in always shows the
+        # wizard. See `_dev_setup_for_skip`.
+        "skip_setup": False,
     }
     # Drop the script path when argv came from sys.argv (argv[0] always ends
     # in .py; no real flag does).
@@ -3543,8 +3570,9 @@ def _parse_args(argv):
             opts["start_hidden"] = True
             i += 1
         elif flag in ("--skip-setup", "--no-setup"):
-            print("[Args] Sign-in is mandatory — --skip-setup/--no-setup no "
-                  "longer bypass the email OTP wizard.")
+            # Still only a request: main() verifies the backend's dev-bypass
+            # flag before honouring it. In strict mode the wizard always runs.
+            opts["skip_setup"] = True
             i += 1
         elif flag == "--setup":
             print("[Args] --setup is redundant: the sign-in wizard always runs.")
@@ -3561,6 +3589,38 @@ def _parse_args(argv):
             print(f"[Args] ignoring unknown argument: {args[i]}")
             i += 1
     return opts
+
+
+def _dev_setup_for_skip(api_url: str) -> Optional[dict]:
+    """Synthesize setup data for `--skip-setup` ONLY in local dev-bypass mode.
+
+    The decision is made from the live backend, never from a file or environment
+    variable on the desktop side, so an accidental `--skip-setup` against a
+    strict backend cannot remove email OTP verification.
+    """
+    try:
+        with urllib.request.urlopen(
+                f"{api_url.rstrip('/')}/api/auth/status", timeout=3) as resp:
+            status = json.loads(resp.read().decode("utf-8", "replace"))
+    except Exception as exc:  # noqa: BLE001 - strict fallback is always safe
+        print(f"[Setup] --skip-setup ignored (status check failed: {exc})")
+        return None
+    if not isinstance(status, dict) or not status.get("dev_bypass"):
+        print("[Setup] --skip-setup ignored: strict SMTP authentication is active")
+        return None
+    print("[Setup] --skip-setup honoured: backend has local dev auth bypass")
+    return {
+        "dev_bypass": True,
+        "auth_token": None,
+        "username": "local",
+        "account": {
+            "full_name": "Local Developer",
+            "email": "dev@localhost",
+            "phone": "",
+            "is_verified": True,
+        },
+        "job_description_id": None,
+    }
 
 
 def main(argv=None):
@@ -3620,12 +3680,15 @@ def main(argv=None):
     # 2. Pre-flight setup: sign in → job description → instructions. Always
     #    runs — every launch needs a fresh email OTP unless the backend has
     #    explicitly enabled the local KIYRA_DEV_AUTH_BYPASS flag. In hidden
-    #    mode the wizard is placed off-screen.
+    #    mode the wizard is placed off-screen. `--skip-setup` is honoured only
+    #    after the backend itself confirms that local bypass is active.
     root = tk.Tk()
     root.withdraw()
-    from setup_wizard import run_setup_wizard
-    setup = run_setup_wizard(
-        root, api_url, offscreen=True if opts["start_hidden"] else None)
+    setup = _dev_setup_for_skip(api_url) if opts["skip_setup"] else None
+    if setup is None:
+        from setup_wizard import run_setup_wizard
+        setup = run_setup_wizard(
+            root, api_url, offscreen=True if opts["start_hidden"] else None)
     if setup is None:
         print("[Setup] Cancelled — exiting.")
         try:
@@ -3675,7 +3738,8 @@ def main(argv=None):
         model_launcher=model_launcher if opts["stop_on_exit"] else None,
         listening_mode=opts["listening_mode"],
         auto_start_listening=opts["auto_start_listening"],
-        auth_token=auth_token)
+        auth_token=auth_token,
+        dev_bypass=bool(setup.get("dev_bypass")))
     if opts.get("start_hidden"):
         # Collapse into the 56x56 bubble right after the window paints, so the
         # overlay runs (listening + answering) without covering the desktop.

@@ -106,8 +106,12 @@ uv run uvicorn main:app --reload --port 8000
 ```
 
 > **Desktop overlay:** you do NOT need to start the backend or Bonsai yourself.
-> `python desktop/stealth_overlay.py` checks `GET /health` first, launches the
-> backend automatically (hidden console, logged to
+> Always launch through `desktop/run_overlay.py`: it explicitly selects a Python
+> interpreter that has `pyaudiowpatch` (the backend venv deliberately does not),
+> validates the WASAPI loopback twin of the active playback endpoint, and refuses
+> to start if neither is available — it never falls back to a microphone.
+> `stealth_overlay.py` then checks `GET /health` first, launches the backend
+> automatically (hidden console, logged to
 > `%TEMP%\opencode\kiyra-backend.log`) if nothing is serving, waits for it to
 > become healthy, creates the live session, then opens the overlay.
 >
@@ -118,21 +122,26 @@ uv run uvicorn main:app --reload --port 8000
 > stopped by the overlay.
 >
 > ```bash
-> # one command — Bonsai + backend included
-> python desktop/stealth_overlay.py
+> # one command — audio runtime selected, Bonsai + backend included
+> python desktop/run_overlay.py
 >
-> # options
-> python desktop/stealth_overlay.py --api-url http://localhost:9000
-> python desktop/stealth_overlay.py --no-backend          # never start it
-> python desktop/stealth_overlay.py --no-model           # never start Bonsai
-> python desktop/stealth_overlay.py --startup-timeout 180
-> python desktop/stealth_overlay.py --stop-backend-on-exit
+> # options (passed through to the overlay)
+> python desktop/run_overlay.py --api-url http://localhost:9000
+> python desktop/run_overlay.py --no-backend          # never start it
+> python desktop/run_overlay.py --no-model           # never start Bonsai
+> python desktop/run_overlay.py --startup-timeout 180
+> python desktop/run_overlay.py --stop-backend-on-exit
+>
+> # local dev only: skip the wizard when the backend reports dev_bypass=true
+> # (ignored entirely against a strict SMTP backend)
+> python desktop/run_overlay.py --skip-setup
 > ```
 >
 > By default both are left running when the overlay closes (keep-warm), so the
 > next start is instant. `--stop-backend-on-exit` stops them and frees the GPU.
 >
-> Environment overrides: `KIYRA_API_URL`, `KIYRA_BACKEND_PYTHON`,
+> Environment overrides: `KIYRA_DESKTOP_PYTHON` (audio-capable interpreter),
+> `KIYRA_API_URL`, `KIYRA_BACKEND_PYTHON`,
 > `KIYRA_BACKEND_STARTUP_TIMEOUT`, `KIYRA_STOP_BACKEND_ON_EXIT`.
 > An already-running backend is reused, never restarted, and never killed on
 > exit (only a backend this script started, and only with
