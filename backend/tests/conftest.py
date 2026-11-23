@@ -11,6 +11,9 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 os.environ["DATABASE_URL"] = "sqlite:///:memory:"
 os.environ["TESTING"] = "true"
 os.environ["DEBUG"] = "true"
+# OTP digests use a configured HMAC key in production; tests get a deterministic
+# one so a missing backend/.env never silently changes auth behaviour.
+os.environ.setdefault("AUTH_OTP_SECRET", "kiyra-test-secret-not-for-production")
 
 # Keep the Tkinter overlay windows off the visible desktop during tests. The
 # app still maps/deiconifies them (needed for real geometry assertions), but
@@ -33,6 +36,7 @@ from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import StaticPool
 
+from api.deps import require_account, require_account_ws
 from db.database import Base, get_db
 from main import app
 from db.models import User, ModelConfiguration
@@ -80,6 +84,11 @@ def client():
             db.close()
 
     app.dependency_overrides[get_db] = override_get_db
+    # Route-level enforcement is exercised in test_auth_enforcement.py. Unit
+    # tests call endpoints directly and must not need a bearer token on all
+    # 500+ requests.
+    app.dependency_overrides[require_account] = lambda: None
+    app.dependency_overrides[require_account_ws] = lambda: None
     with TestClient(app) as test_client:
         yield test_client
     app.dependency_overrides.clear()

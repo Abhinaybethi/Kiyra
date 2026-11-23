@@ -3,7 +3,8 @@
 The wizard is pure Tkinter and runs before the overlay. These tests drive it
 directly on the shared session root (never creating a second Tk root) and keep
 every window off-screen. Network calls are monkeypatched — nothing here talks
-to a real backend or sends real email.
+to a real backend or sends real email. The wizard never sees a real code: the
+backend sends it by email, and the tests type a known value into the OTP field.
 """
 import io
 import json
@@ -42,8 +43,7 @@ def _pump(root, rounds=3):
 
 @pytest.fixture
 def wizard(tk_root, monkeypatch, tmp_path):
-    """A wizard with no background network: job fetch disabled and an empty,
-    throwaway session store (so a developer's real token is never touched)."""
+    """A wizard with no background network and a throwaway session store."""
     monkeypatch.setenv("KIYRA_AUTH_STORE", str(tmp_path / "auth.json"))
     monkeypatch.setattr(sw.SetupWizard, "_load_jobs_async", lambda self: None)
     w = sw.SetupWizard(tk_root, "http://127.0.0.1:9", offscreen=True)
@@ -61,15 +61,16 @@ def _set(entry, value):
 
 
 def _challenge(**overrides):
+    """A strict backend challenge: no code, delivery is always email."""
     payload = {
         "ok": True,
         "purpose": "login",
         "email": EMAIL,
-        "delivery": "console",
+        "delivery": "email",
+        "otp_length": 6,
         "expires_in": 600,
         "resend_in": 30,
-        "dev_code": "123456",
-        "message": "console fallback",
+        "message": f"We emailed a 6-digit code to {EMAIL}.",
     }
     payload.update(overrides)
     return payload
@@ -83,6 +84,18 @@ def _http_error(status=400, detail="Incorrect code. 4 attempts left."):
 
 def _signed_in(wizard):
     wizard._set_signed_in(dict(ACCOUNT), "test-token")
+
+
+def test_jobs_are_loaded_after_sign_in(wizard):
+    calls = []
+    wizard._load_jobs_async = lambda: calls.append(True)
+
+    _signed_in(wizard)
+    assert calls == [True]
+
+    wizard._sign_out()
+    _signed_in(wizard)
+    assert calls == [True, True]
 
 
 # ── mode toggle ─────────────────────────────────────────────────────────────
@@ -143,10 +156,11 @@ def test_login_posts_to_login_and_shows_otp_view(wizard, monkeypatch):
     assert captured["payload"] == {"email": EMAIL}
     assert wizard._pending_email == EMAIL
     assert wizard._pending_purpose == "login"
-    assert wizard._dev_code == "123456"
+    assert wizard._otp_length == 6
     assert wizard.login_otp.winfo_manager() == "pack"
     assert wizard.login_credentials.winfo_manager() == ""
-    assert "123456" in wizard.otp_hint.cget("text")
+    # The code is never present in a challenge response or the UI.
+    assert "123456" not in wizard.otp_hint.cget("text")
 
 
 def test_signup_posts_to_register_with_all_fields(wizard, monkeypatch):
@@ -168,6 +182,19 @@ def test_signup_posts_to_register_with_all_fields(wizard, monkeypatch):
     assert captured["path"] == "/api/auth/register"
     assert captured["payload"] == {
         "full_name": NAME, "phone": PHONE, "email": EMAIL}
+    assert wizard._pending_purpose == "register"
+
+
+def test_challenge_message_and_otp_length_come_from_server(wizard, monkeypatch):
+    def fake_post(*args, **kwargs):
+        return _challenge(otp_length=8, message="Check your inbox for 8 digits.")
+
+    monkeypatch.setattr(sw, "_api_post", fake_post)
+    _set(wizard.ent_email, EMAIL)
+    wizard._request_code(background=False)
+    assert wizard._otp_length == 8
+    assert "8 digits" in wizard.otp_subtitle.cget("text")
+    assert "spam" in wizard.otp_hint.cget("text").lower()
 
 
 def test_network_failure_is_reported(wizard, monkeypatch):
@@ -181,18 +208,6 @@ def test_network_failure_is_reported(wizard, monkeypatch):
     assert "backend" in wizard.login_error.cget("text").lower()
 
 
-def test_email_delivery_hides_the_code(wizard, monkeypatch):
-    def fake_post(*args, **kwargs):
-        return _challenge(delivery="email", dev_code=None)
-
-    monkeypatch.setattr(sw, "_api_post", fake_post)
-    _set(wizard.ent_email, EMAIL)
-    wizard._request_code(background=False)
-
-    assert wizard._dev_code is None
-    assert "spam" in wizard.otp_hint.cget("text").lower()
-
-
 # ── verifying a code ────────────────────────────────────────────────────────
 
 def test_verify_requires_a_code(wizard):
@@ -202,29 +217,55 @@ def test_verify_requires_a_code(wizard):
     assert "enter the code" in wizard.otp_error.cget("text").lower()
 
 
+def test_verify_rejects_wrong_length(wizard):
+    wizard._pending_email = EMAIL
+    wizard._otp_length = 6
+    wizard._show_otp_view()
+    _set(wizard.ent_otp, "123")
+    assert wizard._verify_code(background=False) is False
+    assert "6-digit" in wizard.otp_error.cget("text")
+
+
 def test_verify_creates_session_and_advances(wizard, monkeypatch):
+    captured = {}
+
     def fake_post(api_url, path, payload, timeout=10.0, token=None):
+        captured["path"] = path
+        captured["payload"] = payload
         assert path == "/api/auth/verify"
-        assert payload == {"email": EMAIL, "code": "123456"}
         return {"token": "session-token", "token_type": "bearer",
                 "expires_at": "2026-12-12T00:00:00", "account": dict(ACCOUNT)}
 
     monkeypatch.setattr(sw, "_api_post", fake_post)
     wizard._pending_email = EMAIL
+    wizard._pending_purpose = "login"
     wizard._show_otp_view()
     _set(wizard.ent_otp, "123456")
 
     assert wizard._verify_code(background=False) is True
+    assert captured["payload"] == {
+        "email": EMAIL, "code": "123456", "purpose": "login"}
     assert wizard._page == 1
     assert wizard.account["email"] == EMAIL
     assert wizard.auth_token == "session-token"
     assert wizard.username == NAME
     assert str(wizard.btn_next.cget("state")) == "normal"
 
-    stored = sw.load_auth_session()
-    assert stored is not None
-    assert stored["token"] == "session-token"
-    assert stored["account"]["email"] == EMAIL
+
+def test_verify_sends_register_purpose(wizard, monkeypatch):
+    captured = {}
+
+    def fake_post(api_url, path, payload, timeout=10.0, token=None):
+        captured.update(payload)
+        return {"token": "session-token", "account": dict(ACCOUNT)}
+
+    monkeypatch.setattr(sw, "_api_post", fake_post)
+    wizard._pending_email = EMAIL
+    wizard._pending_purpose = "register"
+    wizard._show_otp_view()
+    _set(wizard.ent_otp, "654321")
+    assert wizard._verify_code(background=False) is True
+    assert captured["purpose"] == "register"
 
 
 def test_wrong_code_shows_backend_message(wizard, monkeypatch):
@@ -285,7 +326,7 @@ def test_resend_countdown_disables_the_button(wizard):
 
 def test_use_different_email_returns_to_credentials(wizard):
     wizard._pending_email = EMAIL
-    wizard._dev_code = "123456"
+    wizard._otp_length = 8
     wizard._show_otp_view()
     wizard._use_different_email()
     _pump(wizard.root)
@@ -294,44 +335,22 @@ def test_use_different_email_returns_to_credentials(wizard):
     assert wizard.login_otp.winfo_manager() == ""
 
 
-# ── stored session ──────────────────────────────────────────────────────────
+# ── no stored-session auto-login ────────────────────────────────────────────
 
-def test_stored_session_is_restored(tk_root, monkeypatch, tmp_path):
-    monkeypatch.setenv("KIYRA_AUTH_STORE", str(tmp_path / "auth.json"))
-    monkeypatch.setattr(sw.SetupWizard, "_load_jobs_async", lambda self: None)
-    monkeypatch.setattr(sw, "_api_get_auth",
-                        lambda url, path, token: dict(ACCOUNT))
-    sw.save_auth_session("stored-token", dict(ACCOUNT))
-
-    w = sw.SetupWizard(tk_root, "http://127.0.0.1:9", offscreen=True)
-    try:
-        _pump(tk_root, rounds=40)
-        assert w.account is not None
-        assert w.account["email"] == EMAIL
-        assert w.auth_token == "stored-token"
-        assert w.login_signed.winfo_manager() == "grid"
-        assert str(w.btn_next.cget("state")) == "normal"
-    finally:
-        w._close()
-
-
-def test_stale_stored_session_is_cleared(tk_root, monkeypatch, tmp_path):
+def test_any_stored_token_is_purged_on_launch(tk_root, monkeypatch, tmp_path):
     store = tmp_path / "auth.json"
     monkeypatch.setenv("KIYRA_AUTH_STORE", str(store))
     monkeypatch.setattr(sw.SetupWizard, "_load_jobs_async", lambda self: None)
-
-    def reject(url, path, token):
-        raise _http_error(status=401, detail="Session expired.")
-
-    monkeypatch.setattr(sw, "_api_get_auth", reject)
-    sw.save_auth_session("stale-token", dict(ACCOUNT))
+    store.write_text(json.dumps({"token": "stolen-token", "account": ACCOUNT}),
+                     encoding="utf-8")
 
     w = sw.SetupWizard(tk_root, "http://127.0.0.1:9", offscreen=True)
     try:
-        _pump(tk_root, rounds=40)
+        _pump(tk_root, rounds=10)
+        assert not store.exists()
         assert w.account is None
         assert w.auth_token is None
-        assert not store.exists()
+        assert str(w.btn_next.cget("state")) == "disabled"
     finally:
         w._close()
 
@@ -345,7 +364,6 @@ def test_sign_out_clears_session(wizard, monkeypatch):
 
     monkeypatch.setattr(sw, "_api_post", fake_post)
     _signed_in(wizard)
-    assert sw.load_auth_session() is not None
 
     wizard._sign_out()
     _pump(wizard.root)
@@ -353,7 +371,6 @@ def test_sign_out_clears_session(wizard, monkeypatch):
     assert wizard.account is None
     assert wizard.auth_token is None
     assert wizard.username == "local"
-    assert sw.load_auth_session() is None
     assert calls == [("/api/auth/logout", "test-token")]
     assert wizard.login_form.winfo_manager() == "grid"
     assert str(wizard.btn_next.cget("state")) == "disabled"
@@ -419,10 +436,11 @@ def test_existing_selection_activates_it(wizard, monkeypatch):
     calls = []
 
     def fake_post(api_url, path, payload, timeout=10.0, token=None):
-        calls.append(path)
+        calls.append((path, token))
         return {}
 
     monkeypatch.setattr(sw, "_api_post", fake_post)
+    _signed_in(wizard)
     wizard.jd_mode.set("existing")
     wizard._jobs = [{"id": 7, "title": "Data Eng", "company": "X",
                      "is_active": False}]
@@ -432,7 +450,7 @@ def test_existing_selection_activates_it(wizard, monkeypatch):
 
     assert wizard._save_jd() is True
     assert wizard.job_description_id == 7
-    assert calls == ["/api/jobs/7/activate"]
+    assert calls == [("/api/jobs/7/activate", "test-token")]
 
 
 def test_new_description_posts_and_records_id(wizard, monkeypatch):
@@ -441,9 +459,11 @@ def test_new_description_posts_and_records_id(wizard, monkeypatch):
     def fake_post(api_url, path, payload, timeout=10.0, token=None):
         captured["path"] = path
         captured["payload"] = payload
+        captured["token"] = token
         return {"id": 42}
 
     monkeypatch.setattr(sw, "_api_post", fake_post)
+    _signed_in(wizard)
     wizard.jd_mode.set("new")
     _set(wizard.ent_jd_title, "Backend Engineer")
     _set(wizard.ent_jd_company, "Acme")
@@ -453,6 +473,7 @@ def test_new_description_posts_and_records_id(wizard, monkeypatch):
     assert wizard._save_jd() is True
     assert wizard.job_description_id == 42
     assert captured["path"] == "/api/jobs"
+    assert captured["token"] == "test-token"
     assert captured["payload"]["title"] == "Backend Engineer"
     assert captured["payload"]["company"] == "Acme"
     assert "FastAPI" in captured["payload"]["raw_text"]
@@ -487,7 +508,30 @@ def test_render_jobs_surfaces_load_errors(wizard):
     assert "Could not load" in wizard.jd_hint.cget("text")
 
 
-# ── error helper ────────────────────────────────────────────────────────────
+# ── HTTP helpers + mandatory wizard ─────────────────────────────────────────
+
+def test_api_get_sends_bearer_token(monkeypatch):
+    captured = {}
+
+    class FakeResponse:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def read(self):
+            return b'{"ok": true}'
+
+    def fake_urlopen(req, timeout):
+        captured["headers"] = req.headers
+        return FakeResponse()
+
+    import urllib.request
+    monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
+    assert sw._api_get("http://x", "/api/jobs", token="tok") == {"ok": True}
+    assert captured["headers"]["Authorization"] == "Bearer tok"
+
 
 def test_api_error_extracts_backend_detail():
     assert "4 attempts" in sw._api_error(_http_error())
@@ -498,34 +542,11 @@ def test_api_error_handles_unreachable_backend():
         urllib.error.URLError("nope")).lower()
 
 
-# ── skip / off-screen behaviour ─────────────────────────────────────────────
-
-def test_should_skip_setup_env(monkeypatch):
-    monkeypatch.delenv("KIYRA_SKIP_SETUP", raising=False)
-    monkeypatch.delenv("KIYRA_OVERLAY_HIDDEN", raising=False)
-    assert sw.should_skip_setup() is False
-
-    monkeypatch.setenv("KIYRA_SKIP_SETUP", "1")
-    assert sw.should_skip_setup() is True
-
-
-def test_hidden_mode_skips_setup(monkeypatch):
-    monkeypatch.delenv("KIYRA_SKIP_SETUP", raising=False)
-    monkeypatch.setenv("KIYRA_OVERLAY_HIDDEN", "1")
-    assert sw.should_skip_setup() is True
-
-
-def test_run_setup_wizard_skip_returns_defaults(tk_root, monkeypatch):
-    monkeypatch.setenv("KIYRA_SKIP_SETUP", "1")
-    assert sw.run_setup_wizard(tk_root, "http://127.0.0.1:9") == {
-        "username": "local", "job_description_id": None,
-        "account": None, "auth_token": None}
-
-
-def test_run_setup_wizard_explicit_skip(tk_root):
-    assert sw.run_setup_wizard(tk_root, "http://127.0.0.1:9", skip=True) == {
-        "username": "local", "job_description_id": None,
-        "account": None, "auth_token": None}
+def test_no_skip_flags_are_accepted(tk_root):
+    with pytest.raises(TypeError):
+        sw.run_setup_wizard(tk_root, "http://127.0.0.1:9", skip=True)
+    with pytest.raises(TypeError):
+        sw.run_setup_wizard(tk_root, "http://127.0.0.1:9", force=True)
 
 
 def test_offscreen_position(wizard):

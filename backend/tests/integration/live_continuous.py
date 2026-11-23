@@ -22,6 +22,7 @@ import websockets
 
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
+from _live_auth import ws_connect_headers  # noqa: E402
 from live_listening import (  # noqa: E402
     FRAME_MS, SR, WORK, create_session, frame_stream, read_wav, silence, tts_wav,
     wav_frame,
@@ -152,7 +153,7 @@ async def main():
     print(f"warmup session {warm_id}")
     async with websockets.connect(
             f"ws://localhost:8000/api/interviews/{warm_id}/ws",
-            max_size=None) as wws:
+            max_size=None, additional_headers=ws_connect_headers()) as wws:
         wc = Collector()
         c_global[0] = wc
         wt = wc.start(wws)
@@ -171,7 +172,8 @@ async def main():
     print(f"session {session_id}")
 
     url = f"ws://localhost:8000/api/interviews/{session_id}/ws"
-    async with websockets.connect(url, max_size=None) as ws:
+    async with websockets.connect(
+            url, max_size=None, additional_headers=ws_connect_headers()) as ws:
         c = Collector()
         c_global[0] = c
         task = c.start(ws)

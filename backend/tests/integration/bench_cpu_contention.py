@@ -26,6 +26,8 @@ import time
 import requests
 import websockets
 
+from _live_auth import http_headers, ws_connect_headers
+
 OLLAMA = "http://localhost:11434"
 BACKEND = "http://localhost:8000"
 MODEL = "qwen3.5:4b"
@@ -117,12 +119,13 @@ def standalone(options: dict) -> dict:
 async def live_turn() -> dict:
     r = requests.post(f"{BACKEND}/api/interviews", json={
         "mode": "live", "interview_type": "mixed", "title": "CPU probe",
-    }, timeout=30)
+    }, headers=http_headers(), timeout=30)
     sid = r.json()["id"]
     url = f"ws://localhost:8000/api/interviews/{sid}/ws"
     events: list = []
 
-    async with websockets.connect(url, max_size=None) as ws:
+    async with websockets.connect(
+            url, max_size=None, additional_headers=ws_connect_headers()) as ws:
         async def reader():
             try:
                 async for raw in ws:

@@ -25,6 +25,8 @@ import time
 import requests
 import websockets
 
+from _live_auth import http_headers, ws_connect_headers
+
 BACKEND = "http://localhost:8000"
 
 QUESTIONS = [
@@ -41,7 +43,7 @@ def create_session() -> int:
         "mode": "live",
         "interview_type": "mixed",
         "title": "Latency probe",
-    }, timeout=30)
+    }, headers=http_headers(), timeout=30)
     r.raise_for_status()
     return r.json()["id"]
 
@@ -108,7 +110,8 @@ async def main():
     print(f"session {session_id}")
     url = f"ws://localhost:8000/api/interviews/{session_id}/ws"
     rows = []
-    async with websockets.connect(url, max_size=None) as ws:
+    async with websockets.connect(
+            url, max_size=None, additional_headers=ws_connect_headers()) as ws:
         sink: list = []
         task = asyncio.create_task(collect(ws, sink))
         await ws.send(json.dumps({"type": "mode.set",
