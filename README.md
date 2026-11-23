@@ -18,7 +18,7 @@ A production-grade, local-first, free-first AI interview assistance platform for
 
 2. **Live Assistance Mode**
    - 3-panel low-cognitive-load live workspace:
-     - **Left**: Live microphone stream with real-time speech-to-text transcription via `faster-whisper`.
+     - **Left**: Windows WASAPI loopback capture of the interview's own playback (never the microphone), with real-time speech-to-text transcription via `faster-whisper`.
      - **Center**: Question detection & AI answer recommendations (STAR framing, technical trade-offs, supporting points).
      - **Right**: Candidate context, skills, projects, and manual trigger controls.
    - Heuristic question detection with mandatory manual "Generate Answer" trigger fallback.
@@ -149,7 +149,24 @@ npm install
 npm run dev
 ```
 
-Visit **http://localhost:3000** to start practicing!
+### 4. Sign-in (required)
+
+Kiyra signs you in with a real email one-time code — there is no console fallback,
+no code in API responses, and no way to skip sign-in. Before starting the backend,
+copy `.env.example` to `backend/.env` and set:
+
+- `AUTH_OTP_SECRET` — generate once with
+  `python -c "import secrets; print(secrets.token_urlsafe(48))"` and keep it
+  stable so codes remain valid across backend restarts.
+- `SMTP_HOST`, `SMTP_PORT`, `SMTP_USERNAME`, `SMTP_PASSWORD`, `SMTP_FROM` —
+  a real SMTP account (Gmail requires an App Password, not your login password).
+
+OTP endpoints return HTTP 503 until SMTP is configured. The desktop overlay asks
+for a fresh email code on every launch; the web app sends you to `/login` when
+its bearer token expires. Every API and WebSocket route except the sign-in
+challenges and `/health` requires that token.
+
+Visit **http://localhost:3000** to sign in and start practicing!
 
 ---
 
@@ -177,5 +194,7 @@ uv run pytest tests/ -v
 ## 🔒 Security & Privacy
 
 - **100% Local-First**: Your resume, job descriptions, and interview audio recordings never leave your machine by default.
+- **Email-only sign-in**: A one-time code delivered over real SMTP is the only way to get a session. No development backdoor, console code, or stored-token auto-login.
+- **Bearer tokens everywhere**: All API and WebSocket routes (except sign-in challenges and `/health`) reject unauthenticated requests.
 - **Path Traversal & File Validation**: Uploads are sanitized and restricted to safe extensions (`.pdf`, `.docx`, `.txt`) up to 10MB.
 - **Zero Committed Secrets**: All credentials and custom provider URLs are managed via `.env`.
